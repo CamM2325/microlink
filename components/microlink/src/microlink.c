@@ -415,6 +415,96 @@ skip_bsd_socket:
     return ESP_OK;
 }
 
+esp_err_t microlink_rebind(microlink_t *ml) {
+    if (!ml) return ESP_ERR_INVALID_ARG;
+    if (ml->state == ML_STATE_IDLE) return ESP_ERR_INVALID_STATE;
+
+    ESP_LOGI(TAG, "=== Rebinding to new network interface ===");
+
+    /* Step 1: Invalidate socket FDs FIRST, then delay to let net_io_task's
+     * select() cycle complete (50ms timeout). Only THEN close the old FDs.
+     * Closing a socket while another thread has it in select() deadlocks
+     * on lwIP's global socket lock. */
+    int old_disco = ml->disco_sock4;
+    int old_stun = ml->stun_sock;
+    int old_stun6 = ml->stun_sock6;
+
+    /* Invalidate — net_io_task will skip these on next iteration */
+    ml->disco_sock4 = -1;
+    ml->stun_sock = -1;
+    ml->stun_sock6 = -1;
+
+    /* Wait for net_io_task select() to cycle out (50ms timeout + margin) */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* Now safe to close the old FDs */
+    if (old_disco >= 0) ml_close_sock(old_disco);
+    if (old_stun >= 0) ml_close_sock(old_stun);
+    if (old_stun6 >= 0) ml_close_sock(old_stun6);
+    ESP_LOGI(TAG, "Rebind: closed DISCO + STUN sockets");
+
+    /* Step 2: Signal coord to reconnect. ML_CMD_FORCE_RECONNECT closes
+     * the coord socket, resets Noise state, and re-enters the
+     * STUN → DNS → TCP → Noise → Register → MapRequest flow.
+     * Peers and WG state are preserved. */
+    xEventGroupClearBits(ml->events, ML_EVT_COORD_REGISTERED);
+    ml_coord_cmd_t cmd = ML_CMD_FORCE_RECONNECT;
+    xQueueSend(ml->coord_cmd_queue, &cmd, pdMS_TO_TICKS(100));
+
+    /* Step 3: Signal DERP to reconnect. ML_EVT_DERP_RECONNECT triggers
+     * derp_tx_task to close TLS, then reconnect with full handshake.
+     * Pending TX packets are drained but WG state is preserved. */
+    xEventGroupClearBits(ml->events, ML_EVT_DERP_CONNECTED);
+    xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+    ESP_LOGI(TAG, "Rebind: signaled coord + DERP to reconnect");
+
+    /* Step 4: Brief delay for coord/DERP to process reconnect signals */
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    /* Step 5: Recreate DISCO UDP socket on the new interface */
+#ifdef CONFIG_ML_ZERO_COPY_WG
+    ml_zerocopy_deinit(ml);
+    if (ml_zerocopy_init(ml) == ESP_OK) {
+        ESP_LOGI(TAG, "Rebind: zero-copy DISCO PCB recreated");
+        goto rebind_wg_update;
+    }
+    ESP_LOGW(TAG, "Rebind: zero-copy init failed, using BSD socket fallback");
+#endif
+    ml->disco_sock4 = ml_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (ml->disco_sock4 >= 0) {
+        struct sockaddr_in bind_addr = {
+            .sin_family = AF_INET,
+            .sin_port = htons(51820),
+            .sin_addr.s_addr = INADDR_ANY,
+        };
+        if (ml_bind(ml->disco_sock4, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+            bind_addr.sin_port = 0;
+            ml_bind(ml->disco_sock4, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
+        }
+        int tos = 0xB8;
+        setsockopt(ml->disco_sock4, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+        int flags = ml_fcntl(ml->disco_sock4, F_GETFL, 0);
+        ml_fcntl(ml->disco_sock4, F_SETFL, flags | O_NONBLOCK);
+
+        struct sockaddr_in local_addr;
+        socklen_t addr_len = sizeof(local_addr);
+        getsockname(ml->disco_sock4, (struct sockaddr *)&local_addr, &addr_len);
+        ml->disco_local_port = ntohs(local_addr.sin_port);
+        ESP_LOGI(TAG, "Rebind: DISCO socket rebound to port %d", ml->disco_local_port);
+    } else {
+        ESP_LOGE(TAG, "Rebind: failed to create DISCO socket: errno=%d", errno);
+    }
+
+#ifdef CONFIG_ML_ZERO_COPY_WG
+rebind_wg_update:
+#endif
+    /* Step 6: Update WG output mode for new transport */
+    ml_wg_mgr_update_transport(ml);
+
+    ESP_LOGI(TAG, "=== Rebind complete — waiting for coord+DERP reconnect ===");
+    return ESP_OK;
+}
+
 esp_err_t microlink_stop(microlink_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
 

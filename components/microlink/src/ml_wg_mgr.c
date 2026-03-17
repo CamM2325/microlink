@@ -1384,6 +1384,19 @@ bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip) {
     return up;
 }
 
+void ml_wg_mgr_update_transport(microlink_t *ml) {
+#if CONFIG_ML_ENABLE_CELLULAR
+    if (!ml || !ml->wg_netif) return;
+    struct netif *netif = (struct netif *)ml->wg_netif;
+    bool at_ready = ml_at_socket_is_ready();
+    wireguardif_force_derp_output(netif, at_ready);
+    ESP_LOGI(TAG, "WG transport updated: force_derp=%d (%s)",
+             at_ready, at_ready ? "AT socket" : "PPP/WiFi");
+#else
+    (void)ml;
+#endif
+}
+
 /* ============================================================================
  * Periodic DISCO probing (rate-limited per tailscaled timing)
  * ========================================================================== */

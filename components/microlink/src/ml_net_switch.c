@@ -482,15 +482,46 @@ state_loop:
                 ESP_LOGI(TAG, "Switching WiFi → Cellular");
                 xTimerStop(s_ctx.health_timer, 0);
 
-                if (s_ctx.on_disconnected) {
-                    s_ctx.on_disconnected(s_ctx.user_data);
+                if (s_ctx.on_switching) {
+                    s_ctx.on_switching(ML_NET_WIFI, ML_NET_CELLULAR, s_ctx.user_data);
                 }
 
-                /* Tear down WiFi VPN */
-                vpn_stop();
-                wifi_stop();
-
-                goto try_cellular;
+                /* Start cellular while WiFi VPN is still running */
+                s_ctx.state = ML_NET_SW_CELL_CONNECTING;
+                esp_err_t cell_err = cellular_start();
+                if (cell_err == ESP_OK) {
+                    /* Cellular is up — rebind sockets instead of full restart */
+                    wifi_stop();
+                    s_ctx.active_transport = ML_NET_CELLULAR;
+                    esp_err_t rb_err = microlink_rebind(s_ctx.ml);
+                    if (rb_err == ESP_OK) {
+                        ESP_LOGI(TAG, "Rebind to cellular complete");
+                        s_ctx.state = ML_NET_SW_CELL_VPN_UP;
+                        if (s_ctx.on_connected) {
+                            s_ctx.on_connected(ML_NET_CELLULAR, s_ctx.user_data);
+                        }
+                        xTimerStart(s_ctx.health_timer, 0);
+                        if (s_ctx.failback_check_ms > 0 && s_ctx.failback_timer) {
+                            xTimerStart(s_ctx.failback_timer, 0);
+                        }
+                    } else {
+                        ESP_LOGE(TAG, "Rebind failed (%s), full restart",
+                                 esp_err_to_name(rb_err));
+                        vpn_stop();
+                        wifi_stop();
+                        goto try_cellular;
+                    }
+                } else {
+                    /* Cellular failed — full restart path */
+                    ESP_LOGE(TAG, "Cellular start failed, full restart");
+                    if (s_ctx.on_disconnected) {
+                        s_ctx.on_disconnected(s_ctx.user_data);
+                    }
+                    vpn_stop();
+                    wifi_stop();
+                    goto try_cellular;
+                }
+                break;
             }
 
             case ML_NET_SW_SWITCHING_TO_WIFI: {
@@ -503,58 +534,35 @@ state_loop:
                 /* Try WiFi without tearing down cellular yet */
                 s_ctx.state = ML_NET_SW_WIFI_CONNECTING;
 
-                /* Temporarily try WiFi — if it fails, stay on cellular */
                 esp_err_t wifi_err = wifi_start();
                 if (wifi_err == ESP_OK) {
-                    /* WiFi is back! Stop cellular VPN, try WiFi VPN.
-                     * Keep cellular modem warm in case WiFi VPN fails. */
-                    ESP_LOGI(TAG, "WiFi recovered! Switching back from cellular");
+                    /* WiFi is back — rebind sockets to WiFi interface */
+                    ESP_LOGI(TAG, "WiFi recovered! Rebinding to WiFi");
 
                     if (s_ctx.on_switching) {
                         s_ctx.on_switching(ML_NET_CELLULAR, ML_NET_WIFI, s_ctx.user_data);
                     }
 
-                    vpn_stop();
-                    /* Don't call cellular_stop() yet — keep modem warm */
-
+                    /* Tear down cellular transport first so ml_at_socket_is_ready()
+                     * returns false and ml_* wrappers route to BSD sockets */
+                    cellular_stop();
                     s_ctx.active_transport = ML_NET_WIFI;
-                    esp_err_t vpn_err = vpn_start();
-                    if (vpn_err == ESP_OK) {
-                        /* WiFi VPN is up — now safe to tear down cellular */
-                        cellular_stop();
+
+                    esp_err_t rb_err = microlink_rebind(s_ctx.ml);
+                    if (rb_err == ESP_OK) {
+                        ESP_LOGI(TAG, "Rebind to WiFi complete");
                         s_ctx.state = ML_NET_SW_WIFI_VPN_UP;
                         if (s_ctx.on_connected) {
                             s_ctx.on_connected(ML_NET_WIFI, s_ctx.user_data);
                         }
                         xTimerStart(s_ctx.health_timer, 0);
                     } else {
-                        /* WiFi VPN failed — cellular is still warm, reuse it */
-                        ESP_LOGW(TAG, "WiFi VPN failed, reverting to cellular (modem still warm)");
+                        /* Rebind failed — try full restart on cellular */
+                        ESP_LOGW(TAG, "Rebind to WiFi failed (%s), reverting to cellular",
+                                 esp_err_to_name(rb_err));
                         wifi_stop();
-                        s_ctx.active_transport = ML_NET_CELLULAR;
-
-                        /* Re-start VPN over cellular (modem already connected) */
-                        vpn_err = vpn_start();
-                        if (vpn_err == ESP_OK) {
-                            s_ctx.state = ML_NET_SW_CELL_VPN_UP;
-                            if (s_ctx.on_connected) {
-                                s_ctx.on_connected(ML_NET_CELLULAR, s_ctx.user_data);
-                            }
-                            xTimerStart(s_ctx.health_timer, 0);
-                            if (s_ctx.failback_check_ms > 0 && s_ctx.failback_timer) {
-                                xTimerStart(s_ctx.failback_timer, 0);
-                            }
-                        } else {
-                            /* Both failed — full restart */
-                            ESP_LOGE(TAG, "Both WiFi and cellular VPN failed, full restart");
-                            cellular_stop();
-                            s_ctx.state = ML_NET_SW_ERROR;
-                            if (s_ctx.on_disconnected) {
-                                s_ctx.on_disconnected(s_ctx.user_data);
-                            }
-                            vTaskDelay(pdMS_TO_TICKS(5000));
-                            if (s_ctx.running) goto try_cellular;
-                        }
+                        vpn_stop();
+                        goto try_cellular;
                     }
                 } else {
                     /* WiFi still down, stay on cellular */

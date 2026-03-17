@@ -105,6 +105,24 @@ microlink_t *microlink_init(const microlink_config_t *config);
 esp_err_t microlink_start(microlink_t *ml);
 
 /**
+ * @brief Rebind to a new network interface without destroying the session
+ * @param ml Handle
+ * @return ESP_OK on success
+ *
+ * Use this when switching between WiFi and cellular (or vice versa).
+ * Closes and reopens all sockets on the new interface while preserving:
+ * - WireGuard peer state and crypto keys
+ * - Peer table and DISCO discovery state
+ * - VPN IP assignment
+ * - Task state machines
+ *
+ * The coord and DERP connections will reconnect automatically (~5-10s).
+ * Much faster than stop/destroy/init/start which requires full re-registration
+ * and MapResponse re-download.
+ */
+esp_err_t microlink_rebind(microlink_t *ml);
+
+/**
  * @brief Stop and disconnect from Tailscale
  * @param ml Handle
  * @return ESP_OK on success

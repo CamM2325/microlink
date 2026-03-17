@@ -19,6 +19,7 @@ Production-ready Tailscale VPN client for the ESP32 platform with WiFi and 4G ce
   - PPP cellular data — real lwIP sockets, direct UDP, NAT hole-punching
   - AT socket bridge fallback for carriers that reject PPP auth
   - Multi-carrier: PAP (IMSI-based) and CHAP (credential-based) automatic selection
+  - Seamless network rebind — switch between WiFi and cellular without destroying the VPN session (~330ms rebind, ~7s recovery)
   - Network health monitoring with automatic failback to WiFi when recovered
 
 - **Production Ready**
@@ -365,6 +366,18 @@ ml_net_switch_start();
 // Get the MicroLink handle (same API as above)
 microlink_t *ml = ml_net_switch_get_handle();
 ```
+
+### Network Rebind
+
+```c
+// Switch the VPN to a new network interface without destroying the session.
+// Preserves WG peer state, crypto keys, VPN IP, and DISCO state.
+// Closes/recreates DISCO+STUN sockets, signals coord+DERP to reconnect.
+// ~330ms rebind, ~7s VPN recovery.
+esp_err_t ret = microlink_rebind(ml);
+```
+
+The `ml_net_switch` module calls `microlink_rebind()` automatically during WiFi↔cellular transitions.
 
 ### Cleanup
 
