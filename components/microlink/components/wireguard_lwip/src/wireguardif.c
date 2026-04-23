@@ -42,6 +42,7 @@
 #include "lwip/sys.h"
 #include "lwip/timeouts.h"
 #include "lwip/tcpip.h"
+#include "arch/sys_arch.h"
 
 #include "wireguard.h"
 #include "crypto.h"
@@ -59,6 +60,10 @@
 #else
 #define WG_DEBUG(...) do {} while(0)
 #endif
+
+static inline bool wireguardif_core_lock_needed(void) {
+	return !sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER);
+}
 
 #define WIREGUARDIF_TIMER_MSECS 400
 
@@ -391,7 +396,14 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 		wireguardif_send_keepalive(device, peer);
 
 		// Set the IF-UP flag on netif
+		bool need_lock = wireguardif_core_lock_needed();
+		if (need_lock) {
+			LOCK_TCPIP_CORE();
+		}
 		netif_set_link_up(device->netif);
+		if (need_lock) {
+			UNLOCK_TCPIP_CORE();
+		}
 		printf("[WG] *** WIREGUARD SESSION ESTABLISHED wg_idx=%u ***\n", wg_idx);
 	} else {
 		// Packet bad
@@ -482,7 +494,14 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 					}
 
 					// Make sure that link is reported as up
+					bool need_lock = wireguardif_core_lock_needed();
+					if (need_lock) {
+						LOCK_TCPIP_CORE();
+					}
 					netif_set_link_up(device->netif);
+					if (need_lock) {
+						UNLOCK_TCPIP_CORE();
+					}
 
 					if (pbuf->tot_len > 0) {
 						//4a. Once the packet payload is decrypted, the interface has a plaintext packet. If this is not an IP packet, it is dropped.
@@ -778,28 +797,19 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 					// Update the peer location
 					update_peer_addr(peer, addr, port);
 
-					// If initiation arrived via DERP (addr=0.0.0.0), send response
-					// via DERP too by temporarily clearing the peer endpoint.
-					// The ESP32 on cellular may not reach the peer's direct endpoint.
-					ip_addr_t saved_ip;
-					u16_t saved_port;
+					// If initiation arrived via DERP (addr=0.0.0.0), keep the peer on
+					// the DERP path for the whole session until DISCO/direct-path logic
+					// updates it. Restoring a stale direct endpoint here makes replies
+					// (ICMP/HTTP response data) go to an unreachable public IP:port.
 					bool via_derp = ip_addr_isany(addr);
 					if (via_derp) {
-						saved_ip = peer->ip;
-						saved_port = peer->port;
 						ip_addr_set_any(false, &peer->ip);
 						peer->port = 0;
-						printf("[WG_RX] Sending response via DERP (initiation was relayed)\n");
+						printf("[WG_RX] Sending response via DERP and keeping DERP as active path\n");
 					}
 
 					// Send back a handshake response
 					wireguardif_send_handshake_response(device, peer);
-
-					// Restore peer endpoint after sending
-					if (via_derp) {
-						peer->ip = saved_ip;
-						peer->port = saved_port;
-					}
 				} else {
 					printf("[WG_RX] Initiation process FAILED (bad keys/timestamp?)\n");
 				}
@@ -1205,7 +1215,14 @@ void wireguardif_periodic(struct netif *netif) {
 		}
 	}
 	if (!link_up) {
+		bool need_lock = wireguardif_core_lock_needed();
+		if (need_lock) {
+			LOCK_TCPIP_CORE();
+		}
 		netif_set_link_down(device->netif);
+		if (need_lock) {
+			UNLOCK_TCPIP_CORE();
+		}
 	}
 }
 

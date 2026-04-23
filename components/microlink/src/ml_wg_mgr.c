@@ -24,6 +24,7 @@
 #include "lwip/ip_addr.h"
 #include "lwip/ip.h"
 #include "lwip/tcpip.h"
+#include "arch/sys_arch.h"
 #include "nacl_box.h"
 #include "wireguardif.h"
 #include "wireguard.h"
@@ -36,6 +37,10 @@ extern void wireguardif_network_rx(void *arg, struct udp_pcb *pcb,
                                     struct pbuf *p, const ip_addr_t *addr, u16_t port);
 
 static const char *TAG = "ml_wg_mgr";
+
+static inline bool ml_lwip_core_lock_needed(void) {
+    return !sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER);
+}
 
 /* Forward declarations */
 static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx);
@@ -206,7 +211,14 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
     IP_SET_TYPE_VAL(dst, IPADDR_TYPE_V4);
     ip4_addr_set_u32(ip_2_ip4(&dst), dest_ip);  /* already network byte order */
 
+    bool need_lock = ml_lwip_core_lock_needed();
+    if (need_lock) {
+        LOCK_TCPIP_CORE();
+    }
     err_t err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
+    if (need_lock) {
+        UNLOCK_TCPIP_CORE();
+    }
     pbuf_free(p);
     return err;
 }
@@ -236,10 +248,18 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
     /* Disable internal socket binding (we use magicsock mode) */
     wireguardif_disable_socket_bind();
 
+    bool need_lock = ml_lwip_core_lock_needed();
+    if (need_lock) {
+        LOCK_TCPIP_CORE();
+    }
+
     /* Initialize WireGuard netif */
     netif->state = &wg_init;
     err_t err = wireguardif_init(netif);
     if (err != ERR_OK) {
+        if (need_lock) {
+            UNLOCK_TCPIP_CORE();
+        }
         ESP_LOGE(TAG, "wireguardif_init failed: %d", err);
         free(netif);
         return ESP_FAIL;
@@ -286,6 +306,10 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
             /* DSCP 46 (EF) → WMM AC_VO for low-latency WiFi scheduling */
             s_wg_output_pcb->tos = 0xB8;
         }
+    }
+
+    if (need_lock) {
+        UNLOCK_TCPIP_CORE();
     }
 
     /* Register output callbacks for magicsock mode */
@@ -1184,7 +1208,14 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
     }
 
     /* Call WG RX handler — pbuf is PBUF_RAM so data survives async delivery */
+    bool need_lock = ml_lwip_core_lock_needed();
+    if (need_lock) {
+        LOCK_TCPIP_CORE();
+    }
     wireguardif_network_rx(device, NULL, p, &addr, pkt->src_port);
+    if (need_lock) {
+        UNLOCK_TCPIP_CORE();
+    }
 }
 
 /* ============================================================================
@@ -1642,11 +1673,22 @@ void ml_wg_mgr_task(void *arg) {
     /* Shutdown WireGuard interface */
     if (ml->wg_netif) {
         struct netif *netif = (struct netif *)ml->wg_netif;
+        bool need_lock = ml_lwip_core_lock_needed();
+        if (need_lock) {
+            LOCK_TCPIP_CORE();
+        }
         wireguardif_shutdown(netif);
         netif_set_link_down(netif);
         netif_set_down(netif);
-        vTaskDelay(pdMS_TO_TICKS(100));
         netif_remove(netif);
+        if (s_wg_output_pcb) {
+            udp_remove(s_wg_output_pcb);
+            s_wg_output_pcb = NULL;
+        }
+        if (need_lock) {
+            UNLOCK_TCPIP_CORE();
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
         free(netif);
         ml->wg_netif = NULL;
     }
