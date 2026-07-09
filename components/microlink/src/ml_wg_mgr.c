@@ -497,18 +497,20 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
         IP4_ADDR(&wg_peer.allowed_ip.u_addr.ip4, ip_a, ip_b, ip_c, ip_d);
         IP4_ADDR(&wg_peer.allowed_mask.u_addr.ip4, 255, 255, 255, 255);
 
-        /* Set endpoint if available, otherwise leave blank for DERP-only */
-        if (p->endpoint_count > 0 && p->endpoints[0].ip != 0) {
-            uint8_t ea = (p->endpoints[0].ip >> 24) & 0xFF;
-            uint8_t eb = (p->endpoints[0].ip >> 16) & 0xFF;
-            uint8_t ec = (p->endpoints[0].ip >> 8) & 0xFF;
-            uint8_t ed = p->endpoints[0].ip & 0xFF;
-            IP4_ADDR(&wg_peer.endpoint_ip.u_addr.ip4, ea, eb, ec, ed);
-            wg_peer.endport_port = p->endpoints[0].port;
-        } else {
-            ip_addr_set_any(false, &wg_peer.endpoint_ip);
-            wg_peer.endport_port = 0;
-        }
+        /* Leave the endpoint BLANK: data output goes via DERP until DISCO
+         * validates a direct path (Tailscale semantics). Pre-installing
+         * endpoints[0] from the MapResponse advertisement made wireguardif
+         * treat an UNVALIDATED address as a working direct path
+         * (wireguardif.c peer_output: any non-zero endpoint => direct UDP),
+         * so with a CGNAT peer (e.g. PC on cellular) every data reply was
+         * fired at an unreachable advertised endpoint and silently lost,
+         * while inbound arrived via DERP — one-way tunnel, ping/TCP dead.
+         * The validated path install lives in process_disco_pong (only a
+         * DIRECT pong sets best_ip -> wireguardif_update_endpoint), which
+         * still upgrades us to direct within seconds when it truly works
+         * (proven same-LAN). */
+        ip_addr_set_any(false, &wg_peer.endpoint_ip);
+        wg_peer.endport_port = 0;
 
         wg_peer.keep_alive = 25;
 
