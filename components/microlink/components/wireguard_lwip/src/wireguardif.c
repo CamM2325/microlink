@@ -539,9 +539,14 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 								if (dest_ok) {
 									// Send packet to be processed by LWIP
 									WG_DEBUG("[WG_RX_IP] Passing %u bytes to IP layer\n", (unsigned)pbuf->tot_len);
-									ip_input(pbuf, device->netif);
-									// pbuf is owned by IP layer now
-									pbuf = NULL;
+									// Enter the lwIP core ONLY from the tcpip_thread. netif->input is
+									// tcpip_input (set in ml_wg_mgr): posting the packet defers ip_input
+									// to the tcpip_thread. Calling ip_input() directly here runs on the
+									// wg_mgr task and races the tcpip_thread's WiFi TCP processing ->
+									// unsynchronized pbuf/PCB access -> double-free crash (pbuf.c:753).
+									if (device->netif->input(pbuf, device->netif) == ERR_OK) {
+										pbuf = NULL;  // ownership handed to the tcpip_thread queue
+									}  // else: still ours -> freed by pbuf_free() at the end of this block
 								} else {
 									WG_DEBUG("[WG_RX_IP] DROPPED: dest_ok=false\n");
 								}
