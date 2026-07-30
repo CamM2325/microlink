@@ -944,6 +944,14 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
         free(resp_buf);
         return 0;  /* Not fatal - we'll get peers in MapResponse */
     }
+    /* The server reports a refused registration only in Error — a rejected auth
+     * key gives "invalid key: unable to validate API key". Node is absent either
+     * way, so without this the first symptom is MapResponse "node not found". */
+    const cJSON *reg_error = cJSON_GetObjectItem(resp_json, "Error");
+    if (cJSON_IsString(reg_error) && reg_error->valuestring[0] != '\0') {
+        ESP_LOGE(TAG, "RegisterResponse error: %s", reg_error->valuestring);
+    }
+
     parse_start[parse_len] = saved;
     free(resp_buf);
 
