@@ -442,6 +442,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->hostname[sizeof(p->hostname) - 1] = '\0';
     p->derp_region = update->derp_region;
     p->active = true;
+    p->online = update->online;
 
     /* Copy endpoints */
     p->endpoint_count = update->endpoint_count;
@@ -576,7 +577,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     if (ml->peer_cb) {
         microlink_peer_info_t info = {
             .vpn_ip = p->vpn_ip,
-            .online = true,
+            .online = p->online,
             .direct_path = false,
         };
         strncpy(info.hostname, p->hostname, sizeof(info.hostname) - 1);
@@ -637,8 +638,11 @@ static void process_peer_updates(microlink_t *ml) {
                     if (update->derp_region > 0) {
                         p->derp_region = update->derp_region;
                     }
-                    ESP_LOGI(TAG, "Peer patched: %s (eps=%d derp=%d)",
-                             p->hostname, p->endpoint_count, p->derp_region);
+                    if (update->online_valid) {
+                        p->online = update->online;
+                    }
+                    ESP_LOGI(TAG, "Peer patched: %s (eps=%d derp=%d online=%d)",
+                             p->hostname, p->endpoint_count, p->derp_region, p->online);
                 }
             }
             break;

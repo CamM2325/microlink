@@ -1079,6 +1079,12 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
             }
         }
 
+        /* Online is the control plane's own liveness view. A full peer record
+         * always settles it — absent means "not reported", which we take as
+         * offline rather than assuming reachable. */
+        update->online = cJSON_IsTrue(cJSON_GetObjectItem(peer, "Online"));
+        update->online_valid = true;
+
         /* DERP region — try modern HomeDERP (int) first, then legacy DERP string */
         cJSON *peer_home_derp = cJSON_GetObjectItem(peer, "HomeDERP");
         if (peer_home_derp && cJSON_IsNumber(peer_home_derp) && peer_home_derp->valueint > 0) {
@@ -1173,6 +1179,16 @@ check_removed:
                     const char *hex = patch->string;
                     if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
                     hex_to_bytes(hex, update->public_key, 32);
+
+                    /* Liveness transitions arrive here on the long-poll stream,
+                     * so this is what keeps Online fresh between full peer
+                     * lists. A patch is partial — an absent field means
+                     * "unchanged", not "offline". */
+                    cJSON *patch_online = cJSON_GetObjectItem(patch, "Online");
+                    if (patch_online) {
+                        update->online = cJSON_IsTrue(patch_online);
+                        update->online_valid = true;
+                    }
 
                     /* Parse DERP region if present — try DERPRegion (int) first,
                      * then legacy DERP string */
