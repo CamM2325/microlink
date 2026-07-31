@@ -613,7 +613,26 @@ V2 uses fully dynamic DERP discovery — no manual region configuration needed. 
 
 MicroLink supports custom coordination servers like [Headscale](https://github.com/juanfont/headscale) and [Ionscale](https://github.com/jsiebens/ionscale). This allows you to run your own private Tailscale-compatible control plane.
 
-**Configuration:** Set the control plane host via the HTTP config server web UI (Device Settings → Control Plane Host) or programmatically via `ctrl_host` in the config struct.
+**Configuration:** Set the control plane host via the HTTP config server web UI (Device Settings → Control Plane Host) or programmatically via `ctrl_host` in the config struct. The server's Noise public key can likewise be supplied at runtime via `ctrl_noise_pubkey` (32 bytes) — fetch it from `https://<host>/key?v=88` (`"publicKey":"mkey:<hex>"`) during provisioning, or pin it at build time (below).
+
+**Build-time configuration:** For pre-provisioned firmware, or when the HTTP config server is disabled, the control plane can also be set at build time:
+
+```ini
+# sdkconfig.defaults
+CONFIG_ML_CTRL_HOST="headscale.example.com"
+
+# Control planes that only expose an HTTPS listener (e.g. Headscale behind
+# a reverse proxy / load balancer on port 443) cannot accept MicroLink's
+# default plain-TCP port-80 transport. This wraps the ts2021 Noise
+# handshake in TLS on port 443 instead. The server certificate is not
+# verified; the control plane is authenticated by the pinned Noise public
+# key below (same trust model as the plain port-80 transport).
+CONFIG_ML_CTRL_TLS=y
+
+# The control plane's Noise public key, from
+# https://<host>/key?v=88 → "publicKey":"mkey:<hex>" (64-char hex)
+CONFIG_ML_CTRL_NOISE_PUBKEY_HEX="..."
+```
 
 **Server key:** MicroLink automatically fetches the server's Noise public key from the `/key` endpoint via HTTPS. No manual key configuration required.
 

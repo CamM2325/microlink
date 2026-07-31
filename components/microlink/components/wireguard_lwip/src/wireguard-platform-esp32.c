@@ -5,9 +5,9 @@
 
 #include "wireguard-platform.h"
 #include "esp_random.h"
-#include "esp_timer.h"
 #include "lwip/sys.h"
 #include <string.h>
+#include <sys/time.h>
 
 /* ============================================================================
  * Time Functions
@@ -19,18 +19,19 @@ uint32_t wireguard_sys_now() {
 }
 
 void wireguard_tai64n_now(uint8_t *output) {
-    // TAI64N format: 8 bytes seconds + 4 bytes nanoseconds
-    // For simplicity, use Unix epoch time
-    uint64_t now_us = esp_timer_get_time();
-    uint64_t seconds = now_us / 1000000ULL;
-    uint32_t nanoseconds = (now_us % 1000000ULL) * 1000;
-
-    // Log raw uptime before TAI offset (only every ~5s to avoid spam)
-    static uint64_t last_log_s = 0;
-    if (seconds - last_log_s >= 5) {
-        printf("[TAI64N] uptime=%llu s, nano=%lu\n", (unsigned long long)seconds, (unsigned long)nanoseconds);
-        last_log_s = seconds;
-    }
+    // TAI64N format: 8 bytes seconds + 4 bytes nanoseconds.
+    //
+    // This must be wall-clock time, not uptime. A peer keeps the greatest
+    // timestamp it has seen from us and rejects any handshake initiation whose
+    // timestamp is not greater (replay protection, WireGuard spec 5.1). With
+    // uptime, every reboot restarts the counter near zero, so the peer rejects
+    // us with "handshake replay" until our uptime passes the previous session's
+    // — a device that ran for hours cannot reconnect at all after a reboot.
+    // The system clock is expected to be set (e.g. by SNTP) before connecting.
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint64_t seconds = (uint64_t)tv.tv_sec;
+    uint32_t nanoseconds = (uint32_t)tv.tv_usec * 1000;
 
     // TAI64 starts at 1970-01-01 00:00:10 TAI (Unix epoch + 10 seconds)
     // Add TAI offset: 2^62 + Unix time

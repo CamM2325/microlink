@@ -85,11 +85,40 @@ static int hex_to_bytes(const char *hex, uint8_t *bytes, size_t max_len) {
  * TCP I/O helpers for coord socket (owned exclusively by this task)
  * ========================================================================== */
 
+/* Single read from the coord transport (recv() semantics).
+ * With CONFIG_ML_CTRL_TLS the Noise byte stream runs inside TLS records;
+ * timeouts still surface as -1/EAGAIN via the TLS BIO. */
+static int coord_raw_recv(microlink_t *ml, uint8_t *buf, size_t len) {
+#ifdef CONFIG_ML_CTRL_TLS
+    return ml_coord_tls_recv(ml, buf, len);
+#else
+    return ml_recv(ml->coord_sock, buf, len, 0);
+#endif
+}
+
+/* Close the coord connection (TLS session first, then the socket) */
+static void coord_close_conn(microlink_t *ml) {
+#ifdef CONFIG_ML_CTRL_TLS
+    ml_coord_tls_free(ml);
+#endif
+    if (ml->coord_sock >= 0) {
+        ml_close_sock(ml->coord_sock);
+        ml->coord_sock = -1;
+    }
+}
+
 static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
     /* Set send timeout to prevent indefinite blocking (v1 uses MSG_DONTWAIT) */
     struct timeval snd_tv = { .tv_sec = 5, .tv_usec = 0 };
     ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
 
+#ifdef CONFIG_ML_CTRL_TLS
+    if (ml_coord_tls_send(ml, data, len) < 0) {
+        ESP_LOGE(TAG, "coord_send (TLS) failed: len=%d errno=%d", (int)len, errno);
+        return -1;
+    }
+    return 0;
+#else
     size_t sent = 0;
     while (sent < len) {
         int n = ml_send(ml->coord_sock, data + sent, len - sent, 0);
@@ -101,13 +130,14 @@ static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
         sent += n;
     }
     return 0;
+#endif
 }
 
 static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
     size_t recvd = 0;
     int retries = 0;
     while (recvd < len) {
-        int n = ml_recv(ml->coord_sock, buf + recvd, len - recvd, 0);
+        int n = coord_raw_recv(ml, buf + recvd, len - recvd);
         if (n <= 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 if (recvd == 0) {
@@ -227,7 +257,13 @@ static int do_tcp_connect(microlink_t *ml) {
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
     struct addrinfo *res = NULL;
 
-    if (ml_getaddrinfo(CTRL_HOST(ml), "80", &hints, &res) != 0 || !res) {
+#ifdef CONFIG_ML_CTRL_TLS
+    const char *ctrl_port = "443";
+#else
+    const char *ctrl_port = "80";
+#endif
+
+    if (ml_getaddrinfo(CTRL_HOST(ml), ctrl_port, &hints, &res) != 0 || !res) {
         ESP_LOGE(TAG, "DNS resolve failed for %s", CTRL_HOST(ml));
         return -1;
     }
@@ -257,7 +293,7 @@ static int do_tcp_connect(microlink_t *ml) {
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
 
-    ESP_LOGI(TAG, "Connecting to %s:80...", CTRL_HOST(ml));
+    ESP_LOGI(TAG, "Connecting to %s:%s...", CTRL_HOST(ml), ctrl_port);
 
     if (ml_connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
         ESP_LOGE(TAG, "TCP connect failed: %d", errno);
@@ -272,6 +308,17 @@ static int do_tcp_connect(microlink_t *ml) {
              (t_tcp - t_dns) / 1000, (t_tcp - t_start) / 1000);
 
     ml->coord_sock = sock;
+
+#ifdef CONFIG_ML_CTRL_TLS
+    if (ml_coord_tls_handshake(ml, CTRL_HOST(ml)) < 0) {
+        ml_close_sock(ml->coord_sock);
+        ml->coord_sock = -1;
+        return -1;
+    }
+    int64_t t_tls = esp_timer_get_time();
+    ESP_LOGI(TAG, "[TIMING] Control TLS handshake: %lld ms", (t_tls - t_tcp) / 1000);
+#endif
+
     return 0;
 }
 
@@ -286,10 +333,27 @@ static int s_server_extra_data_len = 0;
 static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_noise_start = esp_timer_get_time();
 
-    /* Initialize Noise state with our machine key and Tailscale's server key */
+    /* Initialize Noise state with our machine key and the control plane's
+     * server key. Priority: config-struct key (runtime, e.g. fetched from
+     * https://<control-host>/key?v=88 at provisioning time) >
+     * CONFIG_ML_CTRL_NOISE_PUBKEY_HEX (build-time) > built-in Tailscale key. */
+    const uint8_t *server_key = NULL;
+    if (ml->ctrl_noise_pubkey_set) {
+        server_key = ml->ctrl_noise_pubkey;
+    }
+#ifdef CONFIG_ML_CTRL_NOISE_PUBKEY_HEX
+    static uint8_t custom_server_key[32];
+    if (!server_key && CONFIG_ML_CTRL_NOISE_PUBKEY_HEX[0] != '\0') {
+        if (hex_to_bytes(CONFIG_ML_CTRL_NOISE_PUBKEY_HEX, custom_server_key, 32) == 32) {
+            server_key = custom_server_key;
+        } else {
+            ESP_LOGE(TAG, "Invalid ML_CTRL_NOISE_PUBKEY_HEX (need 64 hex chars) — using built-in key");
+        }
+    }
+#endif
     ml_noise_init(noise,
                    ml->machine_private_key, ml->machine_public_key,
-                   NULL);  /* NULL = use default Tailscale server key */
+                   server_key);
 
     /* Build Noise message 1 (101 bytes) */
     uint8_t msg1[128];
@@ -334,7 +398,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     uint8_t *resp = ml_psram_malloc(2048);
     if (!resp) return -1;
 
-    int total = ml_recv(ml->coord_sock, resp, 2047, 0);
+    int total = coord_raw_recv(ml, resp, 2047);
     if (total <= 0) {
         ESP_LOGE(TAG, "Handshake recv failed: %d (errno=%d)", total, errno);
         free(resp);
@@ -468,7 +532,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
 
         extra_data = ml_psram_malloc(1024);
         if (extra_data) {
-            int n = ml_recv(ml->coord_sock, extra_data, 1024, 0);
+            int n = coord_raw_recv(ml, extra_data, 1024);
             if (n > 0) {
                 extra_len = n;
                 ESP_LOGI(TAG, "Read %d bytes of proactive frames from socket", extra_len);
@@ -687,6 +751,9 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
  * State: REGISTER - Send RegisterRequest, parse RegisterResponse
  * ========================================================================== */
 
+/* do_register: the control plane rejected our auth (vs. -1 = I/O error) */
+#define ML_REG_AUTH_FAILED (-2)
+
 static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_reg_start = esp_timer_get_time();
 
@@ -714,7 +781,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON *hostinfo = cJSON_CreateObject();
     const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
     cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-    cJSON_AddStringToObject(hostinfo, "OS", "linux");
+    cJSON_AddStringToObject(hostinfo, "OS", "esp32");
     cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
     cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
 
@@ -879,6 +946,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
 
         fpos += f_len;
     }
+    (void)got_end_stream;  /* Currently unused for completion detection (suppress -Wunused-but-set-variable) */
     free(h2_resp);
 
     /* Send connection-level WINDOW_UPDATE for RegisterResponse.
@@ -911,6 +979,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
         hexbuf[dump * 3] = '\0';
         ESP_LOGI(TAG, "RegisterResponse first %d bytes (hex): %s", dump, hexbuf);
     }
+
 
     /* Find start of JSON - skip any binary prefix */
     char *parse_start = (char *)json_data;
@@ -946,6 +1015,25 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     }
     parse_start[parse_len] = saved;
     free(resp_buf);
+
+    /* The control plane reports auth problems in-band: a non-empty Error or
+     * MachineAuthorized=false means the auth key was rejected (expired,
+     * revoked, or pending approval). Without this check a rejected
+     * registration looks like success and the client spins in the reconnect
+     * loop with no way for the host app to tell the user. Return
+     * ML_REG_AUTH_FAILED so the coordinator can raise ML_STATE_AUTH_FAILED. */
+    cJSON *reg_err = cJSON_GetObjectItem(resp_json, "Error");
+    if (reg_err && cJSON_IsString(reg_err) && reg_err->valuestring[0]) {
+        ESP_LOGE(TAG, "Registration rejected by control plane: %s", reg_err->valuestring);
+        cJSON_Delete(resp_json);
+        return ML_REG_AUTH_FAILED;
+    }
+    cJSON *authorized = cJSON_GetObjectItem(resp_json, "MachineAuthorized");
+    if (authorized && cJSON_IsFalse(authorized)) {
+        ESP_LOGE(TAG, "Registration not authorized by control plane");
+        cJSON_Delete(resp_json);
+        return ML_REG_AUTH_FAILED;
+    }
 
     /* Extract our VPN IP from Node.Addresses */
     cJSON *node = cJSON_GetObjectItem(resp_json, "Node");
@@ -1300,6 +1388,180 @@ static int add_endpoints_to_json(microlink_t *ml, cJSON *root) {
     return count;
 }
 
+/* Ingest the self-node info (VPN IP / HomeDERP / KeyExpiry / Expired) from
+ * a MapResponse. Shared parser called from both paths — the Stream=false
+ * one-shot fetch and the streaming_map_fetch initial netmap (extracted from
+ * do_fetch_peers). */
+static void parse_self_node_from_map(microlink_t *ml, cJSON *map_json) {
+    cJSON *node = cJSON_GetObjectItem(map_json, "Node");
+    if (!node) return;
+
+    /* Extract VPN IP if not already set */
+    if (ml->vpn_ip == 0) {
+        cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
+        if (addresses && cJSON_GetArraySize(addresses) > 0) {
+            const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
+            if (addr) {
+                unsigned a, b, c, d;
+                if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+                    ml->vpn_ip = (a << 24) | (b << 16) | (c << 8) | d;
+                    char ip_str[16];
+                    microlink_ip_to_str(ml->vpn_ip, ip_str);
+                    ESP_LOGI(TAG, "Our VPN IP: %s", ip_str);
+                }
+            }
+        }
+    }
+    /* Parse self-node DERP region — try modern HomeDERP (int) first,
+     * then fall back to legacy DERP string (format: "127.3.3.40:REGION") */
+    cJSON *home_derp = cJSON_GetObjectItem(node, "HomeDERP");
+    if (home_derp && cJSON_IsNumber(home_derp) && home_derp->valueint > 0) {
+        ml->derp_home_region = (uint16_t)home_derp->valueint;
+        ESP_LOGI(TAG, "Home DERP region: %d (from server, HomeDERP)", ml->derp_home_region);
+    } else {
+        cJSON *self_derp = cJSON_GetObjectItem(node, "DERP");
+        if (self_derp && self_derp->valuestring) {
+            ESP_LOGI(TAG, "Self-Node DERP: %s", self_derp->valuestring);
+            const char *colon = strrchr(self_derp->valuestring, ':');
+            if (colon) {
+                int region = atoi(colon + 1);
+                if (region > 0) {
+                    ml->derp_home_region = (uint16_t)region;
+                    ESP_LOGI(TAG, "Home DERP region: %d (from server, legacy DERP)", region);
+                }
+            }
+        }
+    }
+    /* Fallback: if server didn't assign a DERP region, use our configured default */
+    if (ml->derp_home_region == 0) {
+        ml->derp_home_region = ML_DERP_REGION;
+        ESP_LOGI(TAG, "Home DERP region: %d (default)", ML_DERP_REGION);
+    }
+    cJSON *self_key = cJSON_GetObjectItem(node, "Key");
+    if (self_key && self_key->valuestring) {
+        ESP_LOGI(TAG, "Self-Node Key (server): %.40s...", self_key->valuestring);
+        char our_hex[65];
+        bytes_to_hex(ml->wg_public_key, 32, our_hex);
+        ESP_LOGI(TAG, "Our WG pubkey (local):  nodekey:%.32s...", our_hex);
+    }
+
+    /* Parse KeyExpiry (ISO 8601: "YYYY-MM-DDTHH:MM:SSZ") */
+    cJSON *key_expiry = cJSON_GetObjectItem(node, "KeyExpiry");
+    if (key_expiry && key_expiry->valuestring) {
+        int yr, mo, dy, hr, mn, sc;
+        if (sscanf(key_expiry->valuestring, "%d-%d-%dT%d:%d:%d",
+                   &yr, &mo, &dy, &hr, &mn, &sc) >= 6) {
+            /* Simple epoch calculation (approximate, no leap second) */
+            /* Days from year 1970 */
+            int64_t days = 0;
+            for (int y = 1970; y < yr; y++) {
+                days += (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) ? 366 : 365;
+            }
+            static const int mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+            for (int m = 1; m < mo; m++) {
+                days += mdays[m];
+                if (m == 2 && (yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0))) days++;
+            }
+            days += dy - 1;
+            ml->key_expiry_epoch = days * 86400 + hr * 3600 + mn * 60 + sc;
+            ESP_LOGI(TAG, "Key expiry: %s (epoch: %lld)", key_expiry->valuestring,
+                     (long long)ml->key_expiry_epoch);
+        }
+    }
+
+    /* Check Expired flag */
+    cJSON *expired = cJSON_GetObjectItem(node, "Expired");
+    if (expired && cJSON_IsTrue(expired)) {
+        ml->key_expired = true;
+        ESP_LOGW(TAG, "Node key is EXPIRED — re-registration needed");
+    } else {
+        ml->key_expired = false;
+    }
+}
+
+/* Shared parser that ingests the DERPMap (all regions and nodes) from a
+ * MapResponse. Does nothing for MapResponses without a DERPMap (e.g.
+ * incremental updates). Called from both the Stream=false one-shot fetch
+ * and the streaming_map_fetch path (extracted from do_fetch_peers). */
+static void parse_derp_map_from_map(microlink_t *ml, cJSON *map_json) {
+    cJSON *derp_map = cJSON_GetObjectItem(map_json, "DERPMap");
+    if (!derp_map) return;
+    cJSON *regions = cJSON_GetObjectItem(derp_map, "Regions");
+    if (!regions) return;
+
+    ml->derp_region_count = 0;
+    cJSON *region_obj;
+    cJSON_ArrayForEach(region_obj, regions) {
+        if (ml->derp_region_count >= ML_MAX_DERP_REGIONS) break;
+        ml_derp_region_t *r = &ml->derp_regions[ml->derp_region_count];
+        memset(r, 0, sizeof(*r));
+
+        cJSON *rid = cJSON_GetObjectItem(region_obj, "RegionID");
+        if (rid) r->region_id = (uint16_t)rid->valuedouble;
+
+        cJSON *rcode = cJSON_GetObjectItem(region_obj, "RegionCode");
+        if (rcode && rcode->valuestring) {
+            strncpy(r->code, rcode->valuestring, sizeof(r->code) - 1);
+        }
+
+        cJSON *avoid = cJSON_GetObjectItem(region_obj, "Avoid");
+        if (avoid && cJSON_IsTrue(avoid)) r->avoid = true;
+
+        /* Parse nodes */
+        cJSON *nodes = cJSON_GetObjectItem(region_obj, "Nodes");
+        if (nodes) {
+            cJSON *node_obj;
+            cJSON_ArrayForEach(node_obj, nodes) {
+                if (r->node_count >= ML_MAX_DERP_NODES) break;
+                ml_derp_node_t *n = &r->nodes[r->node_count];
+                memset(n, 0, sizeof(*n));
+
+                cJSON *hn = cJSON_GetObjectItem(node_obj, "HostName");
+                if (hn && hn->valuestring) {
+                    strncpy(n->hostname, hn->valuestring, sizeof(n->hostname) - 1);
+                }
+
+                cJSON *ip4 = cJSON_GetObjectItem(node_obj, "IPv4");
+                if (ip4 && ip4->valuestring) {
+                    strncpy(n->ipv4, ip4->valuestring, sizeof(n->ipv4) - 1);
+                }
+
+                cJSON *ip6 = cJSON_GetObjectItem(node_obj, "IPv6");
+                if (ip6 && ip6->valuestring) {
+                    strncpy(n->ipv6, ip6->valuestring, sizeof(n->ipv6) - 1);
+                }
+
+                cJSON *sp = cJSON_GetObjectItem(node_obj, "STUNPort");
+                if (sp) n->stun_port = (uint16_t)sp->valuedouble;
+
+                cJSON *dp = cJSON_GetObjectItem(node_obj, "DERPPort");
+                if (dp) n->derp_port = (uint16_t)dp->valuedouble;
+
+                cJSON *so = cJSON_GetObjectItem(node_obj, "STUNOnly");
+                if (so && cJSON_IsTrue(so)) n->stun_only = true;
+
+                r->node_count++;
+            }
+        }
+
+        ESP_LOGI(TAG, "  DERP region %d (%s): %d nodes%s",
+                 r->region_id, r->code, r->node_count,
+                 r->avoid ? " [avoid]" : "");
+        for (int ni = 0; ni < r->node_count; ni++) {
+            ESP_LOGI(TAG, "    node: %s (v4=%s v6=%s stun=%d derp=%d%s)",
+                     r->nodes[ni].hostname,
+                     r->nodes[ni].ipv4[0] ? r->nodes[ni].ipv4 : "-",
+                     r->nodes[ni].ipv6[0] ? r->nodes[ni].ipv6 : "-",
+                     r->nodes[ni].stun_port ? r->nodes[ni].stun_port : 3478,
+                     r->nodes[ni].derp_port ? r->nodes[ni].derp_port : 443,
+                     r->nodes[ni].stun_only ? " stun-only" : "");
+        }
+
+        ml->derp_region_count++;
+    }
+    ESP_LOGI(TAG, "DERPMap: parsed %d regions", ml->derp_region_count);
+}
+
 static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_map_start = esp_timer_get_time();
 
@@ -1329,7 +1591,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON *hostinfo = cJSON_CreateObject();
     const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
     cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-    cJSON_AddStringToObject(hostinfo, "OS", "linux");
+    cJSON_AddStringToObject(hostinfo, "OS", "esp32");
     cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
     cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
     cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
@@ -1607,174 +1869,13 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     }
 
     /* Extract self-node info */
-    {
-        cJSON *node = cJSON_GetObjectItem(map_json, "Node");
-        if (node) {
-            /* Extract VPN IP if not already set */
-            if (ml->vpn_ip == 0) {
-                cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
-                if (addresses && cJSON_GetArraySize(addresses) > 0) {
-                    const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
-                    if (addr) {
-                        unsigned a, b, c, d;
-                        if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-                            ml->vpn_ip = (a << 24) | (b << 16) | (c << 8) | d;
-                            char ip_str[16];
-                            microlink_ip_to_str(ml->vpn_ip, ip_str);
-                            ESP_LOGI(TAG, "Our VPN IP: %s", ip_str);
-                        }
-                    }
-                }
-            }
-            /* Parse self-node DERP region — try modern HomeDERP (int) first,
-             * then fall back to legacy DERP string (format: "127.3.3.40:REGION") */
-            cJSON *home_derp = cJSON_GetObjectItem(node, "HomeDERP");
-            if (home_derp && cJSON_IsNumber(home_derp) && home_derp->valueint > 0) {
-                ml->derp_home_region = (uint16_t)home_derp->valueint;
-                ESP_LOGI(TAG, "Home DERP region: %d (from server, HomeDERP)", ml->derp_home_region);
-            } else {
-                cJSON *self_derp = cJSON_GetObjectItem(node, "DERP");
-                if (self_derp && self_derp->valuestring) {
-                    ESP_LOGI(TAG, "Self-Node DERP: %s", self_derp->valuestring);
-                    const char *colon = strrchr(self_derp->valuestring, ':');
-                    if (colon) {
-                        int region = atoi(colon + 1);
-                        if (region > 0) {
-                            ml->derp_home_region = (uint16_t)region;
-                            ESP_LOGI(TAG, "Home DERP region: %d (from server, legacy DERP)", region);
-                        }
-                    }
-                }
-            }
-            /* Fallback: if server didn't assign a DERP region, use our configured default */
-            if (ml->derp_home_region == 0) {
-                ml->derp_home_region = ML_DERP_REGION;
-                ESP_LOGI(TAG, "Home DERP region: %d (default)", ML_DERP_REGION);
-            }
-            cJSON *self_key = cJSON_GetObjectItem(node, "Key");
-            if (self_key && self_key->valuestring) {
-                ESP_LOGI(TAG, "Self-Node Key (server): %.40s...", self_key->valuestring);
-                char our_hex[65];
-                bytes_to_hex(ml->wg_public_key, 32, our_hex);
-                ESP_LOGI(TAG, "Our WG pubkey (local):  nodekey:%.32s...", our_hex);
-            }
-
-            /* Parse KeyExpiry (ISO 8601: "YYYY-MM-DDTHH:MM:SSZ") */
-            cJSON *key_expiry = cJSON_GetObjectItem(node, "KeyExpiry");
-            if (key_expiry && key_expiry->valuestring) {
-                int yr, mo, dy, hr, mn, sc;
-                if (sscanf(key_expiry->valuestring, "%d-%d-%dT%d:%d:%d",
-                           &yr, &mo, &dy, &hr, &mn, &sc) >= 6) {
-                    /* Simple epoch calculation (approximate, no leap second) */
-                    /* Days from year 1970 */
-                    int64_t days = 0;
-                    for (int y = 1970; y < yr; y++) {
-                        days += (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) ? 366 : 365;
-                    }
-                    static const int mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
-                    for (int m = 1; m < mo; m++) {
-                        days += mdays[m];
-                        if (m == 2 && (yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0))) days++;
-                    }
-                    days += dy - 1;
-                    ml->key_expiry_epoch = days * 86400 + hr * 3600 + mn * 60 + sc;
-                    ESP_LOGI(TAG, "Key expiry: %s (epoch: %lld)", key_expiry->valuestring,
-                             (long long)ml->key_expiry_epoch);
-                }
-            }
-
-            /* Check Expired flag */
-            cJSON *expired = cJSON_GetObjectItem(node, "Expired");
-            if (expired && cJSON_IsTrue(expired)) {
-                ml->key_expired = true;
-                ESP_LOGW(TAG, "Node key is EXPIRED — re-registration needed");
-            } else {
-                ml->key_expired = false;
-            }
-        }
-    }
+    parse_self_node_from_map(ml, map_json);
 
     /* Parse peers */
     parse_peers_from_map_response(ml, map_json);
 
     /* Extract DERPMap if present — parse all regions and nodes */
-    cJSON *derp_map = cJSON_GetObjectItem(map_json, "DERPMap");
-    if (derp_map) {
-        cJSON *regions = cJSON_GetObjectItem(derp_map, "Regions");
-        if (regions) {
-            ml->derp_region_count = 0;
-            cJSON *region_obj;
-            cJSON_ArrayForEach(region_obj, regions) {
-                if (ml->derp_region_count >= ML_MAX_DERP_REGIONS) break;
-                ml_derp_region_t *r = &ml->derp_regions[ml->derp_region_count];
-                memset(r, 0, sizeof(*r));
-
-                cJSON *rid = cJSON_GetObjectItem(region_obj, "RegionID");
-                if (rid) r->region_id = (uint16_t)rid->valuedouble;
-
-                cJSON *rcode = cJSON_GetObjectItem(region_obj, "RegionCode");
-                if (rcode && rcode->valuestring) {
-                    strncpy(r->code, rcode->valuestring, sizeof(r->code) - 1);
-                }
-
-                cJSON *avoid = cJSON_GetObjectItem(region_obj, "Avoid");
-                if (avoid && cJSON_IsTrue(avoid)) r->avoid = true;
-
-                /* Parse nodes */
-                cJSON *nodes = cJSON_GetObjectItem(region_obj, "Nodes");
-                if (nodes) {
-                    cJSON *node_obj;
-                    cJSON_ArrayForEach(node_obj, nodes) {
-                        if (r->node_count >= ML_MAX_DERP_NODES) break;
-                        ml_derp_node_t *n = &r->nodes[r->node_count];
-                        memset(n, 0, sizeof(*n));
-
-                        cJSON *hn = cJSON_GetObjectItem(node_obj, "HostName");
-                        if (hn && hn->valuestring) {
-                            strncpy(n->hostname, hn->valuestring, sizeof(n->hostname) - 1);
-                        }
-
-                        cJSON *ip4 = cJSON_GetObjectItem(node_obj, "IPv4");
-                        if (ip4 && ip4->valuestring) {
-                            strncpy(n->ipv4, ip4->valuestring, sizeof(n->ipv4) - 1);
-                        }
-
-                        cJSON *ip6 = cJSON_GetObjectItem(node_obj, "IPv6");
-                        if (ip6 && ip6->valuestring) {
-                            strncpy(n->ipv6, ip6->valuestring, sizeof(n->ipv6) - 1);
-                        }
-
-                        cJSON *sp = cJSON_GetObjectItem(node_obj, "STUNPort");
-                        if (sp) n->stun_port = (uint16_t)sp->valuedouble;
-
-                        cJSON *dp = cJSON_GetObjectItem(node_obj, "DERPPort");
-                        if (dp) n->derp_port = (uint16_t)dp->valuedouble;
-
-                        cJSON *so = cJSON_GetObjectItem(node_obj, "STUNOnly");
-                        if (so && cJSON_IsTrue(so)) n->stun_only = true;
-
-                        r->node_count++;
-                    }
-                }
-
-                ESP_LOGI(TAG, "  DERP region %d (%s): %d nodes%s",
-                         r->region_id, r->code, r->node_count,
-                         r->avoid ? " [avoid]" : "");
-                for (int ni = 0; ni < r->node_count; ni++) {
-                    ESP_LOGI(TAG, "    node: %s (v4=%s v6=%s stun=%d derp=%d%s)",
-                             r->nodes[ni].hostname,
-                             r->nodes[ni].ipv4[0] ? r->nodes[ni].ipv4 : "-",
-                             r->nodes[ni].ipv6[0] ? r->nodes[ni].ipv6 : "-",
-                             r->nodes[ni].stun_port ? r->nodes[ni].stun_port : 3478,
-                             r->nodes[ni].derp_port ? r->nodes[ni].derp_port : 443,
-                             r->nodes[ni].stun_only ? " stun-only" : "");
-                }
-
-                ml->derp_region_count++;
-            }
-            ESP_LOGI(TAG, "DERPMap: parsed %d regions", ml->derp_region_count);
-        }
-    }
+    parse_derp_map_from_map(ml, map_json);
 
     cJSON_Delete(map_json);
     free(resp_buf);
@@ -1792,8 +1893,11 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
  * State: LONG_POLL - Start streaming MapRequest + process incremental updates
  * ========================================================================== */
 
-/* Send MapRequest with Stream=true to start long-poll on H2 stream 5 */
-static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
+/* Send MapRequest with Stream=true to start long-poll on H2 stream 5.
+ * omit_peers=false is for streaming_map_fetch: when the initial peer fetch
+ * is not done via Stream=false, the first stream message must carry the
+ * full netmap (Peers + DERPMap), so OmitPeers is dropped. */
+static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise, bool omit_peers) {
     cJSON *root = cJSON_CreateObject();
     if (!root) return -1;
 
@@ -1814,7 +1918,7 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
     if (hostinfo) {
         const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
         cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-        cJSON_AddStringToObject(hostinfo, "OS", "linux");
+        cJSON_AddStringToObject(hostinfo, "OS", "esp32");
         cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
         cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
         cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
@@ -1837,7 +1941,11 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON_AddBoolToObject(root, "Stream", true);
     cJSON_AddBoolToObject(root, "KeepAlive", true);
     cJSON_AddStringToObject(root, "Compress", "");    /* Disable compression */
-    cJSON_AddBoolToObject(root, "OmitPeers", true);   /* Already have peers */
+    /* omit_peers=true: peers were already fetched via Stream=false
+     * (existing path).
+     * omit_peers=false: streaming_map_fetch — receive all peers + DERPMap
+     * in the first stream message. */
+    cJSON_AddBoolToObject(root, "OmitPeers", omit_peers);
 
     /* NOTE: With Version >= 68, the control plane IGNORES Endpoints and
      * Hostinfo in Stream=true MapRequests. Endpoints are sent via separate
@@ -1876,6 +1984,217 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise) {
     free(h2_buf);
 
     ESP_LOGI(TAG, "Streaming MapRequest sent on stream 5");
+    return 0;
+}
+
+/* For streaming_map_fetch: blockingly read the first MapResponse (the full
+ * netmap) on stream 5 opened by do_start_long_poll(omit_peers=false), and
+ * parse Node / Peers / DERPMap from it.
+ *
+ * headscale-based controllers such as ZTL do not respond to Stream=false
+ * MapRequests, so this function fetches the initial netmap instead of
+ * do_fetch_peers. A Stream=true response keeps the stream open and never
+ * sends END_STREAM, so do_fetch_peers' END_STREAM detection cannot be used.
+ * Instead, message completion is detected via the 4-byte length prefix at
+ * the start of each message (the Tailscale/headscale map stream framing).
+ *
+ * The DERP connect request must be issued only after this function
+ * succeeds — in the reverse order we would try to connect to DERP without
+ * a DERPMap and fail (same symptom as getting stuck with Stream=false). */
+static int do_read_initial_netmap(microlink_t *ml, ml_noise_state_t *noise) {
+    int64_t t_map_start = esp_timer_get_time();
+
+    uint8_t *h2_recv = ml_psram_malloc(ML_H2_BUFFER_SIZE);
+    if (!h2_recv) return -1;
+    size_t h2_total = 0;
+    size_t fpos = 0;              /* Consumed H2 frame boundary */
+
+    uint8_t *resp_buf = ml_psram_malloc(ML_JSON_BUFFER_SIZE);
+    if (!resp_buf) { free(h2_recv); return -1; }
+    size_t json_total = 0;        /* Accumulated DATA payload of stream 5 */
+
+    /* The initial netmap can be large, so wait up to 60 seconds (same as do_fetch_peers) */
+    struct timeval rcv_tv = { .tv_sec = 60, .tv_usec = 0 };
+    ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
+
+    uint64_t recv_start_ms = ml_get_time_ms();
+    uint64_t last_progress_ms = recv_start_ms;
+    size_t window_consumed = 0;
+
+    size_t msg_len = 0;           /* Body length from the length prefix (0 = not yet known) */
+    size_t msg_off = 0;           /* Body start offset (= prefix length) */
+    bool msg_complete = false;
+
+    for (int read_count = 0; read_count < 200 && !msg_complete; read_count++) {
+        uint8_t *frame_buf = ml_psram_malloc(65536);
+        if (!frame_buf) break;
+
+        int frame_len = noise_recv(ml, noise, frame_buf, 65536);
+        if (frame_len <= 0) {
+            free(frame_buf);
+            break;
+        }
+
+        if (h2_total + frame_len >= ML_H2_BUFFER_SIZE) {
+            ESP_LOGW(TAG, "H2 buffer full at %dKB, truncating", (int)(h2_total / 1024));
+            free(frame_buf);
+            break;
+        }
+        memcpy(h2_recv + h2_total, frame_buf, frame_len);
+        h2_total += frame_len;
+        window_consumed += frame_len;
+        free(frame_buf);
+
+        /* Consume only complete H2 frames, in order. An H2 frame can span
+         * multiple Noise frames, so keep the consumption boundary fpos and
+         * process incrementally. */
+        while (fpos + 9 <= h2_total) {
+            uint32_t f_len = (h2_recv[fpos] << 16) | (h2_recv[fpos + 1] << 8) | h2_recv[fpos + 2];
+            uint8_t f_type = h2_recv[fpos + 3];
+            uint8_t f_flags = h2_recv[fpos + 4];
+            uint32_t f_stream = ((h2_recv[fpos + 5] & 0x7F) << 24) |
+                                (h2_recv[fpos + 6] << 16) |
+                                (h2_recv[fpos + 7] << 8) | h2_recv[fpos + 8];
+            if (fpos + 9 + f_len > h2_total) break;  /* Frame tail has not arrived yet */
+
+            const uint8_t *payload = h2_recv + fpos + 9;
+
+            if (f_type == 0x00 && f_stream == 5 && f_len > 0) {
+                /* DATA on stream 5 = the MapResponse body */
+                if (json_total + f_len < ML_JSON_BUFFER_SIZE) {
+                    memcpy(resp_buf + json_total, payload, f_len);
+                    json_total += f_len;
+                }
+            } else if (f_type == 0x06 && f_len == 8 && !(f_flags & 0x01)) {
+                /* HTTP/2 PING from the server -> reply with PONG (ignoring it gets us disconnected) */
+                uint8_t pong[17];
+                pong[0] = 0x00; pong[1] = 0x00; pong[2] = 0x08;
+                pong[3] = 0x06; pong[4] = 0x01;
+                pong[5] = 0x00; pong[6] = 0x00; pong[7] = 0x00; pong[8] = 0x00;
+                memcpy(pong + 9, payload, 8);
+                noise_send(ml, noise, pong, sizeof(pong));
+            } else if (f_type == 0x04 && !(f_flags & 0x01)) {
+                /* HTTP/2 SETTINGS → ACK */
+                uint8_t settings_ack[9] = {0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00};
+                noise_send(ml, noise, settings_ack, sizeof(settings_ack));
+            }
+            /* Skip everything else (HEADERS etc.) */
+            fpos += 9 + f_len;
+        }
+
+        /* Message completion check: 4-byte length prefix at the start.
+         * Tailscale / headscale write it little-endian, but as a safeguard
+         * against implementation differences, try BE if the LE value is
+         * implausible; raw JSON without a prefix (starting with '{') is
+         * considered complete once it parses fully. */
+        if (json_total >= 4 && msg_len == 0 && resp_buf[0] != '{') {
+            size_t le = (size_t)resp_buf[0] | ((size_t)resp_buf[1] << 8) |
+                        ((size_t)resp_buf[2] << 16) | ((size_t)resp_buf[3] << 24);
+            size_t be = ((size_t)resp_buf[0] << 24) | ((size_t)resp_buf[1] << 16) |
+                        ((size_t)resp_buf[2] << 8) | (size_t)resp_buf[3];
+            if (le > 0 && le < ML_JSON_BUFFER_SIZE) {
+                msg_len = le;
+                msg_off = 4;
+            } else if (be > 0 && be < ML_JSON_BUFFER_SIZE) {
+                msg_len = be;
+                msg_off = 4;
+            }
+        }
+        if (msg_len > 0 && json_total >= msg_off + msg_len) {
+            msg_complete = true;
+            ESP_LOGI(TAG, "Initial netmap complete: %d bytes (%lums)",
+                     (int)msg_len, (unsigned long)(ml_get_time_ms() - recv_start_ms));
+        } else if (msg_len == 0 && json_total > 0 && resp_buf[0] == '{') {
+            resp_buf[json_total] = '\0';  /* Safe: accumulation is capped at SIZE-1 */
+            cJSON *probe = cJSON_Parse((char *)resp_buf);
+            if (probe) {
+                cJSON_Delete(probe);
+                msg_len = json_total;
+                msg_off = 0;
+                msg_complete = true;
+                ESP_LOGI(TAG, "Initial netmap complete (no length prefix): %d bytes",
+                         (int)msg_len);
+            }
+        }
+
+        uint64_t now = ml_get_time_ms();
+        if (!msg_complete && now - last_progress_ms > 5000) {
+            ESP_LOGI(TAG, "Initial netmap: received %dKB so far (%lums elapsed)",
+                     (int)(json_total / 1024), (unsigned long)(now - recv_start_ms));
+            last_progress_ms = now;
+        }
+
+        /* Every 32KB, replenish flow control with WINDOW_UPDATE (connection
+         * level + stream 5) so the server never stalls sending (same
+         * pattern as do_fetch_peers). */
+        if (window_consumed >= 32768) {
+            uint8_t wu_buf[26];
+            int wu_len = ml_h2_build_window_update(wu_buf, 13, 0, (uint32_t)window_consumed);
+            wu_len += ml_h2_build_window_update(wu_buf + wu_len, 13, 5, (uint32_t)window_consumed);
+            if (wu_len > 0) noise_send(ml, noise, wu_buf, wu_len);
+            window_consumed = 0;
+        }
+    }
+
+    /* Restore the normal recv timeout (5 seconds) */
+    rcv_tv.tv_sec = 5;
+    ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
+
+    free(h2_recv);
+
+    /* Replenish the remaining flow control. Stream 5 stays open (the
+     * long-poll continues), so always replenish the stream level as well,
+     * not just the connection level. */
+    if (window_consumed > 0) {
+        uint8_t wu_buf[26];
+        int wu_len = ml_h2_build_window_update(wu_buf, 13, 0, (uint32_t)window_consumed);
+        wu_len += ml_h2_build_window_update(wu_buf + wu_len, 13, 5, (uint32_t)window_consumed);
+        if (wu_len > 0) noise_send(ml, noise, wu_buf, wu_len);
+    }
+
+    if (!msg_complete || json_total == 0) {
+        ESP_LOGW(TAG, "Initial netmap not received (got %d bytes, complete=%d)",
+                 (int)json_total, msg_complete ? 1 : 0);
+        free(resp_buf);
+        return -1;
+    }
+
+    /* Parse the body (skipping the prefix). Even if a fragment of the next
+     * message is mixed in at the tail, we cut at msg_len so it is harmless.
+     * The next keepalive normally arrives 60 seconds later, so in practice
+     * a fragment almost never gets mixed in. */
+    char *parse_start = (char *)resp_buf + msg_off;
+    char saved = parse_start[msg_len];
+    parse_start[msg_len] = '\0';
+    cJSON *map_json = cJSON_Parse(parse_start);
+    parse_start[msg_len] = saved;
+
+    if (!map_json) {
+        const char *err = cJSON_GetErrorPtr();
+        ESP_LOGE(TAG, "Initial netmap JSON parse failed near: %.50s", err ? err : "unknown");
+        free(resp_buf);
+        return -1;
+    }
+
+    if (json_total > msg_off + msg_len) {
+        ESP_LOGD(TAG, "Initial netmap: %d trailing bytes discarded",
+                 (int)(json_total - msg_off - msg_len));
+    }
+
+    /* Ingest self-node info / peers / DERPMap (via the same shared parsers
+     * as do_fetch_peers — the DERP connection relies on the DERPMap being
+     * reliably parsed here). */
+    parse_self_node_from_map(ml, map_json);
+    parse_peers_from_map_response(ml, map_json);
+    parse_derp_map_from_map(ml, map_json);
+
+    cJSON_Delete(map_json);
+    free(resp_buf);
+
+    int64_t t_map_done = esp_timer_get_time();
+    ESP_LOGI(TAG, "[TIMING] Initial netmap recv+parse: %lld ms (%dKB)",
+             (t_map_done - t_map_start) / 1000, (int)(json_total / 1024));
+
     return 0;
 }
 
@@ -1919,7 +2238,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     if (hostinfo) {
         const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
         cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-        cJSON_AddStringToObject(hostinfo, "OS", "linux");
+        cJSON_AddStringToObject(hostinfo, "OS", "esp32");
         cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
         cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
         cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
@@ -1987,13 +2306,20 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
 
 /* Try to read one incremental MapResponse update (non-blocking) */
 static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
-    /* Use select() to check if data is available before blocking in recv */
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(ml->coord_sock, &readfds);
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };  /* 50ms */
-    int sel = ml_select_fds(ml->coord_sock + 1, &readfds, NULL, NULL, &tv);
-    if (sel <= 0) return 0;  /* No data available or error */
+#ifdef CONFIG_ML_CTRL_TLS
+    /* Decrypted bytes may already sit in the TLS layer with nothing left
+     * on the socket — select() alone would miss them. */
+    if (ml_coord_tls_pending(ml) == 0)
+#endif
+    {
+        /* Use select() to check if data is available before blocking in recv */
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(ml->coord_sock, &readfds);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };  /* 50ms */
+        int sel = ml_select_fds(ml->coord_sock + 1, &readfds, NULL, NULL, &tv);
+        if (sel <= 0) return 0;  /* No data available or error */
+    }
 
     /* Data available — set short recv timeout for partial frame safety */
     struct timeval tv_recv = { .tv_sec = 2, .tv_usec = 0 };
@@ -2119,6 +2445,14 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
 
         /* Parse peer updates */
         parse_peers_from_map_response(ml, update_json);
+
+        /* With streaming_map_fetch, DERPMap updates also arrive on this
+         * stream (the initial fetch uses the same stream), so ingest them.
+         * Behavior of the existing path (initial fetch via Stream=false) is
+         * unchanged. No-op for incremental updates without a DERPMap. */
+        if (ml->config.streaming_map_fetch) {
+            parse_derp_map_from_map(ml, update_json);
+        }
         cJSON_Delete(update_json);
     }
 
@@ -2166,10 +2500,7 @@ void ml_coord_task(void *arg) {
                 }
                 break;
             case ML_CMD_DISCONNECT:
-                if (ml->coord_sock >= 0) {
-                    ml_close_sock(ml->coord_sock);
-                    ml->coord_sock = -1;
-                }
+                coord_close_conn(ml);
                 state = COORD_IDLE;
                 ml->state = ML_STATE_IDLE;
                 break;
@@ -2233,8 +2564,7 @@ void ml_coord_task(void *arg) {
             ml->state = ML_STATE_REGISTERING;
             if (do_noise_handshake(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "Noise handshake failed");
-                ml_close_sock(ml->coord_sock);
-                ml->coord_sock = -1;
+                coord_close_conn(ml);
                 state = COORD_RECONNECTING;
                 break;
             }
@@ -2248,8 +2578,7 @@ void ml_coord_task(void *arg) {
         case COORD_H2_PREFACE:
             if (do_h2_preface(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "H2 preface failed");
-                ml_close_sock(ml->coord_sock);
-                ml->coord_sock = -1;
+                coord_close_conn(ml);
                 state = COORD_RECONNECTING;
                 break;
             }
@@ -2258,24 +2587,55 @@ void ml_coord_task(void *arg) {
 
         case COORD_REGISTER:
             ESP_LOGI(TAG, "Registering...");
-            if (do_register(ml, &noise) < 0) {
-                ESP_LOGE(TAG, "Registration failed");
-                ml_close_sock(ml->coord_sock);
-                ml->coord_sock = -1;
-                state = COORD_RECONNECTING;
-                break;
+            {
+                int reg_rc = do_register(ml, &noise);
+                if (reg_rc < 0) {
+                    ESP_LOGE(TAG, "Registration failed");
+                    if (reg_rc == ML_REG_AUTH_FAILED) {
+                        /* Not transient: retrying with the same key will keep
+                         * failing. Notify the host (its "re-login" prompt) and
+                         * jump to maximum backoff — the loop keeps running in
+                         * case the key is re-enabled server-side. */
+                        ml->state = ML_STATE_AUTH_FAILED;
+                        if (ml->state_cb) {
+                            ml->state_cb(ml, ML_STATE_AUTH_FAILED, ml->state_cb_data);
+                        }
+                        reconnect_attempts = 5;
+                    }
+                    coord_close_conn(ml);
+                    state = COORD_RECONNECTING;
+                    break;
+                }
             }
             state = COORD_FETCH_PEERS;
             break;
 
         case COORD_FETCH_PEERS:
             ESP_LOGI(TAG, "Fetching peers...");
-            if (do_fetch_peers(ml, &noise) < 0) {
-                ESP_LOGW(TAG, "MapRequest failed, will retry");
-                ml_close_sock(ml->coord_sock);
-                ml->coord_sock = -1;
-                state = COORD_RECONNECTING;
-                break;
+            if (ml->config.streaming_map_fetch) {
+                /* headscale-based controllers such as ZTL do not respond to
+                 * Stream=false MapRequests (60s of zero bytes -> Empty
+                 * MapResponse -> reconnect loop). Like the official client,
+                 * start a single Stream=true / OmitPeers=false stream from
+                 * the beginning and take the full netmap (Peers + DERPMap)
+                 * from the first stream message. The DERP connect request is
+                 * issued after this point, once the DERPMap has been parsed
+                 * (in the reverse order we would try to connect to DERP
+                 * without a DERPMap and fail). */
+                if (do_start_long_poll(ml, &noise, false) < 0 ||
+                    do_read_initial_netmap(ml, &noise) < 0) {
+                    ESP_LOGW(TAG, "Streaming MapRequest failed, will retry");
+                    coord_close_conn(ml);
+                    state = COORD_RECONNECTING;
+                    break;
+                }
+            } else {
+                if (do_fetch_peers(ml, &noise) < 0) {
+                    ESP_LOGW(TAG, "MapRequest failed, will retry");
+                    coord_close_conn(ml);
+                    state = COORD_RECONNECTING;
+                    break;
+                }
             }
 
             xEventGroupSetBits(ml->events, ML_EVT_COORD_REGISTERED);
@@ -2289,9 +2649,15 @@ void ml_coord_task(void *arg) {
                                     pdFALSE, pdTRUE, pdMS_TO_TICKS(15000));
             }
 
-            /* Start streaming long-poll for incremental updates */
-            if (do_start_long_poll(ml, &noise) < 0) {
-                ESP_LOGW(TAG, "Failed to start long-poll (non-fatal)");
+            /* Start streaming long-poll for incremental updates.
+             * With streaming_map_fetch, the long-poll on stream 5 was
+             * already started for the initial fetch, so do not start it a
+             * second time (reusing the same stream ID would violate the H2
+             * protocol). */
+            if (!ml->config.streaming_map_fetch) {
+                if (do_start_long_poll(ml, &noise, true) < 0) {
+                    ESP_LOGW(TAG, "Failed to start long-poll (non-fatal)");
+                }
             }
 
             /* Send initial endpoint update if STUN already completed.
@@ -2495,6 +2861,10 @@ void ml_coord_task(void *arg) {
                                 break;
                             } else {
                                 ESP_LOGE(TAG, "Key expired but no auth_key — manual re-provisioning needed!");
+                                ml->state = ML_STATE_AUTH_FAILED;
+                                if (ml->state_cb) {
+                                    ml->state_cb(ml, ML_STATE_AUTH_FAILED, ml->state_cb_data);
+                                }
                             }
                         }
                         /* Warn 1 hour before expiry (rough uptime-based check) */
@@ -2552,7 +2922,20 @@ void ml_coord_task(void *arg) {
                 ESP_LOGI(TAG, "Reconnecting in %lu ms (attempt %d)",
                          (unsigned long)backoff_ms, reconnect_attempts + 1);
 
-                ml->state = ML_STATE_RECONNECTING;
+                /* Notify the host like CONNECTED and AUTH_FAILED do, so a
+                 * status display does not keep showing "connected" through an
+                 * outage. The loop re-enters this state on every backoff
+                 * cycle, so fire only on the transition — and never downgrade
+                 * AUTH_FAILED, which requires human action: overwriting it
+                 * with RECONNECTING on each retry would clear the host's
+                 * re-login prompt. */
+                if (ml->state != ML_STATE_RECONNECTING &&
+                    ml->state != ML_STATE_AUTH_FAILED) {
+                    ml->state = ML_STATE_RECONNECTING;
+                    if (ml->state_cb) {
+                        ml->state_cb(ml, ML_STATE_RECONNECTING, ml->state_cb_data);
+                    }
+                }
 
                 /* Wait on command queue with backoff timeout (interruptible!) */
                 ml_coord_cmd_t wake_cmd;
@@ -2567,10 +2950,7 @@ void ml_coord_task(void *arg) {
                 reconnect_attempts++;
 
                 /* Close old connection */
-                if (ml->coord_sock >= 0) {
-                    ml_close_sock(ml->coord_sock);
-                    ml->coord_sock = -1;
-                }
+                coord_close_conn(ml);
 
                 /* Reset Noise state for fresh handshake */
                 memset(&noise, 0, sizeof(noise));
@@ -2582,10 +2962,7 @@ void ml_coord_task(void *arg) {
     }
 
     /* Cleanup */
-    if (ml->coord_sock >= 0) {
-        ml_close_sock(ml->coord_sock);
-        ml->coord_sock = -1;
-    }
+    coord_close_conn(ml);
     memset(&noise, 0, sizeof(noise));
 
     ESP_LOGI(TAG, "Coord task exiting");

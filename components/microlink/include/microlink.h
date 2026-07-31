@@ -45,6 +45,25 @@ typedef struct {
     uint32_t disco_heartbeat_ms;    /* DISCO keepalive interval (default: 3000) */
     uint32_t stun_interval_ms;      /* STUN re-probe interval (default: 23000) */
     uint32_t ctrl_watchdog_ms;      /* Control plane watchdog timeout (default: 120000) */
+
+    /* Custom control plane (Headscale / Ionscale). NULL = use the
+     * CONFIG_ML_CTRL_HOST / CONFIG_ML_CTRL_NOISE_PUBKEY_HEX build-time
+     * values, falling back to Tailscale's. The NVS web-UI override, if
+     * present, still wins over both. */
+    const char *ctrl_host;          /* Coordination server hostname */
+    const uint8_t *ctrl_noise_pubkey; /* Server Noise public key (32 bytes),
+                                        e.g. fetched from https://<host>/key?v=88
+                                        at provisioning time */
+
+    /* Some headscale-based controllers never respond to the initial
+     * Stream=false MapRequest (e.g. ZTL: 60s of zero bytes -> Empty
+     * MapResponse -> reconnect loop). The official Tailscale client uses a
+     * single Stream=true streaming poll from the start, and the first stream
+     * message carries the full netmap (Peers + DERPMap).
+     * Setting this to true switches to that scheme (start with Stream=true /
+     * OmitPeers=false and take Peers + DERPMap from the first MapResponse).
+     * false (default) keeps the existing Stream=false one-shot fetch. */
+    bool streaming_map_fetch;
 } microlink_config_t;
 
 /* Peer info (read-only snapshot) */
@@ -65,6 +84,12 @@ typedef enum {
     ML_STATE_CONNECTED,
     ML_STATE_RECONNECTING,
     ML_STATE_ERROR,
+    /* Registration was rejected by the control plane (expired/revoked auth
+     * key, or the node awaits authorization). The stack keeps retrying at
+     * maximum backoff, but recovery normally needs a new auth key — hosts
+     * should surface this to the user as their equivalent of a "re-login"
+     * prompt (headless devices have no UI to notice it otherwise). */
+    ML_STATE_AUTH_FAILED,
 } microlink_state_t;
 
 /* Callback types */

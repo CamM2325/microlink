@@ -287,6 +287,37 @@ menu "MicroLink V2 Configuration"
 
     endmenu
 
+    menu "Control Plane"
+
+        config ML_CTRL_HOST
+            string "Control plane hostname"
+            default "controlplane.tailscale.com"
+            help
+                Coordination server hostname. Set to a Headscale-compatible
+                host (e.g. Lolipop Zero Trust Link controller) to use a
+                custom control plane. NVS runtime override still wins.
+
+        config ML_CTRL_TLS
+            bool "Connect to control plane over TLS (port 443)"
+            default n
+            help
+                Wrap the ts2021 Noise handshake in TLS on port 443 instead
+                of plain TCP on port 80. Required for control planes that
+                only expose an HTTPS listener (e.g. Headscale behind an LB).
+                The server certificate is NOT verified; the control plane is
+                authenticated by the pinned Noise public key instead, same
+                trust model as Tailscale's plain port-80 transport.
+
+        config ML_CTRL_NOISE_PUBKEY_HEX
+            string "Control plane Noise public key (hex)"
+            default ""
+            help
+                64-char hex of the control plane's Noise (machine) public key,
+                from https://<control-host>/key?v=88 → "publicKey":"mkey:<hex>".
+                Empty = use the built-in Tailscale key.
+
+    endmenu
+
     menu "HTTP Config Server"
 
         config ML_ENABLE_CONFIG_HTTPD
