@@ -1208,8 +1208,13 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     plaintext[pt_len++] = DISCO_MSG_CALL_ME_MAYBE;
     plaintext[pt_len++] = 0;  /* version */
 
-    /* 1. Local LAN IP endpoint (critical for same-network peers) */
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    /* 1. Local LAN IP endpoint (critical for same-network peers). Use whatever
+     * interface currently carries the default route (WiFi or Ethernet) rather
+     * than assuming WIFI_STA_DEF, so same-LAN direct paths work on Ethernet too. */
+    esp_netif_t *netif = esp_netif_get_default_netif();
+    if (!netif) {
+        netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    }
     if (netif) {
         esp_netif_ip_info_t ip_info;
         if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {

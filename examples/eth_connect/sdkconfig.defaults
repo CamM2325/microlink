@@ -1,0 +1,19 @@
+# MicroLink over Ethernet — ESP32-P4 (Waveshare)
+CONFIG_IDF_TARGET="esp32p4"
+
+# 32 MB HEX PSRAM (MicroLink allocates large buffers there)
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+
+# Ethernet: internal EMAC
+CONFIG_ETH_USE_ESP32_EMAC=y
+CONFIG_ETH_PHY_INTERFACE_RMII=y
+
+# mbedTLS: the coord/DERP TLS clients skip cert validation (Noise authenticates
+# the control plane), so no cert bundle is needed here.
+# ChaCha20-Poly1305 for the Noise layer (ml_noise.c). On WiFi SoCs the supplicant
+# pulls these in transitively; the P4 has no WiFi, so enable them explicitly.
+CONFIG_MBEDTLS_CHACHA20_C=y
+CONFIG_MBEDTLS_POLY1305_C=y
+CONFIG_MBEDTLS_CHACHAPOLY_C=y

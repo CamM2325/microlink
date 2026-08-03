@@ -31,6 +31,8 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "mbedtls/base64.h"
+#include "mbedtls/error.h"
+#include "mbedtls/net_sockets.h"
 #include <string.h>
 #include <errno.h>
 
@@ -85,7 +87,66 @@ static int hex_to_bytes(const char *hex, uint8_t *bytes, size_t max_len) {
  * TCP I/O helpers for coord socket (owned exclusively by this task)
  * ========================================================================== */
 
+/* --- optional TLS wrapper for the coordination connection (issue #16) ------ *
+ * When config.ctrl_tls is set the coord socket is wrapped in TLS, so the
+ * control plane can sit behind an HTTPS reverse proxy or be the hosted Tailscale
+ * service. The BIO and the setup mirror the DERP connection (see ml_derp.c). */
+
+#define COORD_TLS_TIMEOUT_MS 10000
+
+static int coord_bio_send(void *ctx, const unsigned char *buf, size_t len) {
+    int fd = *(int *)ctx;
+    if (fd < 0) return MBEDTLS_ERR_NET_INVALID_CONTEXT;
+    int ret = (int)ml_write_sock(fd, buf, len);
+    if (ret < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return MBEDTLS_ERR_SSL_WANT_WRITE;
+        if (errno == EPIPE || errno == ECONNRESET) return MBEDTLS_ERR_NET_CONN_RESET;
+        if (errno == EINTR) return MBEDTLS_ERR_SSL_WANT_WRITE;
+        return MBEDTLS_ERR_NET_SEND_FAILED;
+    }
+    return ret;
+}
+
+static int coord_bio_recv(void *ctx, unsigned char *buf, size_t len, uint32_t timeout) {
+    int fd = *(int *)ctx;
+    if (fd < 0) return MBEDTLS_ERR_NET_INVALID_CONTEXT;
+    uint32_t t = timeout ? timeout : COORD_TLS_TIMEOUT_MS;
+    struct timeval tv = { .tv_sec = t / 1000, .tv_usec = (t % 1000) * 1000 };
+    ml_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int ret = (int)ml_read_sock(fd, buf, len);
+    if (ret < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return MBEDTLS_ERR_SSL_TIMEOUT;
+        if (errno == EPIPE || errno == ECONNRESET) return MBEDTLS_ERR_NET_CONN_RESET;
+        if (errno == EINTR) return MBEDTLS_ERR_SSL_WANT_READ;
+        return MBEDTLS_ERR_NET_RECV_FAILED;
+    }
+    return ret;
+}
+
+/* Free the coord TLS context if one is up (before a reconnect, or on teardown). */
+static void coord_tls_free(microlink_t *ml) {
+    if (!ml->coord_tls_up) return;
+    mbedtls_ssl_free(&ml->coord_ssl);
+    mbedtls_ssl_config_free(&ml->coord_ssl_conf);
+    mbedtls_ctr_drbg_free(&ml->coord_ctr_drbg);
+    mbedtls_entropy_free(&ml->coord_entropy);
+    ml->coord_tls_up = false;
+}
+
 static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
+    if (ml->config.ctrl_tls) {
+        size_t sent = 0;
+        while (sent < len) {
+            int n = mbedtls_ssl_write(&ml->coord_ssl, data + sent, len - sent);
+            if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+            if (n <= 0) {
+                ESP_LOGE(TAG, "coord_send (tls) failed: %d", n);
+                return -1;
+            }
+            sent += n;
+        }
+        return 0;
+    }
     /* Set send timeout to prevent indefinite blocking (v1 uses MSG_DONTWAIT) */
     struct timeval snd_tv = { .tv_sec = 5, .tv_usec = 0 };
     ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
@@ -104,6 +165,30 @@ static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
 }
 
 static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
+    if (ml->config.ctrl_tls) {
+        size_t recvd = 0;
+        int retries = 0;
+        while (recvd < len) {
+            int n = mbedtls_ssl_read(&ml->coord_ssl, buf + recvd, len - recvd);
+            if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE ||
+                n == MBEDTLS_ERR_SSL_TIMEOUT) {
+                if (recvd == 0) return -1;   /* nothing consumed yet: caller can retry */
+                if (++retries > 300) {       /* ~3 s: must finish to keep frame alignment */
+                    ESP_LOGE(TAG, "coord_recv (tls) partial timeout: %d/%d", (int)recvd, (int)len);
+                    return -1;
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            if (n <= 0) {
+                ESP_LOGE(TAG, "coord_recv (tls) failed: %d", n);
+                return -1;
+            }
+            recvd += n;
+            retries = 0;
+        }
+        return 0;
+    }
     size_t recvd = 0;
     int retries = 0;
     while (recvd < len) {
@@ -132,6 +217,21 @@ static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
         retries = 0;  /* Reset on successful read */
     }
     return 0;
+}
+
+/* Read up to len bytes in one go (not a fixed-length read), TLS-aware. Used for
+ * the HTTP upgrade response and the proactive frames that may trail it. Returns
+ * the byte count, or <= 0 on error/timeout. Note: over TLS the read timeout is
+ * the config's (COORD_TLS_TIMEOUT_MS), not any SO_RCVTIMEO set by the caller. */
+static int coord_read_some(microlink_t *ml, uint8_t *buf, size_t len) {
+    if (ml->config.ctrl_tls) {
+        int n;
+        do {
+            n = mbedtls_ssl_read(&ml->coord_ssl, buf, len);
+        } while (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE);
+        return n;
+    }
+    return (int)ml_recv(ml->coord_sock, buf, len, 0);
 }
 
 /* ============================================================================
@@ -222,12 +322,21 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
 static int do_tcp_connect(microlink_t *ml) {
     int64_t t_start = esp_timer_get_time();
 
+    /* Drop any TLS context left from a previous connection before reconnecting. */
+    coord_tls_free(ml);
+
+    /* Control-plane port: explicit override, else 443 with TLS or 80 without. */
+    int port = ml->config.ctrl_port ? ml->config.ctrl_port
+                                     : (ml->config.ctrl_tls ? 443 : 80);
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
     ESP_LOGI(TAG, "Resolving %s...", CTRL_HOST(ml));
 
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
     struct addrinfo *res = NULL;
 
-    if (ml_getaddrinfo(CTRL_HOST(ml), "80", &hints, &res) != 0 || !res) {
+    if (ml_getaddrinfo(CTRL_HOST(ml), port_str, &hints, &res) != 0 || !res) {
         ESP_LOGE(TAG, "DNS resolve failed for %s", CTRL_HOST(ml));
         return -1;
     }
@@ -257,7 +366,7 @@ static int do_tcp_connect(microlink_t *ml) {
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
 
-    ESP_LOGI(TAG, "Connecting to %s:80...", CTRL_HOST(ml));
+    ESP_LOGI(TAG, "Connecting to %s:%d...", CTRL_HOST(ml), port);
 
     if (ml_connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
         ESP_LOGE(TAG, "TCP connect failed: %d", errno);
@@ -272,6 +381,45 @@ static int do_tcp_connect(microlink_t *ml) {
              (t_tcp - t_dns) / 1000, (t_tcp - t_start) / 1000);
 
     ml->coord_sock = sock;
+
+    /* Wrap the connection in TLS when the control plane requires it (issue #16).
+     * VERIFY_NONE matches the DERP connection: the ts2021 Noise handshake, not
+     * the TLS certificate, is what authenticates the control plane. */
+    if (ml->config.ctrl_tls) {
+        mbedtls_ssl_init(&ml->coord_ssl);
+        mbedtls_ssl_config_init(&ml->coord_ssl_conf);
+        mbedtls_entropy_init(&ml->coord_entropy);
+        mbedtls_ctr_drbg_init(&ml->coord_ctr_drbg);
+        ml->coord_tls_up = true;  /* context now needs freeing on the next reconnect */
+
+        mbedtls_ctr_drbg_seed(&ml->coord_ctr_drbg, mbedtls_entropy_func,
+                              &ml->coord_entropy, NULL, 0);
+        mbedtls_ssl_config_defaults(&ml->coord_ssl_conf, MBEDTLS_SSL_IS_CLIENT,
+                                    MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+        mbedtls_ssl_conf_authmode(&ml->coord_ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
+        mbedtls_ssl_conf_rng(&ml->coord_ssl_conf, mbedtls_ctr_drbg_random, &ml->coord_ctr_drbg);
+        mbedtls_ssl_conf_read_timeout(&ml->coord_ssl_conf, COORD_TLS_TIMEOUT_MS);
+        mbedtls_ssl_setup(&ml->coord_ssl, &ml->coord_ssl_conf);
+        mbedtls_ssl_set_hostname(&ml->coord_ssl, CTRL_HOST(ml));
+        mbedtls_ssl_set_bio(&ml->coord_ssl, &ml->coord_sock, coord_bio_send, NULL, coord_bio_recv);
+
+        int64_t t_tls_start = esp_timer_get_time();
+        int ret;
+        while ((ret = mbedtls_ssl_handshake(&ml->coord_ssl)) != 0) {
+            if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+            char eb[128];
+            mbedtls_strerror(ret, eb, sizeof(eb));
+            ESP_LOGE(TAG, "coord TLS handshake failed: %s", eb);
+            ml_close_sock(sock);
+            ml->coord_sock = -1;
+            coord_tls_free(ml);
+            return -1;
+        }
+        ESP_LOGI(TAG, "[TIMING] coord TLS handshake: %lld ms",
+                 (esp_timer_get_time() - t_tls_start) / 1000);
+        ESP_LOGI(TAG, "coord TLS established with %s", CTRL_HOST(ml));
+    }
+
     return 0;
 }
 
@@ -334,7 +482,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     uint8_t *resp = ml_psram_malloc(2048);
     if (!resp) return -1;
 
-    int total = ml_recv(ml->coord_sock, resp, 2047, 0);
+    int total = coord_read_some(ml, resp, 2047);
     if (total <= 0) {
         ESP_LOGE(TAG, "Handshake recv failed: %d (errno=%d)", total, errno);
         free(resp);
@@ -468,7 +616,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
 
         extra_data = ml_psram_malloc(1024);
         if (extra_data) {
-            int n = ml_recv(ml->coord_sock, extra_data, 1024, 0);
+            int n = coord_read_some(ml, extra_data, 1024);
             if (n > 0) {
                 extra_len = n;
                 ESP_LOGI(TAG, "Read %d bytes of proactive frames from socket", extra_len);
@@ -2586,6 +2734,11 @@ void ml_coord_task(void *arg) {
         ml_close_sock(ml->coord_sock);
         ml->coord_sock = -1;
     }
+    /* Free the TLS context too: mbedtls_ssl_free zeroizes the session key
+     * material, matching how the Noise state is wiped just below and the
+     * long-term keys in microlink_destroy. Otherwise a shutdown while connected
+     * over TLS would leak the context and leave its keys in freed heap. */
+    coord_tls_free(ml);
     memset(&noise, 0, sizeof(noise));
 
     ESP_LOGI(TAG, "Coord task exiting");

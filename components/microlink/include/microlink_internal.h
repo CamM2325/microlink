@@ -379,6 +379,15 @@ struct microlink_s {
 
     /* Coordination socket (owned exclusively by coord task) */
     int coord_sock;
+    /* Control-plane TLS (issue #16): when config.ctrl_tls is set, the coord
+     * connection is wrapped in TLS, mirroring the DERP setup, so it can reach a
+     * control server behind an HTTPS reverse proxy or the hosted Tailscale
+     * service. coord_tls_up tracks whether the context below is initialised. */
+    bool coord_tls_up;
+    mbedtls_ssl_context coord_ssl;
+    mbedtls_ssl_config coord_ssl_conf;
+    mbedtls_entropy_context coord_entropy;
+    mbedtls_ctr_drbg_context coord_ctr_drbg;
     uint32_t h2_next_stream_id;         /* Next H2 stream ID for endpoint updates (odd, starts at 7) */
 
     /* WireGuard netif (owned exclusively by wg_mgr task) */

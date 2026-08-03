@@ -12,6 +12,7 @@
 #include "esp_timer.h"
 #include "esp_mac.h"
 #include "esp_wifi.h"
+#include "soc/soc_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
@@ -306,12 +307,16 @@ esp_err_t microlink_start(microlink_t *ml) {
 
     ml->state = ML_STATE_WIFI_WAIT;
 
-    /* Set WiFi TX power if configured */
+    /* Set WiFi TX power if configured. Only on SoCs with a native radio - the
+     * ESP32-P4 (Ethernet/cellular here) has no WiFi MAC, so the symbol is not
+     * even linkable there. */
+#if SOC_WIFI_SUPPORTED
     if (ml->config.wifi_tx_power_dbm > 0) {
         int8_t power_quarter_dbm = ml->config.wifi_tx_power_dbm * 4;
         esp_wifi_set_max_tx_power(power_quarter_dbm);
         ESP_LOGI(TAG, "WiFi TX power set to %d dBm", ml->config.wifi_tx_power_dbm);
     }
+#endif
 
 #ifdef CONFIG_ML_ZERO_COPY_WG
     /* Zero-copy mode: raw lwIP PCB replaces BSD socket for DISCO/WG UDP.

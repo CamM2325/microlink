@@ -45,6 +45,15 @@ typedef struct {
     uint32_t disco_heartbeat_ms;    /* DISCO keepalive interval (default: 3000) */
     uint32_t stun_interval_ms;      /* STUN re-probe interval (default: 23000) */
     uint32_t ctrl_watchdog_ms;      /* Control plane watchdog timeout (default: 120000) */
+
+    /* Control-plane transport (issue #16). By default the coordination server is
+     * reached over plain TCP on port 80 - the Noise layer provides the
+     * encryption - which fails when the server sits behind an HTTPS reverse
+     * proxy (Caddy/nginx in front of Headscale) or is the hosted Tailscale
+     * service. Set ctrl_tls to wrap the coordination connection in TLS as well.
+     * ctrl_port overrides the TCP port (0 = 443 when ctrl_tls, otherwise 80). */
+    bool ctrl_tls;
+    uint16_t ctrl_port;
 } microlink_config_t;
 
 /* Peer info (read-only snapshot) */
