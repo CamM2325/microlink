@@ -32,6 +32,25 @@ menu "MicroLink V2 Configuration"
             communicate with). For large tailnets, set this to the actual
             peer count needed, not the total tailnet size.
 
+    config ML_DERP_REGION
+        int "Preferred DERP region ID"
+        default 9
+        help
+            Tailscale DERP region ID to advertise as this node's home region
+            (sent as Hostinfo.NetInfo.PreferredDERP) and to prefer for STUN
+            probing/relay fallback before any live latency measurement has
+            happened. Defaults to 9 (Dallas, Texas) - fine for North America,
+            but every deployment relying on DERP-relayed traffic (e.g. a peer
+            behind CGNAT with no direct path) from elsewhere in the world pays
+            needless latency relaying through Dallas instead of a nearby
+            region. Real Tailscale clients pick this by STUN-probing several
+            regions at startup and using whichever has the lowest measured
+            latency; this project doesn't do that yet, so pick the closest
+            region to this device's usual network by hand instead. Region IDs
+            are visible in this device's own boot log (`ml_coord: DERP region
+            N (code): ...`, printed once the initial MapResponse is parsed) -
+            e.g. 4 = Frankfurt, 14 = Amsterdam, 18 = Paris.
+
     config ML_PRIORITY_PEER_IP
         string "Priority peer VPN IP"
         default ""

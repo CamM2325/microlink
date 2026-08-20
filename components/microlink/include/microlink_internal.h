@@ -73,8 +73,14 @@ extern "C" {
 #define ML_MAX_PACKET_SIZE      1500
 #define ML_DERP_MAX_FRAME       (ML_MAX_PACKET_SIZE + 64)
 
-/* DERP */
-#define ML_DERP_REGION          9       /* Dallas (dfw) */
+/* DERP - preferred region is Kconfig-driven (default 9/Dallas) rather than
+ * hardcoded, so a deployment relying on DERP-relayed traffic (e.g. a peer
+ * behind CGNAT with no direct path) elsewhere in the world doesn't pay
+ * needless latency relaying through Dallas - see ML_DERP_REGION's Kconfig
+ * help text. ML_DERP_HOST/_PORT stay hardcoded: they're only a bootstrap
+ * fallback used before the first DERPMap arrives (ml_derp.c's ml_derp_connect
+ * uses the real per-region host from the parsed DERPMap once available). */
+#define ML_DERP_REGION          CONFIG_ML_DERP_REGION
 #define ML_DERP_HOST            "derp9e.tailscale.com"
 #define ML_DERP_PORT            443
 
