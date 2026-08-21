@@ -72,6 +72,50 @@ void wireguardif_disable_socket_bind(void) {
 	g_disable_socket_bind = true;
 }
 
+// netif_set_link_up() is core lwIP netif state and must only run on
+// tcpip_thread (confirmed on real hardware via CONFIG_LWIP_CHECK_THREAD_SAFETY,
+// which asserts immediately otherwise). Both call sites below run on whatever
+// task calls wireguardif_network_rx() (this project's ml_wg_mgr task, never
+// tcpip_thread - handshake messages are processed here directly, never via
+// the tcpip_input()-based inner-IP-packet path), so this always needs
+// dispatching, unlike wg_udp_output_cb's context-dependent case. Fire-and-forget
+// (tcpip_callback(), no wait): nothing here depends on netif_set_link_up()
+// having completed before this function returns, so there's no reason to pay
+// for a blocking round-trip on every handshake completion.
+static void netif_set_link_up_in_tcpip(void *arg) {
+	netif_set_link_up((struct netif *)arg);
+}
+static void wireguardif_mark_link_up(struct netif *netif) {
+	// One call site is per-data-packet (wireguard_process_data_message()'s
+	// defensive "make sure link is reported as up"), not just per-handshake -
+	// skip the tcpip_callback() dispatch entirely once the flag is already
+	// set, so the common case (link already up) costs one flag read, not a
+	// callback queued on every packet. Reading netif->flags without the core
+	// lock is fine here: it's a single bit that only ever transitions
+	// unset->set for the life of a session, so a stale read costs at most one
+	// redundant (still correct) dispatch, never a wrong result.
+	if (netif->flags & NETIF_FLAG_LINK_UP) {
+		return;
+	}
+	tcpip_callback(netif_set_link_up_in_tcpip, netif);
+}
+
+// Same thread-safety requirement and same reasoning as wireguardif_mark_link_up()
+// above - both of this function's call sites (wireguardif_tmr() and
+// wireguardif_periodic(), the periodic per-peer keepalive/rekey/timeout sweep)
+// run once per tick, not once per packet, but still worth skipping the
+// dispatch once the flag is already clear (the common steady-state case,
+// either "link up" or "link already reported down").
+static void netif_set_link_down_in_tcpip(void *arg) {
+	netif_set_link_down((struct netif *)arg);
+}
+static void wireguardif_mark_link_down(struct netif *netif) {
+	if (!(netif->flags & NETIF_FLAG_LINK_UP)) {
+		return;
+	}
+	tcpip_callback(netif_set_link_down_in_tcpip, netif);
+}
+
 bool wireguardif_is_wireguard_packet(const uint8_t *data, size_t len) {
 	if (len < 4) return false;
 	// WireGuard message types are 1-4 in the first 32-bit LE word
@@ -391,7 +435,7 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 		wireguardif_send_keepalive(device, peer);
 
 		// Set the IF-UP flag on netif
-		netif_set_link_up(device->netif);
+		wireguardif_mark_link_up(device->netif);
 		printf("[WG] *** WIREGUARD SESSION ESTABLISHED wg_idx=%u ***\n", wg_idx);
 	} else {
 		// Packet bad
@@ -482,7 +526,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 					}
 
 					// Make sure that link is reported as up
-					netif_set_link_up(device->netif);
+					wireguardif_mark_link_up(device->netif);
 
 					if (pbuf->tot_len > 0) {
 						//4a. Once the packet payload is decrypted, the interface has a plaintext packet. If this is not an IP packet, it is dropped.
@@ -537,11 +581,32 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 
 								// 5. If the plaintext packet has not been dropped, it is inserted into the receive queue of the wg0 interface.
 								if (dest_ok) {
-									// Send packet to be processed by LWIP
+									// Send packet to be processed by LWIP via netif->input(),
+									// NOT a hardcoded ip_input(): this whole function runs on
+									// the caller's own task (ml_wg_mgr, not lwIP's tcpip_thread),
+									// and ip_input()/ip4_input() is not thread-safe - it must
+									// only run on tcpip_thread. wg_init_interface() already sets
+									// netif->input = tcpip_input specifically so RX code would
+									// dispatch there instead of entering the IP stack directly -
+									// calling the netif's own configured input function (rather
+									// than hardcoding tcpip_input() here too) actually honors
+									// that existing setup, instead of just swapping one hardcoded
+									// function for another that happens to currently match it.
+									// Root-caused on real hardware (2026-08-20) - matches
+									// CamM2325/microlink#17 exactly; a stale comment here used to
+									// (incorrectly) claim ip_input()
+									// already dispatches to tcpip_thread internally, which it
+									// does not.
 									WG_DEBUG("[WG_RX_IP] Passing %u bytes to IP layer\n", (unsigned)pbuf->tot_len);
-									ip_input(pbuf, device->netif);
-									// pbuf is owned by IP layer now
-									pbuf = NULL;
+									err_t input_err = device->netif->input(pbuf, device->netif);
+									if (input_err == ERR_OK) {
+										// pbuf ownership transferred to netif->input()
+										pbuf = NULL;
+									} else {
+										WG_DEBUG("[WG_RX_IP] netif->input() failed: %d, dropping\n", input_err);
+										// pbuf stays non-NULL - freed by this function's
+										// normal cleanup path below
+									}
 								} else {
 									WG_DEBUG("[WG_RX_IP] DROPPED: dest_ok=false\n");
 								}
@@ -1155,7 +1220,7 @@ static void wireguardif_tmr(void *arg) {
 
 	if (!link_up) {
 		// Clear the IF-UP flag on netif
-		netif_set_link_down(device->netif);
+		wireguardif_mark_link_down(device->netif);
 	}
 }
 
@@ -1205,7 +1270,7 @@ void wireguardif_periodic(struct netif *netif) {
 		}
 	}
 	if (!link_up) {
-		netif_set_link_down(device->netif);
+		wireguardif_mark_link_down(device->netif);
 	}
 }
 
