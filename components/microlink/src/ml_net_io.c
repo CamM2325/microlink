@@ -142,20 +142,25 @@ void ml_net_io_task(void *arg) {
         }
         if (sel == 0) continue;  /* Timeout */
 
-        /* Process DISCO UDP socket */
+        /* Process DISCO UDP socket. This socket carries every tunnelled
+         * packet, so drain it rather than taking one datagram per select()
+         * round: that put a full select() and a scheduler round trip in front
+         * of each packet. Bounded so one busy socket cannot starve the rest
+         * of the loop. */
         if (ml->disco_sock4 >= 0 && FD_ISSET(ml->disco_sock4, &read_fds)) {
-            struct sockaddr_in src_addr;
-            socklen_t addr_len = sizeof(src_addr);
-            int n = ml_recvfrom(ml->disco_sock4, udp_buf, sizeof(udp_buf), 0,
-                             (struct sockaddr *)&src_addr, &addr_len);
-            if (n > 0) {
+            for (int drained = 0; drained < 32; drained++) {
+                struct sockaddr_in src_addr;
+                socklen_t addr_len = sizeof(src_addr);
+                int n = ml_recvfrom(ml->disco_sock4, udp_buf, sizeof(udp_buf),
+                                    MSG_DONTWAIT,
+                                    (struct sockaddr *)&src_addr, &addr_len);
+                if (n <= 0) break;
                 uint8_t *pkt_data = malloc(n);
-                if (pkt_data) {
-                    memcpy(pkt_data, udp_buf, n);
-                    uint32_t src_ip = ntohl(src_addr.sin_addr.s_addr);
-                    uint16_t src_port = ntohs(src_addr.sin_port);
-                    route_udp_packet(ml, pkt_data, n, src_ip, src_port);
-                }
+                if (!pkt_data) break;
+                memcpy(pkt_data, udp_buf, n);
+                uint32_t src_ip = ntohl(src_addr.sin_addr.s_addr);
+                uint16_t src_port = ntohs(src_addr.sin_port);
+                route_udp_packet(ml, pkt_data, n, src_ip, src_port);
             }
         }
 

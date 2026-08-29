@@ -1605,10 +1605,18 @@ void ml_wg_mgr_task(void *arg) {
             free(disco_pkt.data);
         }
 
-        /* Process WireGuard packets */
+        /* Process WireGuard packets.
+         * The first receive blocks briefly so the task wakes as soon as a
+         * packet lands rather than on the next fixed tick. Polling added up to
+         * 10 ms of latency to every packet and let the queue overflow between
+         * wakeups. When the queue is empty this blocks for the same 10 ms the
+         * trailing vTaskDelay used to, so the idle cost is unchanged. */
         ml_rx_packet_t wg_pkt;
-        while (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
+        if (xQueueReceive(ml->wg_rx_queue, &wg_pkt, pdMS_TO_TICKS(10)) == pdTRUE) {
             process_wg_packet(ml, &wg_pkt);
+            while (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
+                process_wg_packet(ml, &wg_pkt);
+            }
         }
 
         /* Run WireGuard periodic processing (handshakes, keepalives, rekeys).
@@ -1634,9 +1642,8 @@ void ml_wg_mgr_task(void *arg) {
             ESP_LOGI(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
         }
 
-        /* Yield - 10ms loop rate for minimum packet processing latency.
-         * Each wake is cheap: queue check + event bits check, no crypto. */
-        vTaskDelay(pdMS_TO_TICKS(10));
+        /* No trailing delay: the blocking receive above paces the loop and
+         * yields whenever there is nothing to do. */
     }
 
     /* Shutdown WireGuard interface */
