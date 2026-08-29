@@ -181,6 +181,23 @@ static err_t wg_derp_output_cb(const uint8_t *peer_public_key,
  * on that thread. */
 static struct udp_pcb *s_wg_output_pcb = NULL;
 
+/* Zero-copy WireGuard output. The encrypted pbuf is already PBUF_TRANSPORT
+ * with header room, so it goes straight to udp_sendto - no mem_malloc, no
+ * linearise, no second pbuf, no second copy. Ownership stays with
+ * wireguardif: udp_sendto does not consume q, and this callback is
+ * synchronous, so the caller's pbuf_free still applies. */
+static err_t wg_udp_output_pbuf_cb(uint32_t dest_ip, uint16_t dest_port,
+                                    struct pbuf *q, void *ctx) {
+    (void)ctx;
+    if (!s_wg_output_pcb) return ERR_CONN;
+
+    ip_addr_t dst;
+    IP_SET_TYPE_VAL(dst, IPADDR_TYPE_V4);
+    ip4_addr_set_u32(ip_2_ip4(&dst), dest_ip);  /* already network byte order */
+
+    return udp_sendto(s_wg_output_pcb, q, &dst, dest_port);
+}
+
 static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
                                 const uint8_t *data, size_t len, void *ctx) {
     microlink_t *ml = (microlink_t *)ctx;
@@ -291,6 +308,7 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
     /* Register output callbacks for magicsock mode */
     wireguardif_set_derp_output(netif, wg_derp_output_cb, ml);
     wireguardif_set_udp_output(netif, wg_udp_output_cb, ml);
+    wireguardif_set_udp_output_pbuf(netif, wg_udp_output_pbuf_cb, ml);
 
     /* On cellular AT socket bridge, force all WG output through DERP relay.
      * AT sockets are TCP-only, so direct UDP is impossible.

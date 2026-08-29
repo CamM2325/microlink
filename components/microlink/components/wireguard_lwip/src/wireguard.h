@@ -85,6 +85,13 @@ typedef err_t (*wireguard_derp_output_fn)(const uint8_t *peer_public_key, const 
 // len: length of data
 // Returns: ERR_OK on success, error code on failure
 typedef err_t (*wireguard_udp_output_fn)(uint32_t dest_ip, uint16_t dest_port, const uint8_t *data, size_t len, void *ctx);
+/* Same thing, but handed the encrypted pbuf itself. The byte-buffer form above
+ * forces a mem_malloc and a linearising copy here, and typically a second
+ * pbuf_alloc and copy inside the integrator's sender - two allocations and two
+ * ~1.3 KB copies per packet, all of it on the TCPIP thread. The encrypted pbuf
+ * is already PBUF_TRANSPORT with room for the UDP/IP headers, so udp_sendto()
+ * can take it as-is. */
+typedef err_t (*wireguard_udp_output_pbuf_fn)(uint32_t dest_ip, uint16_t dest_port, struct pbuf *q, void *ctx);
 
 struct wireguard_keypair {
 	bool valid;
@@ -207,6 +214,8 @@ struct wireguard_device {
 	// UDP output callback for magicsock mode (external unified socket)
 	wireguard_udp_output_fn udp_output_fn;
 	void *udp_output_ctx;
+	wireguard_udp_output_pbuf_fn udp_output_pbuf_fn;
+	void *udp_output_pbuf_ctx;
 
 	// Force all peer output through DERP relay (cellular mode)
 	bool force_derp_output;
