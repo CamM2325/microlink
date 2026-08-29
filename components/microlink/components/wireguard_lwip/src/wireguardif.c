@@ -157,6 +157,12 @@ static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct
 		return ERR_RTE;
 	}
 
+	// Zero-copy magicsock output: hand the encrypted pbuf over untouched.
+	if (device->udp_output_pbuf_fn) {
+		uint32_t dest_ip = ip4_addr_get_u32(ip_2_ip4(&peer->ip));
+		return device->udp_output_pbuf_fn(dest_ip, peer->port, q, device->udp_output_pbuf_ctx);
+	}
+
 	// In magicsock mode, use external UDP output callback
 	if (device->udp_output_fn) {
 		WG_DEBUG("[WG_OUT] Using magicsock callback\n");
@@ -191,6 +197,11 @@ static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct
 }
 
 static err_t wireguardif_device_output(struct wireguard_device *device, struct pbuf *q, const ip_addr_t *ipaddr, u16_t port) {
+	if (device->udp_output_pbuf_fn) {
+		uint32_t dest_ip = ip4_addr_get_u32(ip_2_ip4(ipaddr));
+		return device->udp_output_pbuf_fn(dest_ip, port, q, device->udp_output_pbuf_ctx);
+	}
+
 	// In magicsock mode, use external UDP output callback
 	if (device->udp_output_fn) {
 		uint8_t *data = (uint8_t *)mem_malloc(q->tot_len);
@@ -1373,6 +1384,17 @@ void wireguardif_set_udp_output(struct netif *netif, wireguard_udp_output_fn fn,
 		device->udp_output_fn = fn;
 		device->udp_output_ctx = ctx;
 		WG_DEBUG("[WG] UDP output callback registered (magicsock mode)\n");
+	}
+}
+
+void wireguardif_set_udp_output_pbuf(struct netif *netif, wireguard_udp_output_pbuf_fn fn, void *ctx) {
+	LWIP_ASSERT("netif != NULL", (netif != NULL));
+	LWIP_ASSERT("state != NULL", (netif->state != NULL));
+	struct wireguard_device *device = (struct wireguard_device *)netif->state;
+	if (device->valid) {
+		device->udp_output_pbuf_fn = fn;
+		device->udp_output_pbuf_ctx = ctx;
+		WG_DEBUG("[WG] zero-copy UDP output callback registered\n");
 	}
 }
 
