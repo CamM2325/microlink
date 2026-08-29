@@ -9,6 +9,7 @@
 #include "nacl_box.h"
 #include "x25519.h"
 #include <string.h>
+#include <stdbool.h>
 
 /* Debug logging - set to 1 to enable */
 #define NACL_BOX_DEBUG 0
@@ -537,6 +538,47 @@ int nacl_box_beforenm(uint8_t *shared_key,
     NACL_LOG_HEX("HSalsa20 derived key", shared_key, 32);
 
     memset(scalarmult_result, 0, sizeof(scalarmult_result));
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Shared-key cache
+ *
+ * Keyed on the peer public key; our secret key never changes at runtime, so a
+ * hit avoids the X25519 that would otherwise run on every DISCO packet.
+ * Entries are replaced round-robin - a tailnet has far fewer simultaneously
+ * active peers than slots, and a miss costs exactly what the old path did.
+ * ------------------------------------------------------------------------- */
+
+#define NACL_SHARED_CACHE_SLOTS 24
+
+static struct {
+    uint8_t peer_pk[32];
+    uint8_t shared_key[32];
+    bool    valid;
+} s_shared_cache[NACL_SHARED_CACHE_SLOTS];
+
+static int s_shared_cache_next;
+
+int nacl_box_shared_get(uint8_t *shared_key,
+                        const uint8_t *peer_pk,
+                        const uint8_t *our_sk) {
+    for (int i = 0; i < NACL_SHARED_CACHE_SLOTS; i++) {
+        if (s_shared_cache[i].valid &&
+            memcmp(s_shared_cache[i].peer_pk, peer_pk, 32) == 0) {
+            memcpy(shared_key, s_shared_cache[i].shared_key, 32);
+            return 0;
+        }
+    }
+
+    int ret = nacl_box_beforenm(shared_key, peer_pk, our_sk);
+    if (ret != 0) return ret;
+
+    int slot = s_shared_cache_next;
+    s_shared_cache_next = (s_shared_cache_next + 1) % NACL_SHARED_CACHE_SLOTS;
+    memcpy(s_shared_cache[slot].peer_pk, peer_pk, 32);
+    memcpy(s_shared_cache[slot].shared_key, shared_key, 32);
+    s_shared_cache[slot].valid = true;
     return 0;
 }
 

@@ -672,8 +672,10 @@ static void disco_build_ping(microlink_t *ml, int peer_idx,
 
     /* Encrypt with NaCl box: our disco private key -> peer's disco public key */
     uint8_t ciphertext[46 + NACL_BOX_MACBYTES];
-    nacl_box(ciphertext, plaintext, sizeof(plaintext), nonce,
-             p->disco_key, ml->disco_private_key);
+    uint8_t disco_shared[32];
+    nacl_box_shared_get(disco_shared, p->disco_key, ml->disco_private_key);
+    nacl_box_afternm(ciphertext, plaintext, sizeof(plaintext), nonce,
+                     disco_shared);
 
     /* Build packet: magic(6) + our_disco_pubkey(32) + nonce(24) + ciphertext(62) = 124 bytes */
     size_t pos = 0;
@@ -733,8 +735,10 @@ static void disco_build_pong(microlink_t *ml, int peer_idx,
 
     /* Encrypt */
     uint8_t ciphertext[32 + NACL_BOX_MACBYTES];
-    nacl_box(ciphertext, plaintext, sizeof(plaintext), nonce,
-             p->disco_key, ml->disco_private_key);
+    uint8_t disco_shared[32];
+    nacl_box_shared_get(disco_shared, p->disco_key, ml->disco_private_key);
+    nacl_box_afternm(ciphertext, plaintext, sizeof(plaintext), nonce,
+                     disco_shared);
 
     /* Build packet */
     size_t pos = 0;
@@ -1038,8 +1042,13 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
     uint8_t *plaintext = malloc(plaintext_len);
     if (!plaintext) return;
 
-    if (nacl_box_open(plaintext, ciphertext, ciphertext_len, nonce,
-                      sender_disco_key, ml->disco_private_key) != 0) {
+    /* Cached shared key: the X25519 inside nacl_box_open() costs ~30 ms and
+     * would otherwise run on every DISCO packet received. */
+    uint8_t disco_shared[32];
+    nacl_box_shared_get(disco_shared, sender_disco_key, ml->disco_private_key);
+
+    if (nacl_box_open_afternm(plaintext, ciphertext, ciphertext_len, nonce,
+                              disco_shared) != 0) {
         ESP_LOGW(TAG, "DISCO decrypt failed");
         free(plaintext);
         return;
@@ -1271,8 +1280,9 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     esp_fill_random(nonce, DISCO_NONCE_LEN);
 
     uint8_t ciphertext[sizeof(plaintext) + NACL_BOX_MACBYTES];
-    nacl_box(ciphertext, plaintext, pt_len, nonce,
-             p->disco_key, ml->disco_private_key);
+    uint8_t disco_shared[32];
+    nacl_box_shared_get(disco_shared, p->disco_key, ml->disco_private_key);
+    nacl_box_afternm(ciphertext, plaintext, pt_len, nonce, disco_shared);
 
     /* Build packet: magic(6) + disco_pubkey(32) + nonce(24) + ciphertext */
     uint8_t pkt[256];
