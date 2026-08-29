@@ -138,7 +138,7 @@ static err_t wg_derp_output_cb(const uint8_t *peer_public_key,
                 break;
             }
         }
-        ESP_LOGI(TAG, "WG INIT -> %s len=%d key=%02x%02x%02x%02x%02x%02x%02x%02x",
+        ESP_LOGD(TAG, "WG INIT -> %s len=%d key=%02x%02x%02x%02x%02x%02x%02x%02x",
                  hostname, (int)len,
                  peer_public_key[0], peer_public_key[1],
                  peer_public_key[2], peer_public_key[3],
@@ -150,18 +150,18 @@ static err_t wg_derp_output_cb(const uint8_t *peer_public_key,
             init_dump_count++;
             /* WG handshake init: type(1) reserved(3) sender(4) ephemeral(32)
              * enc_static(48) enc_timestamp(28) mac1(16) mac2(16) = 148 */
-            ESP_LOGI(TAG, "  type=%02x res=%02x%02x%02x sender=%02x%02x%02x%02x",
+            ESP_LOGD(TAG, "  type=%02x res=%02x%02x%02x sender=%02x%02x%02x%02x",
                      data[0], data[1], data[2], data[3],
                      data[4], data[5], data[6], data[7]);
-            ESP_LOGI(TAG, "  ephemeral=%02x%02x%02x%02x...%02x%02x%02x%02x",
+            ESP_LOGD(TAG, "  ephemeral=%02x%02x%02x%02x...%02x%02x%02x%02x",
                      data[8], data[9], data[10], data[11],
                      data[36], data[37], data[38], data[39]);
-            ESP_LOGI(TAG, "  mac1=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+            ESP_LOGD(TAG, "  mac1=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
                      data[116], data[117], data[118], data[119],
                      data[120], data[121], data[122], data[123],
                      data[124], data[125], data[126], data[127],
                      data[128], data[129], data[130], data[131]);
-            ESP_LOGI(TAG, "  mac2=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+            ESP_LOGD(TAG, "  mac2=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
                      data[132], data[133], data[134], data[135],
                      data[136], data[137], data[138], data[139],
                      data[140], data[141], data[142], data[143],
@@ -188,7 +188,7 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
 
     /* Log WG packets sent via direct UDP */
     uint32_t ip_host = ntohl(dest_ip);
-    ESP_LOGI(TAG, "WG UDP TX: %d bytes -> %d.%d.%d.%d:%d type=%d",
+    ESP_LOGD(TAG, "WG UDP TX: %d bytes -> %d.%d.%d.%d:%d type=%d",
              (int)len,
              (int)((ip_host >> 24) & 0xFF), (int)((ip_host >> 16) & 0xFF),
              (int)((ip_host >> 8) & 0xFF), (int)(ip_host & 0xFF),
@@ -692,7 +692,7 @@ static void disco_build_ping(microlink_t *ml, int peer_idx,
             pending_probes[i].sent_ms = ml_get_time_ms();
             pending_probes[i].active = true;
             registered = true;
-            ESP_LOGI(TAG, "Probe registered slot=%d peer=%s txid=%02x%02x%02x%02x",
+            ESP_LOGD(TAG, "Probe registered slot=%d peer=%s txid=%02x%02x%02x%02x",
                      i, p->hostname, txid[0], txid[1], txid[2], txid[3]);
             break;
         }
@@ -781,7 +781,7 @@ static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force) {
                         p->endpoints[i].port == p->best_port) continue;
                     int ret = disco_udp_sendto(ml, pkt, pkt_len, p->endpoints[i].ip, p->endpoints[i].port);
                     if (!direct_sent) {  /* Log only first direct send per peer */
-                        ESP_LOGI(TAG, "  direct probe -> %d.%d.%d.%d:%d (%d eps, ret=%d)",
+                        ESP_LOGD(TAG, "  direct probe -> %d.%d.%d.%d:%d (%d eps, ret=%d)",
                                  (int)((p->endpoints[i].ip >> 24) & 0xFF),
                                  (int)((p->endpoints[i].ip >> 16) & 0xFF),
                                  (int)((p->endpoints[i].ip >> 8) & 0xFF),
@@ -805,9 +805,9 @@ static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force) {
      * DERP pong stealing the probe match from the direct pong. */
     if (!p->has_direct_path || !direct_sent) {
         ml_derp_queue_send(ml, p->public_key, pkt, pkt_len);
-        ESP_LOGI(TAG, "DISCO PING -> %s via DERP", p->hostname);
+        ESP_LOGD(TAG, "DISCO PING -> %s via DERP", p->hostname);
     } else {
-        ESP_LOGI(TAG, "DISCO PING -> %s via direct %d.%d.%d.%d:%d",
+        ESP_LOGD(TAG, "DISCO PING -> %s via direct %d.%d.%d.%d:%d",
                  p->hostname,
                  (int)((p->best_ip >> 24) & 0xFF), (int)((p->best_ip >> 16) & 0xFF),
                  (int)((p->best_ip >> 8) & 0xFF), (int)(p->best_ip & 0xFF),
@@ -834,7 +834,7 @@ static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
 
     ml_peer_t *p = &ml->peers[peer_idx];
 
-    ESP_LOGI(TAG, "DISCO PING from %s (via %s)",
+    ESP_LOGD(TAG, "DISCO PING from %s (via %s)",
              p->hostname, pkt->via_derp ? "DERP" : "direct");
 
     /* Build PONG */
@@ -887,7 +887,7 @@ static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
     /* 3. ALWAYS send via DERP (guaranteed delivery, even if direct worked) */
     ml_derp_queue_send(ml, p->public_key, pong, pong_len);
 
-    ESP_LOGI(TAG, "PONG sent to %s (direct=%s, DERP=yes)",
+    ESP_LOGD(TAG, "PONG sent to %s (direct=%s, DERP=yes)",
              p->hostname, direct_sent ? "yes" : "no");
 }
 
@@ -914,7 +914,7 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
         ml_peer_t *p = &ml->peers[peer_idx];
         uint64_t rtt_ms = now - pending_probes[i].sent_ms;
 
-        ESP_LOGI(TAG, "DISCO PONG from %s: RTT=%llu ms (via %s)",
+        ESP_LOGD(TAG, "DISCO PONG from %s: RTT=%llu ms (via %s)",
                  p->hostname, (unsigned long long)rtt_ms,
                  pkt->via_derp ? "DERP" : "direct");
 
@@ -1006,7 +1006,7 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
         for (int i = 0; i < MAX_PENDING_PROBES; i++) {
             if (pending_probes[i].active) active_count++;
         }
-        ESP_LOGW(TAG, "DISCO PONG unmatched from %s (via %s) txid=%02x%02x%02x%02x, active_probes=%d",
+        ESP_LOGD(TAG, "DISCO PONG unmatched from %s (via %s) txid=%02x%02x%02x%02x, active_probes=%d",
                  name, pkt->via_derp ? "DERP" : "direct",
                  txid[0], txid[1], txid[2], txid[3], active_count);
     }
@@ -1018,7 +1018,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
     /* Verify DISCO magic */
     if (memcmp(pkt->data, DISCO_MAGIC, 6) != 0) return;
 
-    ESP_LOGI(TAG, "DISCO RX: %d bytes via %s, disco_key=%02x%02x%02x%02x",
+    ESP_LOGD(TAG, "DISCO RX: %d bytes via %s, disco_key=%02x%02x%02x%02x",
              (int)pkt->len, pkt->via_derp ? "DERP" : "direct",
              pkt->data[6], pkt->data[7], pkt->data[8], pkt->data[9]);
 
@@ -1072,7 +1072,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
             size_t ep_data_len = plaintext_len - 2;
             int ep_count = ep_data_len / 18;
 
-            ESP_LOGI(TAG, "CallMeMaybe from %s: %d endpoints (udp_path=%d, at_sock=%d)",
+            ESP_LOGD(TAG, "CallMeMaybe from %s: %d endpoints (udp_path=%d, at_sock=%d)",
                      ml->peers[peer_idx].hostname, ep_count,
                      disco_has_udp_path(ml), ml_at_socket_is_ready());
 
@@ -1095,7 +1095,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
                 }
                 if (entry[10] != 0xff || entry[11] != 0xff) is_v4_mapped = false;
 
-                ESP_LOGI(TAG, "  CMM ep[%d]: v4mapped=%d port=%d bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                ESP_LOGD(TAG, "  CMM ep[%d]: v4mapped=%d port=%d bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
                          i, is_v4_mapped, port,
                          entry[0], entry[1], entry[2], entry[3],
                          entry[4], entry[5], entry[6], entry[7],
@@ -1117,7 +1117,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
 
                     if (ping_len > 0) {
                         int ret = disco_udp_sendto(ml, ping_pkt, ping_len, ip, port);
-                        ESP_LOGI(TAG, "CMM probe -> %d.%d.%d.%d:%d (%d bytes, ret=%d)",
+                        ESP_LOGD(TAG, "CMM probe -> %d.%d.%d.%d:%d (%d bytes, ret=%d)",
                                  (int)((ip >> 24) & 0xFF), (int)((ip >> 16) & 0xFF),
                                  (int)((ip >> 8) & 0xFF), (int)(ip & 0xFF),
                                  (int)port, (int)ping_len, ret);
@@ -1145,7 +1145,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
  * ========================================================================== */
 
 static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
-    ESP_LOGI(TAG, "WG RX: %d bytes, via_derp=%d, type=%d, from=%02x%02x%02x%02x",
+    ESP_LOGD(TAG, "WG RX: %d bytes, via_derp=%d, type=%d, from=%02x%02x%02x%02x",
              (int)pkt->len, pkt->via_derp,
              pkt->len >= 4 ? pkt->data[0] : -1,
              pkt->src_pubkey[0], pkt->src_pubkey[1], pkt->src_pubkey[2], pkt->src_pubkey[3]);
@@ -1621,7 +1621,7 @@ void ml_wg_mgr_task(void *arg) {
             wireguardif_periodic((struct netif *)ml->wg_netif);
             uint64_t dt = ml_get_time_ms() - t0;
             last_wg_periodic_ms = now;
-            ESP_LOGI(TAG, "wireguardif_periodic: %llu ms", (unsigned long long)dt);
+            ESP_LOGD(TAG, "wireguardif_periodic: %llu ms", (unsigned long long)dt);
         }
 
         /* Periodic DISCO probes (every 1s check) */
@@ -1631,7 +1631,7 @@ void ml_wg_mgr_task(void *arg) {
             disco_periodic_probes(ml);
             uint64_t dt = ml_get_time_ms() - t0;
             last_disco_probe_ms = now;
-            ESP_LOGI(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
+            ESP_LOGD(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
         }
 
         /* Yield - 10ms loop rate for minimum packet processing latency.

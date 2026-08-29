@@ -299,7 +299,7 @@ static void dispatch_derp_frame(microlink_t *ml, uint8_t frame_type,
     switch (frame_type) {
     case DERP_FRAME_RECV_PACKET:
         if (payload) {
-            ESP_LOGI(TAG, "DERP RecvPacket: %d bytes from %02x%02x%02x%02x, hdr=%02x",
+            ESP_LOGD(TAG, "DERP RecvPacket: %d bytes from %02x%02x%02x%02x, hdr=%02x",
                      (int)payload_len,
                      src_key[0], src_key[1], src_key[2], src_key[3],
                      payload_len > 0 ? payload[0] : 0xFF);
@@ -326,7 +326,7 @@ static void dispatch_derp_frame(microlink_t *ml, uint8_t frame_type,
 
     case DERP_FRAME_PEER_GONE:
         if (payload && payload_len >= 32) {
-            ESP_LOGI(TAG, "DERP PeerGone: %02x%02x%02x%02x (len=%d)",
+            ESP_LOGD(TAG, "DERP PeerGone: %02x%02x%02x%02x (len=%d)",
                      payload[0], payload[1], payload[2], payload[3],
                      (int)payload_len);
         }
@@ -499,7 +499,7 @@ void ml_derp_tx_task(void *arg) {
 
         /* Unconditional heartbeat - proves task is alive */
         if (loop_start - last_heartbeat_ms > 5000) {
-            ESP_LOGW(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
+            ESP_LOGD(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
                      (unsigned long)loop_count, ml->derp.connected,
                      (unsigned long)frames_rx, (unsigned long)frames_tx,
                      (unsigned long)uxTaskGetStackHighWaterMark(NULL));
@@ -586,7 +586,7 @@ void ml_derp_tx_task(void *arg) {
                 }
                 int ret;
                 if (item.frame_type == DERP_FRAME_SEND_PACKET) {
-                    ESP_LOGI(TAG, "DERP TX: SendPacket %d bytes, dest=%02x%02x%02x%02x, hdr=%02x",
+                    ESP_LOGD(TAG, "DERP TX: SendPacket %d bytes, dest=%02x%02x%02x%02x, hdr=%02x",
                              (int)item.len, item.dest_pubkey[0], item.dest_pubkey[1],
                              item.dest_pubkey[2], item.dest_pubkey[3],
                              item.data[0]);
