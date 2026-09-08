@@ -708,24 +708,62 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     int64_t t_derp_tcp = esp_timer_get_time();
     ESP_LOGI(TAG, "[TIMING] DERP TCP connect: %lld ms", (t_derp_tcp - t_derp_dns) / 1000);
 
-    /* TLS setup */
+    /* TLS setup.
+     * Every setup call's return value is now checked, and every failure
+     * path from here on frees all four mbedTLS structures (not just the
+     * socket) via `goto fail`. Previously, none of mbedtls_ctr_drbg_seed()/
+     * mbedtls_ssl_config_defaults()/mbedtls_ssl_setup()'s return values were
+     * checked, so a failure there (e.g. under low memory - exactly the kind
+     * of allocation these calls perform) let the code continue straight
+     * into mbedtls_ssl_handshake() with a partially/incorrectly initialized
+     * SSL context, which can surface as a confusing downstream
+     * MBEDTLS_ERR_SSL_BAD_INPUT_DATA ("Bad input parameters to function")
+     * rather than the real, earlier failure. Separately, and regardless of
+     * that: every failure path after this point (TLS handshake, HTTP
+     * upgrade write, upgrade response timeout/read/rejection) only ever
+     * closed the raw socket, never freeing entropy/ctr_drbg/ssl_config/ssl -
+     * a real, permanent leak of all four structures on every failed DERP
+     * (re)connect attempt, since ml_derp_disconnect() (the only place that
+     * frees them) only ever runs on an *established* connection later
+     * dropping, not on a connect attempt that never reached
+     * ML_EVT_DERP_CONNECTED at all. On an unstable link that fails DERP
+     * connects repeatedly, this leaks every single retry. */
     mbedtls_ssl_init(&ml->derp.ssl);
     mbedtls_ssl_config_init(&ml->derp.ssl_conf);
     mbedtls_entropy_init(&ml->derp.entropy);
     mbedtls_ctr_drbg_init(&ml->derp.ctr_drbg);
 
-    mbedtls_ctr_drbg_seed(&ml->derp.ctr_drbg, mbedtls_entropy_func,
-                           &ml->derp.entropy, NULL, 0);
+    int ret;
+    ret = mbedtls_ctr_drbg_seed(&ml->derp.ctr_drbg, mbedtls_entropy_func,
+                                 &ml->derp.entropy, NULL, 0);
+    if (ret != 0) {
+        char err_buf[128];
+        mbedtls_strerror(ret, err_buf, sizeof(err_buf));
+        ESP_LOGE(TAG, "mbedtls_ctr_drbg_seed failed: %s", err_buf);
+        goto fail;
+    }
 
-    mbedtls_ssl_config_defaults(&ml->derp.ssl_conf,
-                                 MBEDTLS_SSL_IS_CLIENT,
-                                 MBEDTLS_SSL_TRANSPORT_STREAM,
-                                 MBEDTLS_SSL_PRESET_DEFAULT);
+    ret = mbedtls_ssl_config_defaults(&ml->derp.ssl_conf,
+                                       MBEDTLS_SSL_IS_CLIENT,
+                                       MBEDTLS_SSL_TRANSPORT_STREAM,
+                                       MBEDTLS_SSL_PRESET_DEFAULT);
+    if (ret != 0) {
+        char err_buf[128];
+        mbedtls_strerror(ret, err_buf, sizeof(err_buf));
+        ESP_LOGE(TAG, "mbedtls_ssl_config_defaults failed: %s", err_buf);
+        goto fail;
+    }
     mbedtls_ssl_conf_authmode(&ml->derp.ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&ml->derp.ssl_conf, mbedtls_ctr_drbg_random, &ml->derp.ctr_drbg);
     mbedtls_ssl_conf_read_timeout(&ml->derp.ssl_conf, DERP_CONNECT_TIMEOUT_MS);
 
-    mbedtls_ssl_setup(&ml->derp.ssl, &ml->derp.ssl_conf);
+    ret = mbedtls_ssl_setup(&ml->derp.ssl, &ml->derp.ssl_conf);
+    if (ret != 0) {
+        char err_buf[128];
+        mbedtls_strerror(ret, err_buf, sizeof(err_buf));
+        ESP_LOGE(TAG, "mbedtls_ssl_setup failed: %s", err_buf);
+        goto fail;
+    }
     mbedtls_ssl_set_hostname(&ml->derp.ssl, derp_host);
     /* Store socket fd BEFORE setting bio.
      * Use custom BIO callbacks that route through ml_read_sock/ml_write_sock,
@@ -736,7 +774,6 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
                          ml_derp_bio_send, NULL, ml_derp_bio_recv_timeout);
 
     /* TLS handshake - socket has 10s SO_RCVTIMEO from connect phase. */
-    int ret;
     while ((ret = mbedtls_ssl_handshake(&ml->derp.ssl)) != 0) {
         if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
             continue;
@@ -744,9 +781,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         char err_buf[128];
         mbedtls_strerror(ret, err_buf, sizeof(err_buf));
         ESP_LOGE(TAG, "TLS handshake failed: %s", err_buf);
-        ml_close_sock(sock);
-        ml->derp.sockfd = -1;
-        return ESP_FAIL;
+        goto fail;
     }
 
     int64_t t_derp_tls = esp_timer_get_time();
@@ -766,9 +801,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     ret = mbedtls_ssl_write(&ml->derp.ssl, (const uint8_t *)upgrade_req, strlen(upgrade_req));
     if (ret < 0) {
         ESP_LOGE(TAG, "Failed to send HTTP upgrade");
-        ml_close_sock(sock);
-        ml->derp.sockfd = -1;
-        return ESP_FAIL;
+        goto fail;
     }
 
     /* Read HTTP response byte-by-byte until \r\n\r\n to avoid over-reading
@@ -782,9 +815,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         while (resp_len < (int)sizeof(resp_buf) - 1) {
             if (ml_get_time_ms() - http_start > DERP_CONNECT_TIMEOUT_MS) {
                 ESP_LOGE(TAG, "HTTP upgrade response timeout");
-                ml_close_sock(sock);
-                ml->derp.sockfd = -1;
-                return ESP_FAIL;
+                goto fail;
             }
 
             ret = mbedtls_ssl_read(&ml->derp.ssl, resp_buf + resp_len, 1);
@@ -795,15 +826,11 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
                     continue;
                 }
                 ESP_LOGE(TAG, "HTTP upgrade read failed: -0x%04x", -ret);
-                ml_close_sock(sock);
-                ml->derp.sockfd = -1;
-                return ESP_FAIL;
+                goto fail;
             }
             if (ret == 0) {
                 ESP_LOGE(TAG, "Connection closed during HTTP upgrade");
-                ml_close_sock(sock);
-                ml->derp.sockfd = -1;
-                return ESP_FAIL;
+                goto fail;
             }
             resp_len++;
 
@@ -820,9 +847,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
 
         if (!found_end || strstr((char *)resp_buf, "101") == NULL) {
             ESP_LOGE(TAG, "DERP upgrade rejected: %.100s", resp_buf);
-            ml_close_sock(sock);
-            ml->derp.sockfd = -1;
-            return ESP_FAIL;
+            goto fail;
         }
         ESP_LOGI(TAG, "HTTP 101 Switching Protocols received");
     }
