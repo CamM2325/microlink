@@ -2017,6 +2017,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
     size_t json_data_len = 0;
     uint32_t total_data_bytes = 0;
     uint32_t data_stream_id = 0;
+    bool stream5_closed = false;  /* RST_STREAM on 5, or a connection-level GOAWAY */
     int pos = 0;
 
     while (pos + 9 <= frame_len) {
@@ -2056,8 +2057,48 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
             /* HTTP/2 SETTINGS from server — respond with SETTINGS ACK */
             uint8_t settings_ack[9] = {0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00};
             noise_send(ml, noise, settings_ack, sizeof(settings_ack));
+        } else if (f_type == 0x03) {
+            /* HTTP/2 RST_STREAM - a legal, normal way for the server to close just
+             * one stream without touching the rest of the connection. Real gap found
+             * 2026-09-01 comparing against the real Tailscale Go client's own
+             * tailcfg.go: Node.Online tracks whether *this specific long-poll stream*
+             * (stream 5, opened by do_start_long_poll()) is open on the server's own
+             * side - not "is the TCP/H2 connection open at all". Before this, an
+             * RST_STREAM on stream 5 specifically was silently skipped (fell through
+             * unrecognized, pos += f_len), while PINGs/endpoint-update responses on
+             * *other* streams kept resetting the watchdog below regardless - so a
+             * board could sit fully reachable (DISCO/WireGuard/endpoint-updates all
+             * still working over the same connection) while permanently shown
+             * offline in the dashboard, with nothing here ever noticing. See
+             * esp32/REMOTE_ACCESS.md's 2026-09-01 entry for the investigation. */
+            uint32_t err_code = f_len >= 4
+                ? ((uint32_t)frame_buf[pos] << 24 | frame_buf[pos + 1] << 16 |
+                   frame_buf[pos + 2] << 8 | frame_buf[pos + 3])
+                : 0;
+            ESP_LOGW(TAG, "H2 RST_STREAM on stream %lu (error %lu)",
+                     (unsigned long)f_stream, (unsigned long)err_code);
+            if (f_stream == 5) {
+                stream5_closed = true;
+            }
+        } else if (f_type == 0x07) {
+            /* HTTP/2 GOAWAY - server closing the whole connection, always fatal
+             * regardless of which stream ID it names. Same reasoning as RST_STREAM
+             * above: was previously unrecognized and silently ignored here. */
+            ESP_LOGW(TAG, "H2 GOAWAY received - server closing the connection");
+            stream5_closed = true;
         }
         pos += f_len;
+    }
+
+    if (stream5_closed) {
+        /* Server closed the long-poll stream (or the whole connection) - this is
+         * definitive proof Node.Online is about to (or already did) flip to
+         * offline server-side, regardless of anything else on this connection
+         * still working. Reconnect now rather than waiting up to
+         * t_ctrl_watchdog_ms for the caller's own generic staleness check to
+         * eventually notice. */
+        free(frame_buf);
+        return -1;
     }
 
     /* Send HTTP/2 WINDOW_UPDATE to replenish flow control after receiving DATA.
@@ -2076,9 +2117,18 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
     }
 
     if (!json_data || json_data_len == 0) {
-        /* Keepalive, SETTINGS, or PING frame - not an error */
+        /* Real content only ever arrives on stream 5 (the long-poll stream) - a
+         * PING/SETTINGS/PONG or an endpoint-update response on some other stream
+         * proves the raw TCP/H2 connection is up, but says nothing about whether
+         * stream 5 itself (what the server's Node.Online actually tracks - see
+         * the RST_STREAM/GOAWAY handling above) is still open. Only reset the
+         * watchdog when stream 5 was actually heard from this cycle (data_stream_id
+         * is set above whenever *any* DATA frame, even an empty keepalive one,
+         * arrives on stream 5) - otherwise leave it running so t_ctrl_watchdog_ms
+         * can still catch a stream 5 that's gone quiet without a clean
+         * RST_STREAM/GOAWAY (e.g. swallowed by a NAT/middlebox). */
         free(frame_buf);
-        return 1;  /* Got data, reset watchdog */
+        return data_stream_id == 5 ? 1 : 0;
     }
 
     /* Skip 4-byte length prefix if present */
@@ -2506,7 +2556,17 @@ void ml_coord_task(void *arg) {
 
                 /* Send HTTP/2 PING every 5 seconds to keep control plane alive.
                  * The server has a ~20s idle timeout; PINGs maintain bidirectional
-                 * activity and are what actually keep us "online". (v1 reference) */
+                 * activity and are what actually keep us "online". (v1 reference)
+                 *
+                 * Deliberately does NOT touch last_activity_ms on send success -
+                 * see the watchdog comment below. A local send() succeeding only
+                 * means the data was handed to this device's own TCP stack, not
+                 * that the server ever received or answered it (a real, hardware-
+                 * found bug: a silently one-way-dead long-poll connection, e.g.
+                 * after a NAT rebind, let this branch "succeed" every 5s forever,
+                 * so the 120s watchdog below could never fire even though nothing
+                 * had actually come back from the server in hours - confirmed on
+                 * real hardware, see esp32/REMOTE_ACCESS.md's 2026-09-01 entry). */
                 static uint64_t last_h2_ping_ms = 0;
                 if (now - last_h2_ping_ms >= 5000) {
                     uint8_t ping_frame[17];
@@ -2522,7 +2582,6 @@ void ml_coord_task(void *arg) {
                     int ping_ret = noise_send(ml, &noise, ping_frame, sizeof(ping_frame));
                     if (ping_ret >= 0) {
                         last_h2_ping_ms = now;
-                        last_activity_ms = now;
                     } else {
                         ESP_LOGW(TAG, "H2 PING send failed, reconnecting");
                         state = COORD_RECONNECTING;
