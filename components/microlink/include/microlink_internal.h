@@ -59,6 +59,18 @@ extern "C" {
 #define ML_TASK_WG_MGR_PRIO     7
 #define ML_TASK_WG_MGR_CORE     1
 
+// Was a bare `configMAX_PRIORITIES - 2` literal at the ml_udp.c call
+// site - numerically identical to ESP-IDF's own ESP_TASK_BT_CONTROLLER_PRIO
+// (esp_task.h), the reserved priority tier for the Bluetooth radio
+// controller's hard-real-time servicing task. There's no radio-timing
+// requirement for draining a 4-deep UDP receive queue into a callback;
+// this priority just needs to beat this project's other MicroLink tasks
+// reliably, matching the ML_TASK_WG_MGR tier rather than colliding with
+// a reserved system-level slot that can starve everything below it
+// (ml_coord's control-plane connection included) for as long as the
+// receive callback runs.
+#define ML_TASK_UDP_RX_PRIO     ML_TASK_WG_MGR_PRIO
+
 /* Queue depths */
 #define ML_DERP_TX_QUEUE_DEPTH  16
 #define ML_DISCO_RX_QUEUE_DEPTH 8
@@ -245,11 +257,22 @@ typedef struct {
     char hostname[64];
     bool active;
 
-    /* Endpoints */
+    /* Endpoints - the per-address ping-tracking equivalent of real
+     * Tailscale's endpointState map (endpoint.go). last_ping_ms mirrors
+     * that struct's lastPing field: 0 means "never pinged", otherwise
+     * checked against ML_DISCO_PING_INTERVAL_MS before sending another
+     * probe to this specific address, unless a caller forces a fresh
+     * round (see disco_ping_round() in ml_wg_mgr.c). Without this, every
+     * trigger (including a received CallMeMaybe) pinged every known
+     * endpoint completely unconditionally, with no per-address memory of
+     * a probe already in flight - real Tailscale's handleCallMeMaybe()
+     * reuses/updates this same per-endpoint state rather than registering
+     * independent anonymous probes per endpoint per call. */
     struct {
         uint32_t ip;
         uint16_t port;
         bool is_ipv6;
+        uint64_t last_ping_ms;
     } endpoints[ML_MAX_ENDPOINTS];
     int endpoint_count;
     uint16_t derp_region;
@@ -268,9 +291,6 @@ typedef struct {
 
     /* WireGuard peer index in wireguard-lwip */
     int wg_peer_index;
-
-    /* On-demand handshake: tried once on first DISCO direct path discovery */
-    bool tried_initial_handshake;
 } ml_peer_t;
 
 /* ============================================================================

@@ -385,6 +385,9 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 		// Update the peer location
 		update_peer_addr(peer, addr, port);
 
+		// Session is up - reset the give-up counter for the next time we need it.
+		peer->handshake_attempts = 0;
+
 		wireguard_start_session(peer, true);
 		printf("[WG] Session started, sending keepalive to %s:%u\n",
 		       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip), peer->port);
@@ -881,6 +884,7 @@ static err_t wireguard_start_handshake(struct netif *netif, struct wireguard_pee
 		pbuf_free(pbuf);
 		peer->send_handshake = false;
 		peer->last_initiation_tx = wireguard_sys_now();
+		peer->handshake_attempts++;
 		memcpy(peer->handshake_mac1, msg.mac1, WIREGUARD_COOKIE_LEN);
 		peer->handshake_mac1_valid = true;
 	} else {
@@ -923,6 +927,9 @@ err_t wireguardif_connect(struct netif *netif, u8_t peer_index) {
 			// Force immediate handshake to the new endpoint
 			peer->send_handshake = true;
 			peer->last_initiation_tx = 0;
+			// A fresh connect request starts a new give-up cycle - see
+			// MAX_TIMER_HANDSHAKES in should_send_initiation().
+			peer->handshake_attempts = 0;
 			wireguard_start_handshake(netif, peer);
 			result = ERR_OK;
 		} else {
@@ -1071,7 +1078,17 @@ static bool should_send_initiation(struct wireguard_peer *peer) {
 		} else if (peer->curr_keypair.valid && !peer->curr_keypair.initiator && wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME - peer->keepalive_interval)) {
 			result = true;
 		} else if (!peer->curr_keypair.valid && peer->active) {
-			result = true;
+			// Cap the "no session yet, actively retrying" case at
+			// MAX_TIMER_HANDSHAKES attempts (~REKEY_ATTEMPT_TIME seconds),
+			// matching wireguard-go's give-up behavior - see
+			// REKEY_ATTEMPT_TIME in wireguard.h. Handshakes explicitly
+			// re-requested by send_handshake (rekey of an already-
+			// established session) are not capped here.
+			if (peer->handshake_attempts >= MAX_TIMER_HANDSHAKES) {
+				peer->active = false;
+			} else {
+				result = true;
+			}
 		}
 	}
 	return result;
@@ -1401,6 +1418,14 @@ err_t wireguardif_connect_derp(struct netif *netif, u8_t peer_index) {
 		// Force immediate handshake - clear last_initiation_tx to bypass REKEY_TIMEOUT
 		// This is safe because DISCO has confirmed the path works
 		peer->last_initiation_tx = 0;
+		// A fresh connect-via-DERP request starts a new give-up cycle -
+		// see MAX_TIMER_HANDSHAKES in should_send_initiation(). Without
+		// this, a peer that never actually responds (e.g. has trimmed us,
+		// or the DERP path itself is bad) gets a handshake retried every
+		// REKEY_TIMEOUT (5s) forever - nothing else in this function or
+		// its caller (wireguardif_periodic()'s own timer loop) ever
+		// clears peer->active if the session never establishes.
+		peer->handshake_attempts = 0;
 		// Now start handshake immediately
 		wireguard_start_handshake(netif, peer);
 		result = ERR_OK;

@@ -196,10 +196,13 @@ microlink_udp_socket_t *microlink_udp_create(microlink_t *ml, uint16_t local_por
     sock->local_port = sock->pcb->local_port;
     udp_recv(sock->pcb, udp_recv_cb, sock);
 
-    /* Start RX task on Core 1 */
+    /* Start RX task on Core 1.
+     * Priority was configMAX_PRIORITIES - 2, numerically identical to
+     * ESP-IDF's reserved ESP_TASK_BT_CONTROLLER_PRIO tier - see
+     * ML_TASK_UDP_RX_PRIO's own comment in microlink_internal.h. */
     sock->rx_running = true;
     if (xTaskCreatePinnedToCore(udp_rx_task, "ml_udp_rx", 4096, sock,
-                                 configMAX_PRIORITIES - 2, &sock->rx_task, 1) != pdPASS) {
+                                 ML_TASK_UDP_RX_PRIO, &sock->rx_task, 1) != pdPASS) {
         sock->rx_running = false;
         sock->rx_task = NULL;
     }

@@ -39,7 +39,7 @@ static const char *TAG = "ml_wg_mgr";
 
 /* Forward declarations */
 static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx);
-static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force);
+static void disco_ping_round(microlink_t *ml, int peer_idx, bool force);
 
 /* DISCO message types */
 #define DISCO_MSG_PING          0x01
@@ -443,12 +443,15 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->derp_region = update->derp_region;
     p->active = true;
 
-    /* Copy endpoints */
+    /* Copy endpoints. New peer, so nothing to preserve - every entry starts
+     * with last_ping_ms=0 ("never pinged yet"), matching a fresh entry in
+     * real Tailscale's endpointState map (a zero time.Time). */
     p->endpoint_count = update->endpoint_count;
     for (int i = 0; i < update->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
         p->endpoints[i].ip = update->endpoints[i].ip;
         p->endpoints[i].port = update->endpoints[i].port;
         p->endpoints[i].is_ipv6 = update->endpoints[i].is_ipv6;
+        p->endpoints[i].last_ping_ms = 0;
     }
 
     /* Initialize DISCO rate limiting state */
@@ -567,7 +570,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
             last_burst_ms = add_now;
         }
         if (burst_count < 5) {
-            disco_send_ping_to_peer(ml, idx, true);
+            disco_ping_round(ml, idx, true);
             burst_count++;
         }
     }
@@ -627,11 +630,33 @@ static void process_peer_updates(microlink_t *ml) {
                 if (idx >= 0) {
                     ml_peer_t *p = &ml->peers[idx];
                     if (update->endpoint_count > 0) {
+                        /* Preserve last_ping_ms for an endpoint that's still
+                         * the same ip:port after this refresh - matching real
+                         * Tailscale's endpointState map (a MapResponse-driven
+                         * endpoint update there doesn't reset lastPing for an
+                         * address that's still valid; it's not a wholesale
+                         * replace). Old array's still valid here since we
+                         * haven't overwritten it yet. */
+                        int old_count = p->endpoint_count;
                         p->endpoint_count = update->endpoint_count;
                         for (int i = 0; i < update->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
-                            p->endpoints[i].ip = update->endpoints[i].ip;
-                            p->endpoints[i].port = update->endpoints[i].port;
-                            p->endpoints[i].is_ipv6 = update->endpoints[i].is_ipv6;
+                            uint64_t preserved_last_ping = 0;
+                            for (int j = 0; j < old_count && j < ML_MAX_ENDPOINTS; j++) {
+                                if (p->endpoints[j].ip == update->endpoints[i].ip &&
+                                    p->endpoints[j].port == update->endpoints[i].port) {
+                                    preserved_last_ping = p->endpoints[j].last_ping_ms;
+                                    break;
+                                }
+                            }
+                            /* Must stage into locals before overwriting p->endpoints[i]
+                             * in place, since i may equal j for an unchanged entry. */
+                            uint32_t new_ip = update->endpoints[i].ip;
+                            uint16_t new_port = update->endpoints[i].port;
+                            bool new_is_ipv6 = update->endpoints[i].is_ipv6;
+                            p->endpoints[i].ip = new_ip;
+                            p->endpoints[i].port = new_port;
+                            p->endpoints[i].is_ipv6 = new_is_ipv6;
+                            p->endpoints[i].last_ping_ms = preserved_last_ping;
                         }
                     }
                     if (update->derp_region > 0) {
@@ -745,59 +770,89 @@ static void disco_build_pong(microlink_t *ml, int peer_idx,
     *out_len = pos;
 }
 
-static void disco_send_ping_to_peer(microlink_t *ml, int peer_idx, bool force) {
+/* Ports real Tailscale's endpoint.go sendDiscoPingsLocked()/handleCallMeMaybe()
+ * pattern: ping tracking lives per (peer, known-endpoint) - p->endpoints[i].last_ping_ms,
+ * the equivalent of endpointState.lastPing - rather than a single per-peer
+ * timestamp gating an unconditional "ping every known address" fan-out.
+ * `force` bypasses the per-endpoint gate for every endpoint this round
+ * (matching handleCallMeMaybe() explicitly zeroing lastPing before its own
+ * sendDiscoPingsLocked() call), so a single round can never send more than
+ * one probe to an address that was already pinged within
+ * ML_DISCO_PING_INTERVAL_MS, no matter how many times this is called back
+ * to back - the actual bug (multiple independent probe-table registrations
+ * per address per incoming CallMeMaybe) this replaces.
+ *
+ * Still shares one txid/ciphertext across every destination sent to this
+ * round (one probe-table registration, not one per address) - the plaintext
+ * doesn't depend on the destination, and this project's own PONG matching
+ * already disambiguates which address actually answered via the reply's
+ * source IP (process_disco_pong()), not via a per-address txid the way real
+ * Tailscale's does. That part is an intentional simplification, not
+ * something this change needed to touch. */
+static void disco_ping_round(microlink_t *ml, int peer_idx, bool force) {
     ml_peer_t *p = &ml->peers[peer_idx];
     uint64_t now = ml_get_time_ms();
 
-    /* Rate limit: don't ping more often than DISCO_PING_INTERVAL_MS (skip if forced) */
-    if (!force && now - p->last_ping_sent_ms < ML_DISCO_PING_INTERVAL_MS) {
-        return;
+    bool eligible[ML_MAX_ENDPOINTS] = {0};
+    bool any_eligible = false;
+    bool best_is_known_endpoint = false;
+    for (int i = 0; i < p->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
+        if (p->endpoints[i].is_ipv6 || p->endpoints[i].ip == 0) continue;
+        if (p->endpoints[i].ip == p->best_ip && p->endpoints[i].port == p->best_port) {
+            best_is_known_endpoint = true;
+        }
+        if (force || p->endpoints[i].last_ping_ms == 0 ||
+            now - p->endpoints[i].last_ping_ms >= ML_DISCO_PING_INTERVAL_MS) {
+            eligible[i] = true;
+            any_eligible = true;
+        }
+    }
+
+    /* best_ip/port is normally already one of the endpoints above (learned
+     * from a successful pong to a known address). If it isn't - e.g. a
+     * NAT-mapped port only discovered via the pong itself - gate it off the
+     * peer-level last_ping_sent_ms instead, same as this function did before
+     * per-endpoint tracking existed. */
+    bool best_eligible = false;
+    if (!best_is_known_endpoint && p->has_direct_path && p->best_ip != 0 && p->best_port != 0) {
+        best_eligible = force || now - p->last_ping_sent_ms >= ML_DISCO_PING_INTERVAL_MS;
+        if (best_eligible) any_eligible = true;
+    }
+
+    if (!any_eligible) {
+        return;  /* Every known destination was pinged too recently this round - nothing to do */
     }
 
     uint8_t pkt[256];
     size_t pkt_len = 0;
     disco_build_ping(ml, peer_idx, pkt, &pkt_len);
-
     if (pkt_len == 0) return;
 
     bool direct_sent = false;
+    bool has_udp = disco_has_udp_path(ml);
 
-    /* If we have a known working direct path, send there FIRST.
-     * This is critical for heartbeat pings to renew trust_until_ms.
-     * A DERP pong would arrive with via_derp=true and NOT renew trust. */
-    if (p->has_direct_path && p->best_ip != 0 && p->best_port != 0) {
-        disco_udp_sendto(ml, pkt, pkt_len, p->best_ip, p->best_port);
-        direct_sent = true;
-    }
-
-    /* Also try direct UDP to all known endpoints from MapResponse */
-    {
-        bool has_udp = disco_has_udp_path(ml);
-        if (has_udp) {
-            for (int i = 0; i < p->endpoint_count; i++) {
-                if (!p->endpoints[i].is_ipv6 && p->endpoints[i].ip != 0) {
-                    /* Skip if same as best_ip (already sent) */
-                    if (p->endpoints[i].ip == p->best_ip &&
-                        p->endpoints[i].port == p->best_port) continue;
-                    int ret = disco_udp_sendto(ml, pkt, pkt_len, p->endpoints[i].ip, p->endpoints[i].port);
-                    if (!direct_sent) {  /* Log only first direct send per peer */
-                        ESP_LOGI(TAG, "  direct probe -> %d.%d.%d.%d:%d (%d eps, ret=%d)",
-                                 (int)((p->endpoints[i].ip >> 24) & 0xFF),
-                                 (int)((p->endpoints[i].ip >> 16) & 0xFF),
-                                 (int)((p->endpoints[i].ip >> 8) & 0xFF),
-                                 (int)(p->endpoints[i].ip & 0xFF),
-                                 (int)p->endpoints[i].port,
-                                 p->endpoint_count, ret);
-                    }
-                    direct_sent = true;
-                }
+    if (has_udp) {
+        if (best_eligible) {
+            disco_udp_sendto(ml, pkt, pkt_len, p->best_ip, p->best_port);
+            direct_sent = true;
+        }
+        for (int i = 0; i < p->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
+            if (p->endpoints[i].is_ipv6 || p->endpoints[i].ip == 0 || !eligible[i]) continue;
+            int ret = disco_udp_sendto(ml, pkt, pkt_len, p->endpoints[i].ip, p->endpoints[i].port);
+            p->endpoints[i].last_ping_ms = now;
+            if (!direct_sent) {  /* Log only first direct send per peer */
+                ESP_LOGI(TAG, "  direct probe -> %d.%d.%d.%d:%d (%d eps, ret=%d)",
+                         (int)((p->endpoints[i].ip >> 24) & 0xFF),
+                         (int)((p->endpoints[i].ip >> 16) & 0xFF),
+                         (int)((p->endpoints[i].ip >> 8) & 0xFF),
+                         (int)(p->endpoints[i].ip & 0xFF),
+                         (int)p->endpoints[i].port,
+                         p->endpoint_count, ret);
             }
+            direct_sent = true;
         }
-        if (!has_udp) {
-            ESP_LOGW(TAG, "  no UDP path for %s (sock4=%d)", p->hostname, ml->disco_sock4);
-        } else if (!direct_sent && p->endpoint_count > 0) {
-            ESP_LOGW(TAG, "  %s: %d eps but none usable (all IPv6?)", p->hostname, p->endpoint_count);
-        }
+    } else if (p->endpoint_count > 0) {
+        ESP_LOGW(TAG, "  no UDP path for %s (sock4=%d)", p->hostname, ml->disco_sock4);
     }
 
     /* Send via DERP as fallback (or always for initial probes).
@@ -962,33 +1017,22 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                              (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
                              (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
                              (int)pkt->src_port, p->hostname);
-                    /* First direct path discovery — send a one-shot handshake
-                     * via direct UDP. Do NOT use wireguardif_connect() which
-                     * sets peer->active=true and causes infinite handshake
-                     * retries (every 5s) when the peer has us trimmed.
-                     * Instead, just fire a single handshake init. If the peer
-                     * has us configured, it will respond and establish session.
-                     * If not, we stop and wait for them to initiate. */
-                    if (!p->tried_initial_handshake) {
-                        p->tried_initial_handshake = true;
-                        /* Store endpoint so wireguardif_connect sends to it */
-                        wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
-                                                     &ep_ip, pkt->src_port);
-                        /* Fire one handshake init but don't leave peer active.
-                         * wireguardif_connect sets active=true internally, so
-                         * we immediately clear it after to prevent retries. */
-                        wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-                        /* Clear active to prevent infinite retry loop.
-                         * If handshake succeeds, the response handler will
-                         * establish the session regardless of active flag. */
-                        {
-                            struct wireguard_device *dev = (struct wireguard_device *)netif->state;
-                            if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
-                                dev->peers[p->wg_peer_index].active = false;
-                            }
-                        }
-                        ESP_LOGI(TAG, "WG one-shot handshake to %s (first direct path)", p->hostname);
-                    }
+                    /* This used to fire exactly one handshake init via a
+                     * one-shot wireguardif_connect()-then-immediately-
+                     * clear-active workaround, specifically to dodge
+                     * wireguard_lwip retrying every 5s forever if the peer
+                     * had us trimmed. That workaround had its own bug: if
+                     * this single handshake-init packet was lost, the peer
+                     * stayed stranded on DERP forever - the one-shot latch
+                     * never reset and this branch never ran again for that
+                     * peer, even on a later PONG re-offering the same
+                     * direct path. Since wireguard_lwip itself now gives up
+                     * after MAX_TIMER_HANDSHAKES attempts (~REKEY_ATTEMPT_TIME
+                     * seconds, see wireguard.h), a plain wireguardif_connect()
+                     * gets real, bounded retries instead of exactly one
+                     * unretried shot. */
+                    wireguardif_connect(netif, (u8_t)p->wg_peer_index);
+                    ESP_LOGI(TAG, "WG handshake initiated to %s (direct path discovered)", p->hostname);
                 }
             }
         }
@@ -1076,14 +1120,42 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
                      ml->peers[peer_idx].hostname, ep_count,
                      disco_has_udp_path(ml), ml_at_socket_is_ready());
 
-            /* Reply with our own CallMeMaybe (bidirectional NAT traversal).
-             * Skip on cellular: our endpoints are behind CGNAT and unreachable. */
-            if (!ml_at_socket_is_ready()) {
-                disco_send_call_me_maybe(ml, peer_idx);
-            }
+            /* This used to reply with our own CallMeMaybe here ("bidirectional
+             * NAT traversal") - disco_send_call_me_maybe() has no rate limit
+             * of its own, and this reply is exactly what the *other* side's
+             * own identical reply-to-CMM logic reacts to, so two peers that
+             * ever exchange one CMM start an unbounded mutual reply loop
+             * (confirmed on real hardware: ~150-250ms cadence, sustained for
+             * about a minute after a cold-start convergence, only stopping
+             * once a direct path won or a packet in the chain happened to
+             * drop). Real Tailscale's handleCallMeMaybe() (endpoint.go) never
+             * does this - a CallMeMaybe there is only ever sent proactively
+             * from the heartbeat path (sendDiscoPingsLocked's own
+             * sendCallMeMaybe flag), never as a receive-triggered reply.
+             * Removed rather than rate-limited, matching the reference
+             * design instead of bolting a throttle onto behavior that
+             * shouldn't exist at all. Bidirectional discovery is still
+             * covered by this file's own independent, one-directional
+             * triggers (the initial add_peer burst, the post-STUN one-shot
+             * broadcast, ml_wg_mgr_send_cmm() from microlink_tcp_connect()) -
+             * none of them receive-triggered, so none can form this loop. */
 
-            /* Probe each endpoint with a DISCO ping.
-             * Skip on cellular: direct UDP impossible, saves TX queue capacity. */
+            /* Merge each offered endpoint into p->endpoints[] - matching real
+             * Tailscale's handleCallMeMaybe(), which updates/inserts into its
+             * persistent per-endpoint endpointState map rather than firing an
+             * independent, untracked ping per endpoint per CallMeMaybe
+             * received. An existing (ip,port) gets its last_ping_ms zeroed to
+             * force a fresh probe this round despite ML_DISCO_PING_INTERVAL_MS
+             * (matching handleCallMeMaybe() explicitly zeroing lastPing); a
+             * genuinely new one is appended if there's room. This is what
+             * fixed a real incident found on real hardware: the old
+             * per-endpoint disco_build_ping() loop registered one brand-new,
+             * untracked probe-table entry per offered endpoint on *every*
+             * CallMeMaybe, with nothing recognizing "I already have an
+             * outstanding probe to this address" - repeated CMMs during a
+             * cold-start convergence filled a 32-slot probe table within
+             * about a minute.
+             * Skip merging/probing on cellular: direct UDP impossible there. */
             for (int i = 0; !ml_at_socket_is_ready() && i < ep_count && i < ML_MAX_ENDPOINTS; i++) {
                 const uint8_t *entry = ep_data + (i * 18);
                 uint16_t port = (entry[16] << 8) | entry[17];
@@ -1109,26 +1181,34 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
                               ((uint32_t)entry[14] << 8) |
                               (uint32_t)entry[15];
 
-                /* Send DISCO ping to this endpoint */
-                if (disco_has_udp_path(ml)) {
-                    uint8_t ping_pkt[256];
-                    size_t ping_len = 0;
-                    disco_build_ping(ml, peer_idx, ping_pkt, &ping_len);
-
-                    if (ping_len > 0) {
-                        int ret = disco_udp_sendto(ml, ping_pkt, ping_len, ip, port);
-                        ESP_LOGI(TAG, "CMM probe -> %d.%d.%d.%d:%d (%d bytes, ret=%d)",
-                                 (int)((ip >> 24) & 0xFF), (int)((ip >> 16) & 0xFF),
-                                 (int)((ip >> 8) & 0xFF), (int)(ip & 0xFF),
-                                 (int)port, (int)ping_len, ret);
+                ml_peer_t *cmm_peer = &ml->peers[peer_idx];
+                int match = -1;
+                for (int k = 0; k < cmm_peer->endpoint_count && k < ML_MAX_ENDPOINTS; k++) {
+                    if (!cmm_peer->endpoints[k].is_ipv6 &&
+                        cmm_peer->endpoints[k].ip == ip && cmm_peer->endpoints[k].port == port) {
+                        match = k;
+                        break;
                     }
-                } else {
-                    ESP_LOGW(TAG, "CMM probe skipped: no UDP path (sock4=%d)", ml->disco_sock4);
                 }
+                if (match >= 0) {
+                    cmm_peer->endpoints[match].last_ping_ms = 0;  /* force a fresh probe this round */
+                } else if (cmm_peer->endpoint_count < ML_MAX_ENDPOINTS) {
+                    int slot = cmm_peer->endpoint_count++;
+                    cmm_peer->endpoints[slot].ip = ip;
+                    cmm_peer->endpoints[slot].port = port;
+                    cmm_peer->endpoints[slot].is_ipv6 = false;
+                    cmm_peer->endpoints[slot].last_ping_ms = 0;
+                }
+                /* Table full and genuinely new: dropped, same as real
+                 * Tailscale's map would just keep growing but ours can't -
+                 * the next MapResponse refresh naturally supersedes this. */
             }
 
-            /* Also force-ping peer's known endpoints from MapResponse */
-            disco_send_ping_to_peer(ml, peer_idx, true);
+            /* One ping round covers every endpoint just merged above, plus
+             * whatever was already known - matches handleCallMeMaybe()
+             * calling sendDiscoPingsLocked() exactly once after updating its
+             * endpoint map, not once per endpoint. */
+            disco_ping_round(ml, peer_idx, true);
         }
         break;
     default:
@@ -1447,7 +1527,7 @@ static void disco_periodic_probes(microlink_t *ml) {
 
                 /* Force-ping to try re-establishing direct path (WiFi only) */
                 if (!ml_at_socket_is_ready()) {
-                    disco_send_ping_to_peer(ml, i, true);
+                    disco_ping_round(ml, i, true);
                 }
             }
         }
@@ -1460,7 +1540,7 @@ static void disco_periodic_probes(microlink_t *ml) {
         if (!ml_at_socket_is_ready() && !p->has_direct_path &&
             now - p->last_upgrade_ms > ML_DISCO_UPGRADE_INTERVAL_MS) {
             if (upgrade_probes_sent < DISCO_PROBES_PER_TICK) {
-                disco_send_ping_to_peer(ml, i, false);
+                disco_ping_round(ml, i, false);
                 p->last_upgrade_ms = now;
                 upgrade_probes_sent++;
             }
@@ -1472,7 +1552,7 @@ static void disco_periodic_probes(microlink_t *ml) {
          * Heartbeats are NEVER throttled — they're time-critical for trust_until_ms. */
         if (p->has_direct_path &&
             now - p->last_ping_sent_ms > ml->t_disco_heartbeat_ms) {
-            disco_send_ping_to_peer(ml, i, true);
+            disco_ping_round(ml, i, true);
         }
     }
 
@@ -1480,7 +1560,7 @@ static void disco_periodic_probes(microlink_t *ml) {
     disco_probe_start_idx = (start + DISCO_PROBES_PER_TICK) % (ml->peer_count > 0 ? ml->peer_count : 1);
 
     /* Expire old pending probes.
-     * MUST refresh 'now' because disco_send_ping_to_peer() above may have
+     * MUST refresh 'now' because disco_ping_round() above may have
      * registered probes with sent_ms NEWER than our stale 'now' from the top
      * of this function. Without refresh, now - sent_ms underflows to ~UINT64_MAX
      * which is always > PING_TIMEOUT_MS, causing immediate false expiry. */
