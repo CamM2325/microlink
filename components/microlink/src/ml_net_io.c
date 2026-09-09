@@ -53,8 +53,13 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
                               uint32_t src_ip, uint16_t src_port) {
     pkt_type_t type = classify_packet(data, len);
 
-    /* Log ALL direct UDP packets for debugging */
-    ESP_LOGI(TAG, "UDP RX: %d bytes from %d.%d.%d.%d:%d type=%s hdr=%02x",
+    /* Was "Log ALL direct UDP packets for debugging" at ESP_LOGI - fires
+     * on every single UDP packet received on this socket (DISCO, STUN,
+     * and WireGuard alike), the same "every packet at Info" issue as
+     * ml_derp.c/ml_wg_mgr.c's own lines. This is the front-door
+     * dispatcher for all direct UDP traffic, so it's the highest-volume
+     * of the bunch. Moved to Debug. */
+    ESP_LOGD(TAG, "UDP RX: %d bytes from %d.%d.%d.%d:%d type=%s hdr=%02x",
              (int)len,
              (int)((src_ip >> 24) & 0xFF), (int)((src_ip >> 16) & 0xFF),
              (int)((src_ip >> 8) & 0xFF), (int)(src_ip & 0xFF),

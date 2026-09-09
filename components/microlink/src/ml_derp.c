@@ -299,7 +299,11 @@ static void dispatch_derp_frame(microlink_t *ml, uint8_t frame_type,
     switch (frame_type) {
     case DERP_FRAME_RECV_PACKET:
         if (payload) {
-            ESP_LOGI(TAG, "DERP RecvPacket: %d bytes from %02x%02x%02x%02x, hdr=%02x",
+            /* Was ESP_LOGI - fires on every single packet relayed through
+             * DERP, not just handshakes/control traffic. At Info this
+             * makes a normal live-filtered log ("show me Info and above")
+             * look like every packet is being traced. Moved to Debug. */
+            ESP_LOGD(TAG, "DERP RecvPacket: %d bytes from %02x%02x%02x%02x, hdr=%02x",
                      (int)payload_len,
                      src_key[0], src_key[1], src_key[2], src_key[3],
                      payload_len > 0 ? payload[0] : 0xFF);
@@ -497,9 +501,17 @@ void ml_derp_tx_task(void *arg) {
         loop_count++;
         uint64_t loop_start = ml_get_time_ms();
 
-        /* Unconditional heartbeat - proves task is alive */
+        /* Unconditional heartbeat - proves task is alive.
+         * Was ESP_LOGW - a plain liveness probe, not a warning condition.
+         * At LOGW it survives even a restrictive "errors and warnings
+         * only" filter, which is presumably why it ended up here during
+         * original bring-up debugging, but it means every consumer sees
+         * a "warning" every 5 seconds forever, indefinitely, even on a
+         * perfectly healthy connection. A routine "still here, nothing
+         * new" pulse belongs at Debug, not Info - INFO is for things that
+         * actually changed, not proof of life. */
         if (loop_start - last_heartbeat_ms > 5000) {
-            ESP_LOGW(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
+            ESP_LOGD(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
                      (unsigned long)loop_count, ml->derp.connected,
                      (unsigned long)frames_rx, (unsigned long)frames_tx,
                      (unsigned long)uxTaskGetStackHighWaterMark(NULL));
@@ -586,7 +598,9 @@ void ml_derp_tx_task(void *arg) {
                 }
                 int ret;
                 if (item.frame_type == DERP_FRAME_SEND_PACKET) {
-                    ESP_LOGI(TAG, "DERP TX: SendPacket %d bytes, dest=%02x%02x%02x%02x, hdr=%02x",
+                    /* Was ESP_LOGI - the TX counterpart of DERP_FRAME_RECV_PACKET's
+                     * own line above, same "every packet" issue. */
+                    ESP_LOGD(TAG, "DERP TX: SendPacket %d bytes, dest=%02x%02x%02x%02x, hdr=%02x",
                              (int)item.len, item.dest_pubkey[0], item.dest_pubkey[1],
                              item.dest_pubkey[2], item.dest_pubkey[3],
                              item.data[0]);
