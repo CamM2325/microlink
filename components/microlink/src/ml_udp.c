@@ -196,10 +196,10 @@ microlink_udp_socket_t *microlink_udp_create(microlink_t *ml, uint16_t local_por
     sock->local_port = sock->pcb->local_port;
     udp_recv(sock->pcb, udp_recv_cb, sock);
 
-    /* Start RX task on Core 1 */
+    /* Start RX task on Core 1 (Core 0 on single-core chips) */
     sock->rx_running = true;
     if (xTaskCreatePinnedToCore(udp_rx_task, "ml_udp_rx", 4096, sock,
-                                 configMAX_PRIORITIES - 2, &sock->rx_task, 1) != pdPASS) {
+                                 configMAX_PRIORITIES - 2, &sock->rx_task, ML_TASK_APP_CORE) != pdPASS) {
         sock->rx_running = false;
         sock->rx_task = NULL;
     }
