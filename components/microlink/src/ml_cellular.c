@@ -13,6 +13,7 @@
  */
 
 #include "ml_cellular.h"
+#include "ml_at_validate.h"
 #include "microlink_internal.h"
 
 #include "esp_log.h"
@@ -26,6 +27,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -73,27 +75,67 @@ static struct {
     .data_mode = ML_DATA_MODE_NONE,
 };
 
+/* Serialises every AT command exchange on the modem UART: this driver's
+ * commands, the AT socket bridge (ml_at_socket.c) and application
+ * pass-through commands. Created on first init and never deleted, so a task
+ * blocked on it can never be left waiting on a freed semaphore. */
+static SemaphoreHandle_t s_uart_lock;
+
+bool ml_cellular_uart_lock(void)
+{
+    if (!s_uart_lock) return false;
+    return xSemaphoreTake(s_uart_lock, portMAX_DELAY) == pdTRUE;
+}
+
+void ml_cellular_uart_unlock(void)
+{
+    if (s_uart_lock) xSemaphoreGive(s_uart_lock);
+}
+
 /* ============================================================================
  * AT Command Helpers (same proven pattern from sim7600_4g_test)
  * ========================================================================== */
 
-static int at_send_cmd(const char *cmd, char *response, size_t resp_size, int timeout_ms)
+/* Send one AT command and collect the response. Caller holds s_uart_lock.
+ * Command arguments are never logged in clear: SIM PIN and PPP password
+ * commands are redacted (ml_at_redact_cmd). */
+static int at_send_cmd_locked(const char *cmd, char *response, size_t resp_size, int timeout_ms)
 {
+    if (!response || resp_size < 2) return -1;
+    memset(response, 0, resp_size);
+
+    char log_cmd[48];
+    char cmd_buf[256];
+    size_t cmd_len = strlen(cmd);
+    if (cmd_len > sizeof(cmd_buf) - 3) {
+        /* Truncating would drop the CR and glue the next command onto it */
+        ESP_LOGE(TAG, "AT command too long (%u bytes): %s", (unsigned)cmd_len,
+                 ml_at_redact_cmd(cmd, log_cmd, sizeof(log_cmd)));
+        return -1;
+    }
+
     uart_flush_input(UART_NUM);
 
-    char cmd_buf[256];
-    snprintf(cmd_buf, sizeof(cmd_buf), "%s\r\n", cmd);
-    uart_write_bytes(UART_NUM, cmd_buf, strlen(cmd_buf));
+    memcpy(cmd_buf, cmd, cmd_len);
+    cmd_buf[cmd_len] = '\r';
+    cmd_buf[cmd_len + 1] = '\n';
+    uart_write_bytes(UART_NUM, cmd_buf, cmd_len + 2);
+    ml_at_secure_zero(cmd_buf, sizeof(cmd_buf));
 
-    ESP_LOGD(TAG, ">> %s", cmd);
+    ESP_LOGD(TAG, ">> %s", ml_at_redact_cmd(cmd, log_cmd, sizeof(log_cmd)));
 
     int total_read = 0;
     int64_t start = esp_timer_get_time();
     int64_t timeout_us = (int64_t)timeout_ms * 1000;
 
-    memset(response, 0, resp_size);
-
     while ((esp_timer_get_time() - start) < timeout_us) {
+        if ((size_t)total_read >= resp_size - 1) {
+            /* Buffer full without a final result code: stop instead of
+             * spinning on zero-length reads until the timeout. The rest is
+             * discarded by the next command's flush. */
+            ESP_LOGW(TAG, "AT response truncated at %d bytes", total_read);
+            break;
+        }
         int len = uart_read_bytes(UART_NUM,
                                    (uint8_t *)(response + total_read),
                                    resp_size - total_read - 1,
@@ -117,11 +159,20 @@ static int at_send_cmd(const char *cmd, char *response, size_t resp_size, int ti
         while (*display == '\r' || *display == '\n') display++;
         ESP_LOGD(TAG, "<< %s", display);
     } else {
-        ESP_LOGW(TAG, "<< (no response to '%s')", cmd);
+        ESP_LOGW(TAG, "<< (no response to '%s')",
+                 ml_at_redact_cmd(cmd, log_cmd, sizeof(log_cmd)));
         return -1;
     }
 
     return total_read;
+}
+
+static int at_send_cmd(const char *cmd, char *response, size_t resp_size, int timeout_ms)
+{
+    if (!ml_cellular_uart_lock()) return -1;
+    int ret = at_send_cmd_locked(cmd, response, resp_size, timeout_ms);
+    ml_cellular_uart_unlock();
+    return ret;
 }
 
 static bool at_cmd_ok(const char *cmd, int timeout_ms)
@@ -335,9 +386,17 @@ static esp_err_t sim_setup(void)
     } else if (strstr(resp, "SIM PIN")) {
         /* Try to unlock with PIN */
         if (s_cell.config.sim_pin && s_cell.config.sim_pin[0]) {
-            char pin_cmd[64];
+            if (!ml_at_valid_pin(s_cell.config.sim_pin)) {
+                /* Never interpolate an unchecked value into an AT command */
+                ESP_LOGE(TAG, "SIM PIN is not 4-8 digits; not sending it");
+                s_cell.state = ML_CELL_STATE_ERROR;
+                return ESP_ERR_INVALID_ARG;
+            }
+            char pin_cmd[32];
             snprintf(pin_cmd, sizeof(pin_cmd), "AT+CPIN=\"%s\"", s_cell.config.sim_pin);
-            if (at_cmd_ok(pin_cmd, AT_TIMEOUT_MS)) {
+            bool pin_ok = at_cmd_ok(pin_cmd, AT_TIMEOUT_MS);
+            ml_at_secure_zero(pin_cmd, sizeof(pin_cmd));
+            if (pin_ok) {
                 ESP_LOGI(TAG, "SIM PIN accepted");
                 vTaskDelay(pdMS_TO_TICKS(2000)); /* Wait for SIM to initialize */
 
@@ -466,9 +525,10 @@ static uint32_t s_ppp_tx_count = 0;
 static esp_err_t ppp_transmit(void *h, void *buffer, size_t len)
 {
     s_ppp_tx_count++;
+    /* Frame dumps include PAP/CHAP exchanges and plaintext DNS: verbose only */
     if (s_ppp_tx_count <= 10 || (s_ppp_tx_count % 20) == 0) {
-        ESP_LOGI(TAG, "PPP TX: %d bytes (frame #%lu)", (int)len, (unsigned long)s_ppp_tx_count);
-        ESP_LOG_BUFFER_HEX_LEVEL(TAG, buffer, len < 64 ? len : 64, ESP_LOG_INFO);
+        ESP_LOGV(TAG, "PPP TX: %d bytes (frame #%lu)", (int)len, (unsigned long)s_ppp_tx_count);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, buffer, len < 64 ? len : 64, ESP_LOG_VERBOSE);
     }
     uart_write_bytes(UART_NUM, buffer, len);
     return ESP_OK;
@@ -565,7 +625,7 @@ static void ppp_rx_task(void *arg)
         if (len > 0) {
             rx_frame_count++;
             if (rx_frame_count <= 15) {  /* Log first 15 RX chunks for debugging */
-                ESP_LOGI(TAG, "PPP RX: %d bytes (chunk #%d)", len, rx_frame_count);
+                ESP_LOGD(TAG, "PPP RX: %d bytes (chunk #%d)", len, rx_frame_count);
             }
             esp_netif_receive(s_cell.ppp_netif, buf, len, NULL);
         }
@@ -609,10 +669,19 @@ static esp_err_t ppp_setup_and_dial(void)
      * Without an explicit PDP context, the modem has no bearer to bridge
      * over PPP and IPCP will get no response (silent timeout).
      * Empty APN = modem uses network-provided default. */
+    const char *ppp_user = s_cell.config.ppp_user ? s_cell.config.ppp_user : "";
+    const char *ppp_pass = s_cell.config.ppp_pass ? s_cell.config.ppp_pass : "";
     {
         const char *apn = (s_cell.config.apn && s_cell.config.apn[0])
                           ? s_cell.config.apn : "";
-        char cgdcont_cmd[128];
+        /* Re-check at the interpolation site: a '"' or CR/LF here would let
+         * the value run arbitrary AT commands (ml_cellular_init checks too). */
+        if (!ml_at_valid_apn(apn) || !ml_at_valid_credential(ppp_user) ||
+            !ml_at_valid_credential(ppp_pass)) {
+            ESP_LOGE(TAG, "Invalid APN or PPP credentials; refusing to dial");
+            return ESP_ERR_INVALID_ARG;
+        }
+        char cgdcont_cmd[160];
         snprintf(cgdcont_cmd, sizeof(cgdcont_cmd),
                  "AT+CGDCONT=1,\"IP\",\"%s\"", apn);
         at_cmd_ok(cgdcont_cmd, AT_TIMEOUT_MS);
@@ -628,15 +697,14 @@ static esp_err_t ppp_setup_and_dial(void)
      * If PPP credentials are provided (e.g. Soracom: sora/sora), use CHAP (type 2).
      * Otherwise use PAP with empty credentials (type 1) — EIOT/BICS SIMs pass
      * PAP Auth-Ack with empty creds (IMSI-based auth). */
-    const char *ppp_user = s_cell.config.ppp_user ? s_cell.config.ppp_user : "";
-    const char *ppp_pass = s_cell.config.ppp_pass ? s_cell.config.ppp_pass : "";
     {
         /* Auth type: 0=none, 1=PAP, 2=CHAP */
         int auth_type = (ppp_user[0] || ppp_pass[0]) ? 2 : 1;  /* CHAP if creds, PAP if empty */
-        char auth_cmd[128];
+        char auth_cmd[192];   /* 2 x ML_AT_CRED_MAX + command: never truncated */
         snprintf(auth_cmd, sizeof(auth_cmd),
                  "AT+CGAUTH=1,%d,\"%s\",\"%s\"", auth_type, ppp_user, ppp_pass);
         at_cmd_ok(auth_cmd, AT_TIMEOUT_MS);
+        ml_at_secure_zero(auth_cmd, sizeof(auth_cmd));
     }
     if (ppp_user[0] || ppp_pass[0]) {
         ESP_LOGI(TAG, "PPP credentials: user=%s (CHAP)", ppp_user);
@@ -818,6 +886,31 @@ esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
     } else {
         ml_cellular_config_t def = ML_CELLULAR_DEFAULT_CONFIG();
         s_cell.config = def;
+    }
+
+    /* Reject values that cannot be passed safely inside an AT command
+     * (Kconfig, NVS and application config all arrive here). */
+    {
+        const char *bad = NULL;
+        if (s_cell.config.apn && !ml_at_valid_apn(s_cell.config.apn)) {
+            bad = "APN (letters, digits, '-' and '.', max 100)";
+        } else if (s_cell.config.sim_pin && s_cell.config.sim_pin[0] &&
+                   !ml_at_valid_pin(s_cell.config.sim_pin)) {
+            bad = "SIM PIN (4-8 digits)";
+        } else if (s_cell.config.ppp_user && !ml_at_valid_credential(s_cell.config.ppp_user)) {
+            bad = "PPP user (printable ASCII without '\"' or '\\', max 64)";
+        } else if (s_cell.config.ppp_pass && !ml_at_valid_credential(s_cell.config.ppp_pass)) {
+            bad = "PPP password (printable ASCII without '\"' or '\\', max 64)";
+        }
+        if (bad) {
+            ESP_LOGE(TAG, "Invalid cellular config: %s", bad);
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    if (!s_uart_lock) {
+        s_uart_lock = xSemaphoreCreateMutex();
+        if (!s_uart_lock) return ESP_ERR_NO_MEM;
     }
 
     if (s_cell.config.tx_pin == 0) s_cell.config.tx_pin = 43;
@@ -1075,17 +1168,53 @@ const char *ml_cellular_get_imei(void)
     return s_cell.info.imei[0] ? s_cell.info.imei : NULL;
 }
 
+int ml_cellular_send_at_cmd(const char *cmd, char *response, size_t resp_size, int timeout_ms)
+{
+    char log_cmd[48];
+
+    if (!response || resp_size < 2) return -1;
+    response[0] = '\0';
+    if (!ml_at_cmd_is_safe(cmd, 0)) {
+        ESP_LOGW(TAG, "send_at_cmd: rejected (must be one line starting with AT, "
+                 "printable ASCII, max %d chars)", ML_AT_CMD_MAX);
+        return -1;
+    }
+    if (timeout_ms <= 0) timeout_ms = AT_TIMEOUT_MS;
+    if (timeout_ms > ML_CELLULAR_AT_CMD_MAX_TIMEOUT_MS) timeout_ms = ML_CELLULAR_AT_CMD_MAX_TIMEOUT_MS;
+
+    if (!ml_cellular_uart_lock()) {
+        ESP_LOGW(TAG, "send_at_cmd: modem not initialized");
+        return -1;
+    }
+
+    /* State is checked under the lock so it cannot change underneath us
+     * (e.g. the PPP dial switching the UART to data mode). */
+    int ret = -1;
+    ml_cellular_state_t st = s_cell.state;
+    if (!s_cell.uart_installed) {
+        ESP_LOGW(TAG, "send_at_cmd: modem not initialized");
+    } else if (s_cell.ppp_running || st == ML_CELL_STATE_PPP_CONNECTING ||
+               st == ML_CELL_STATE_PPP_CONNECTED) {
+        ESP_LOGW(TAG, "send_at_cmd: UART is in PPP data mode; AT commands are not available "
+                 "(use CONFIG_ML_CELLULAR_DATA_AT_ONLY or the modem's AUX/USB port)");
+    } else if (st == ML_CELL_STATE_DATA_CONNECTED) {
+        if (!ml_at_cmd_allowed_with_bridge(cmd)) {
+            ESP_LOGW(TAG, "send_at_cmd: '%s' not allowed while the AT socket bridge is active",
+                     ml_at_redact_cmd(cmd, log_cmd, sizeof(log_cmd)));
+        } else {
+            ret = ml_at_socket_cmd_locked(cmd, response, resp_size, timeout_ms);
+        }
+    } else {
+        ret = at_send_cmd_locked(cmd, response, resp_size, timeout_ms);
+    }
+
+    ml_cellular_uart_unlock();
+    return ret;
+}
+
 int ml_cellular_send_at(const char *cmd, char *response, size_t resp_size, int timeout_ms)
 {
-    if (s_cell.ppp_running) {
-        ESP_LOGW(TAG, "Cannot send AT commands in PPP mode");
-        return -1;
-    }
-    if (s_cell.state == ML_CELL_STATE_DATA_CONNECTED) {
-        ESP_LOGW(TAG, "Cannot send raw AT in AT socket bridge mode — use ml_at_socket API");
-        return -1;
-    }
-    return at_send_cmd(cmd, response, resp_size, timeout_ms);
+    return ml_cellular_send_at_cmd(cmd, response, resp_size, timeout_ms);
 }
 
 /* ============================================================================

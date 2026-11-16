@@ -53,6 +53,16 @@ void ml_at_socket_deinit(void);
  */
 bool ml_at_socket_is_ready(void);
 
+/**
+ * Internal: run one AT command through the bridge's reader so that URCs in
+ * the response are processed. The caller must hold the modem UART lock
+ * (ml_cellular_uart_lock()) and must have validated @p cmd. Applications
+ * use ml_cellular_send_at_cmd() instead.
+ *
+ * @return Bytes received, or -1 on error / no response
+ */
+int ml_at_socket_cmd_locked(const char *cmd, char *resp, size_t resp_size, int timeout_ms);
+
 /* ============================================================================
  * BSD Socket API Wrappers
  * ========================================================================== */
@@ -104,7 +114,12 @@ ssize_t ml_at_sendto(int fd, const void *buf, size_t len, int flags,
 
 /**
  * Receive data and get source address (UDP).
- * Uses AT+CIPRXGET=2,N,len and parses source from URC.
+ * Uses AT+CIPRXGET=2,N,len. The source address is taken from the
+ * +CIPRXGET header when the modem reports one; otherwise 0.0.0.0:0 is
+ * returned. Datagram boundaries are NOT preserved: the bridge stores UDP
+ * payloads in a byte ring, so back-to-back datagrams may be returned
+ * merged. Do not rely on UDP over the AT bridge for framing-sensitive
+ * protocols (MicroLink itself relays via DERP in AT mode).
  *
  * @return Bytes received, or -1 on error
  */
@@ -147,7 +162,8 @@ int ml_at_fcntl(int fd, int cmd, int arg);
 
 /**
  * select()-like multiplexing for AT sockets.
- * Checks rx_ready flags set by URC handler.
+ * Readable when buffered data, a pending modem buffer, remote close or a
+ * receive error is seen (polls with AT+CIPRXGET=4).
  *
  * @param nfds     Highest FD + 1
  * @param readfds  Set of FDs to check for readability

@@ -241,6 +241,8 @@ menu "MicroLink V2 Configuration"
             help
                 Access Point Name for cellular data connection.
                 Leave empty for auto-detection.
+                Letters, digits, '-' and '.' only (3GPP TS 23.003); other
+                values are rejected at startup.
 
         config ML_CELLULAR_SIM_PIN
             string "SIM Card PIN"
@@ -248,6 +250,7 @@ menu "MicroLink V2 Configuration"
             default ""
             help
                 PIN code for the SIM card. Leave empty if no PIN required.
+                Must be 4-8 digits.
 
         config ML_CELLULAR_PPP_USER
             string "PPP CHAP username"
@@ -257,6 +260,7 @@ menu "MicroLink V2 Configuration"
                 Username for PPP CHAP authentication.
                 Leave empty for SIMs that use IMSI-based auth (no credentials).
                 Soracom SIMs use "sora".
+                Printable ASCII without '"' or '\', max 64 characters.
 
         config ML_CELLULAR_PPP_PASS
             string "PPP CHAP password"
@@ -266,6 +270,7 @@ menu "MicroLink V2 Configuration"
                 Password for PPP CHAP authentication.
                 Leave empty for SIMs that use IMSI-based auth (no credentials).
                 Soracom SIMs use "sora".
+                Printable ASCII without '"' or '\', max 64 characters.
 
         choice ML_CELLULAR_DATA_MODE
             prompt "Cellular data mode"
@@ -277,8 +282,13 @@ menu "MicroLink V2 Configuration"
                 Auto: Try PPP first, fall back to AT socket bridge if PPP fails.
                 PPP only: Use PPP exclusively. Fails if PPP auth is rejected.
                 AT socket only: Skip PPP, use AT socket bridge. The UART stays
-                in AT command mode so you can send AT commands (e.g. GPS queries)
-                alongside the data connection.
+                in AT command mode, so the application can send its own AT
+                commands (e.g. GPS queries) alongside the data connection with
+                ml_cellular_send_at_cmd(). While the bridge is active only
+                single "AT+..." commands are accepted, and commands that would
+                break the bridge (+CIP*, +NET*, +CFUN, +IPR, ...) are refused.
+                The bridge is much slower than PPP (seconds of latency); with
+                PPP, use the modem's second UART/USB port for GNSS instead.
 
             config ML_CELLULAR_DATA_AUTO
                 bool "Auto (PPP primary, AT socket fallback)"

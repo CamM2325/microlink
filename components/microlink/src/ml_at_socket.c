@@ -18,10 +18,26 @@
  * appear in AT command responses, and recv/select actively poll the modem.
  *
  * The UART is shared with ml_cellular.c (AT command mode, no PPP).
- * A mutex protects AT command sequences from concurrent access.
+ * Locking (always in this order, never the reverse):
+ *   1. The modem UART lock owned by ml_cellular.c (ml_cellular_uart_lock)
+ *      serialises every AT exchange: socket commands, the driver itself and
+ *      application commands (ml_cellular_send_at_cmd). It is never deleted.
+ *   2. s_at.sock_lock protects each socket's RX ring and its buffer pointer,
+ *      so a close() from one task cannot free a ring another task is reading.
+ *
+ * Known limitations (documented, not fixed here):
+ *   - UDP datagram boundaries are not preserved (payloads share a byte ring).
+ *     The source address is only known if the modem reports it in the
+ *     +CIPRXGET header; otherwise recvfrom() reports 0.0.0.0:0.
+ *   - Every AT exchange starts with uart_flush_input(), which can discard a
+ *     URC (e.g. "+IPCLOSE") that arrived between commands. Data itself is
+ *     not lost (manual RX mode keeps it in the modem until CIPRXGET=2).
+ *   - Virtual FDs ML_AT_SOCK_FD_BASE..+ML_AT_SOCK_MAX-1 are routed here by
+ *     number alone; see the static assertion below.
  */
 
 #include "ml_at_socket.h"
+#include "ml_at_validate.h"
 #include "ml_cellular.h"
 #include "microlink_internal.h"
 
@@ -43,6 +59,14 @@
 #ifdef CONFIG_ML_ENABLE_CELLULAR
 
 static const char *TAG = "ml_at_sock";
+
+/* AT socket FDs are recognised by number only (ml_at_socket_is_at_fd), so
+ * they must not overlap lwIP's FD range [LWIP_SOCKET_OFFSET, FD_SETSIZE).
+ * With FD_SETSIZE 64 this requires CONFIG_LWIP_MAX_SOCKETS <= 22. */
+#if defined(LWIP_SOCKET_OFFSET)
+_Static_assert(LWIP_SOCKET_OFFSET >= ML_AT_SOCK_FD_BASE + ML_AT_SOCK_MAX,
+               "AT socket bridge FDs overlap lwIP FDs: reduce CONFIG_LWIP_MAX_SOCKETS to 22 or less");
+#endif
 
 /* ============================================================================
  * Constants
@@ -70,6 +94,7 @@ typedef struct {
     bool bound;
     bool nonblocking;
     bool closed_by_remote;      /* Remote side closed the connection */
+    bool rx_error;              /* RX stream desynchronised (bad length, short read) */
     uint32_t recv_timeout_ms;
     uint32_t send_timeout_ms;
     uint16_t local_port;        /* For UDP bind */
@@ -80,7 +105,7 @@ typedef struct {
     volatile size_t rx_tail;    /* Read position */
     size_t rx_size;             /* Ring buffer capacity */
 
-    /* Last UDP source (from +RECV FROM URC) */
+    /* Last UDP source (from the +CIPRXGET header, if the modem reports it) */
     uint32_t last_src_ip;
     uint16_t last_src_port;
 
@@ -90,18 +115,24 @@ typedef struct {
 } ml_at_sock_t;
 
 static struct {
-    bool initialized;
+    volatile bool initialized;
     bool net_open;
     ml_at_sock_t socks[AT_SOCK_MAX];
-    SemaphoreHandle_t at_mutex;     /* Protects AT command sequences */
+    SemaphoreHandle_t sock_lock;    /* RX rings + rx_buf pointers; never deleted */
 } s_at = {0};
+
+/* Modem UART lock (shared with ml_cellular.c). It is created by
+ * ml_cellular_init() before the bridge can start and never deleted. */
+#define AT_LOCK()    ((void)ml_cellular_uart_lock())
+#define AT_UNLOCK()  ml_cellular_uart_unlock()
 
 /* ============================================================================
  * Ring Buffer Helpers
  * ========================================================================== */
 
 static inline size_t ring_used(const ml_at_sock_t *s) {
-    return (s->rx_head - s->rx_tail) % s->rx_size;
+    if (s->rx_size == 0) return 0;
+    return (s->rx_head + s->rx_size - s->rx_tail) % s->rx_size;
 }
 
 static inline size_t ring_free(const ml_at_sock_t *s) {
@@ -124,6 +155,46 @@ static size_t ring_read(ml_at_sock_t *s, uint8_t *data, size_t len) {
         s->rx_tail = (s->rx_tail + 1) % s->rx_size;
     }
     return read_count;
+}
+
+/* Locked ring access. A socket can be closed (and its ring freed) by another
+ * task; these re-check the slot under sock_lock before touching rx_buf. */
+
+/* Copy buffered RX bytes out. Returns bytes copied (0 if none), or -1 if the
+ * socket was closed concurrently. */
+static int sock_ring_take(ml_at_sock_t *s, uint8_t *buf, size_t len)
+{
+    int n = -1;
+    xSemaphoreTake(s_at.sock_lock, portMAX_DELAY);
+    if (s->link_num >= 0 && s->rx_buf) {
+        n = (int)ring_read(s, buf, len);
+    }
+    xSemaphoreGive(s_at.sock_lock);
+    return n;
+}
+
+/* Append received bytes. Returns bytes stored (less than len only if the
+ * socket was closed or the ring is full). */
+static size_t sock_ring_put(ml_at_sock_t *s, const uint8_t *data, size_t len)
+{
+    size_t n = 0;
+    xSemaphoreTake(s_at.sock_lock, portMAX_DELAY);
+    if (s->link_num >= 0 && s->rx_buf) {
+        n = ring_write(s, data, len);
+    }
+    xSemaphoreGive(s_at.sock_lock);
+    return n;
+}
+
+/* Something for recv() to report: data, EOF or an error */
+static bool sock_rx_ready(ml_at_sock_t *s)
+{
+    bool ready;
+    xSemaphoreTake(s_at.sock_lock, portMAX_DELAY);
+    ready = s->link_num >= 0 &&
+            (ring_used(s) > 0 || s->closed_by_remote || s->rx_error);
+    xSemaphoreGive(s_at.sock_lock);
+    return ready;
 }
 
 /* ============================================================================
@@ -225,25 +296,49 @@ static void *bin_search(const void *haystack, size_t haystack_len,
 }
 
 /* Send an AT command and wait for response.
- * Caller must hold at_mutex.
+ * Caller must hold the UART lock.
  * Processes any URCs found in the response.
  * Uses binary-safe search (memmem) so null bytes in data don't hang. */
+/* Write "<cmd>\r\n". Refuses (rather than truncates) an over-long command,
+ * since truncation would drop the CR and merge it with the next command. */
+static bool at_write_cmd(const char *cmd)
+{
+    char cmd_buf[512];
+    size_t len = strlen(cmd);
+    if (len > sizeof(cmd_buf) - 3) {
+        ESP_LOGE(TAG, "AT command too long (%u bytes)", (unsigned)len);
+        return false;
+    }
+    memcpy(cmd_buf, cmd, len);
+    cmd_buf[len] = '\r';
+    cmd_buf[len + 1] = '\n';
+    uart_write_bytes(UART_NUM, cmd_buf, len + 2);
+    ml_at_secure_zero(cmd_buf, sizeof(cmd_buf));
+    return true;
+}
+
 static int at_cmd(const char *cmd, char *resp, size_t resp_size, int timeout_ms)
 {
+    char log_cmd[48];
+    memset(resp, 0, resp_size);
+    if (resp_size < 2) return 0;
+
     uart_flush_input(UART_NUM);
+    if (!at_write_cmd(cmd)) return 0;
 
-    char cmd_buf[512];
-    snprintf(cmd_buf, sizeof(cmd_buf), "%s\r\n", cmd);
-    uart_write_bytes(UART_NUM, cmd_buf, strlen(cmd_buf));
-
-    ESP_LOGD(TAG, ">> %s", cmd);
+    ESP_LOGD(TAG, ">> %s", ml_at_redact_cmd(cmd, log_cmd, sizeof(log_cmd)));
 
     int total = 0;
     int64_t start = esp_timer_get_time();
     int64_t timeout_us = (int64_t)timeout_ms * 1000;
-    memset(resp, 0, resp_size);
 
     while ((esp_timer_get_time() - start) < timeout_us) {
+        if ((size_t)total >= resp_size - 1) {
+            /* Full without a final result code: stop rather than spin on
+             * zero-length reads while holding the UART lock. */
+            ESP_LOGW(TAG, "AT response truncated at %d bytes", total);
+            break;
+        }
         /* Short UART read timeout (20ms) for fast AT round-trips.
          * At 921600 baud, 1460 bytes take ~16ms to transfer. */
         int len = uart_read_bytes(UART_NUM,
@@ -285,26 +380,31 @@ static bool at_cmd_ok(const char *cmd, int timeout_ms)
 
 /* Send an AT command and wait for a specific URC pattern (e.g. +CDNSGIP).
  * After getting OK, continues reading for the async URC response.
- * Caller must hold at_mutex. */
+ * Caller must hold the UART lock. */
 static int at_cmd_wait_urc(const char *cmd, const char *urc_prefix,
                             char *resp, size_t resp_size, int timeout_ms)
 {
+    char log_cmd[48];
+    memset(resp, 0, resp_size);
+    if (resp_size < 2) return 0;
+
     uart_flush_input(UART_NUM);
+    if (!at_write_cmd(cmd)) return 0;
 
-    char cmd_buf[512];
-    snprintf(cmd_buf, sizeof(cmd_buf), "%s\r\n", cmd);
-    uart_write_bytes(UART_NUM, cmd_buf, strlen(cmd_buf));
-
-    ESP_LOGD(TAG, ">> %s (wait for %s)", cmd, urc_prefix);
+    ESP_LOGD(TAG, ">> %s (wait for %s)", ml_at_redact_cmd(cmd, log_cmd, sizeof(log_cmd)),
+             urc_prefix);
 
     int total = 0;
     int64_t start = esp_timer_get_time();
     int64_t timeout_us = (int64_t)timeout_ms * 1000;
-    memset(resp, 0, resp_size);
     bool got_ok = false;
     bool got_urc = false;
 
     while ((esp_timer_get_time() - start) < timeout_us) {
+        if ((size_t)total >= resp_size - 1) {
+            ESP_LOGW(TAG, "AT response full (%d bytes) before %s", total, urc_prefix);
+            break;
+        }
         int len = uart_read_bytes(UART_NUM,
                                    (uint8_t *)(resp + total),
                                    resp_size - total - 1,
@@ -324,6 +424,7 @@ static int at_cmd_wait_urc(const char *cmd, const char *urc_prefix,
                 got_urc = true;
                 /* Give a tiny bit more time for trailing data */
                 vTaskDelay(pdMS_TO_TICKS(100));
+                if ((size_t)total >= resp_size - 1) break;
                 len = uart_read_bytes(UART_NUM,
                                        (uint8_t *)(resp + total),
                                        resp_size - total - 1,
@@ -349,7 +450,7 @@ static int at_cmd_wait_urc(const char *cmd, const char *urc_prefix,
 }
 
 /* Send raw data (after AT+CIPSEND prompt).
- * Caller must hold at_mutex. */
+ * Caller must hold the UART lock. */
 static int at_send_raw(const void *data, size_t len, int timeout_ms)
 {
     uart_write_bytes(UART_NUM, data, len);
@@ -362,6 +463,7 @@ static int at_send_raw(const void *data, size_t len, int timeout_ms)
     memset(resp, 0, sizeof(resp));
 
     while ((esp_timer_get_time() - start) < timeout_us) {
+        if (total >= (int)sizeof(resp) - 1) break;   /* full: no zero-length spin */
         int n = uart_read_bytes(UART_NUM,
                                  (uint8_t *)(resp + total),
                                  sizeof(resp) - total - 1,
@@ -379,17 +481,26 @@ static int at_send_raw(const void *data, size_t len, int timeout_ms)
 }
 
 /* Format IP from sockaddr to string (supports both IPv4 and IPv6) */
-static void sockaddr_to_str(const struct sockaddr *addr, char *buf, size_t buflen, uint16_t *port)
+/* Returns false (buf left empty) for a NULL, short or non-IP address, so an
+ * uninitialised string is never put into an AT command. */
+static bool sockaddr_to_str(const struct sockaddr *addr, socklen_t addrlen,
+                            char *buf, size_t buflen, uint16_t *port)
 {
-    if (addr->sa_family == AF_INET) {
+    buf[0] = '\0';
+    if (!addr) return false;
+    if (addr->sa_family == AF_INET && addrlen >= sizeof(struct sockaddr_in)) {
         const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
-        inet_ntoa_r(sin->sin_addr, buf, buflen);
+        if (!inet_ntoa_r(sin->sin_addr, buf, buflen)) return false;
         if (port) *port = ntohs(sin->sin_port);
-    } else if (addr->sa_family == AF_INET6) {
-        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
-        inet_ntop(AF_INET6, &sin6->sin6_addr, buf, buflen);
-        if (port) *port = ntohs(sin6->sin6_port);
+        return true;
     }
+    if (addr->sa_family == AF_INET6 && addrlen >= sizeof(struct sockaddr_in6)) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
+        if (!inet_ntop(AF_INET6, &sin6->sin6_addr, buf, buflen)) return false;
+        if (port) *port = ntohs(sin6->sin6_port);
+        return true;
+    }
+    return false;
 }
 
 /* ============================================================================
@@ -401,7 +512,7 @@ static void sockaddr_to_str(const struct sockaddr *addr, char *buf, size_t bufle
 
 /* Query how many bytes are pending for a given link.
  * Uses AT+CIPRXGET=4,N → +CIPRXGET: 4,<link_num>,<pending_len>
- * Caller must hold at_mutex. */
+ * Caller must hold the UART lock. */
 static int at_query_pending(int link_num)
 {
     char cmd[32];
@@ -420,7 +531,7 @@ static int at_query_pending(int link_num)
     if (sscanf(p, "+CIPRXGET: 4,%d,%d", &ln, &pending) >= 2) {
         int64_t elapsed_ms = (esp_timer_get_time() - t0) / 1000;
         if (pending > 0) {
-            ESP_LOGI(TAG, "QUERY: link=%d pending=%d %lldms", link_num, pending, elapsed_ms);
+            ESP_LOGD(TAG, "QUERY: link=%d pending=%d %lldms", link_num, pending, elapsed_ms);
         }
         return pending;
     }
@@ -428,23 +539,31 @@ static int at_query_pending(int link_num)
 }
 
 /* Read one chunk of data from modem into socket's ring buffer.
- * Binary-safe: reads response in two phases:
+ * Binary-safe: reads response in phases:
  *   1. Text header: +CIPRXGET: 2,<link>,<actual>,<remaining>\r\n
  *   2. Binary data: exactly <actual> bytes
  *   3. Trailing: \r\nOK\r\n
- * Caller must hold at_mutex.
- * Returns: actual bytes written to ring, sets *out_remaining if not NULL. */
+ * The modem-reported lengths are validated (link must match, actual must be
+ * <= what we asked for and fit in the ring). A bad header, a short read or a
+ * ring overflow means the byte stream is out of sync: the socket is marked
+ * rx_error (recv() then fails with EIO once buffered data is consumed)
+ * instead of silently dropping bytes inside a TLS stream.
+ * Caller must hold the UART lock.
+ * Returns: bytes written to ring (0 = no data), or -1 on error. */
 static int at_read_data_chunk(int link_num, int max_bytes, int *out_remaining)
 {
+    if (out_remaining) *out_remaining = 0;
     if (link_num < 0 || link_num >= AT_SOCK_MAX) return 0;
     ml_at_sock_t *s = &s_at.socks[link_num];
-    if (s->link_num < 0) return 0;
+    if (s->link_num < 0 || !s->rx_buf || s->rx_error) return 0;
 
+    /* Only readers run concurrently, and they only free space, so this is
+     * a lower bound for the whole read. close() needs the UART lock. */
     int req_len = max_bytes;
     size_t free_space = ring_free(s);
     if ((size_t)req_len > free_space) req_len = (int)free_space;
     if (req_len <= 0) return 0;
-    if (req_len > 1460) req_len = 1460;
+    if (req_len > AT_MAX_SEND_CHUNK) req_len = AT_MAX_SEND_CHUNK;
 
     /* Send command */
     uart_flush_input(UART_NUM);
@@ -459,78 +578,101 @@ static int at_read_data_chunk(int link_num, int max_bytes, int *out_remaining)
     int hdr_total = 0;
     int64_t start = esp_timer_get_time();
     int64_t timeout_us = (int64_t)AT_TIMEOUT_MS * 1000;
-    int actual_len = 0, remaining = 0;
+    ml_at_rxget_hdr_t h;
+    int data_off = 0;
     bool got_header = false;
 
     while ((esp_timer_get_time() - start) < timeout_us) {
+        if (hdr_total >= (int)sizeof(hdr) - 1) {
+            /* Full of URC lines that arrived before the header: handle the
+             * complete lines and keep only the trailing partial line, instead
+             * of spinning on zero-length reads until the timeout. */
+            int keep_from = hdr_total - 16;   /* no line break: keep a tail */
+            for (int i = hdr_total - 1; i >= 0; i--) {
+                if (hdr[i] == '\n') {
+                    hdr[i] = '\0';
+                    process_urcs_in_response(hdr);
+                    keep_from = i + 1;
+                    break;
+                }
+            }
+            memmove(hdr, hdr + keep_from, hdr_total - keep_from);
+            hdr_total -= keep_from;
+            hdr[hdr_total] = '\0';
+        }
+
         int n = uart_read_bytes(UART_NUM,
                                  (uint8_t *)(hdr + hdr_total),
                                  sizeof(hdr) - hdr_total - 1,
                                  pdMS_TO_TICKS(20));
-        if (n > 0) {
-            hdr_total += n;
-            hdr[hdr_total] = '\0';
+        if (n <= 0) continue;
+        hdr_total += n;
+        hdr[hdr_total] = '\0';
 
-            /* Check for ERROR response */
-            if (strstr(hdr, "ERROR")) {
-                return 0;
+        char *p = strstr(hdr, "+CIPRXGET: 2,");
+        if (p) {
+            char *nl = memchr(p, '\n', (size_t)(hdr_total - (p - hdr)));
+            if (!nl) continue;   /* header line not complete yet */
+            if (!ml_at_parse_rxget_hdr(p, (size_t)(nl - p), AT_SOCK_MAX, req_len, &h) ||
+                h.link != link_num) {
+                ESP_LOGE(TAG, "link %d: bad +CIPRXGET header (requested %d): %.*s",
+                         link_num, req_len, (int)(nl - p), p);
+                goto desync;
             }
+            data_off = (int)(nl + 1 - hdr);
+            got_header = true;
+            break;
+        }
 
-            /* Parse the header — look for the line ending with \n after +CIPRXGET */
-            char *p = strstr(hdr, "+CIPRXGET: 2,");
-            if (p) {
-                char *nl = strchr(p, '\n');
-                if (nl) {
-                    int ln;
-                    if (sscanf(p, "+CIPRXGET: 2,%d,%d,%d", &ln, &actual_len, &remaining) >= 2) {
-                        got_header = true;
-                        /* Calculate how many bytes of data we already consumed
-                         * past the header \n */
-                        int hdr_end_offset = (int)(nl + 1 - hdr);
-                        int data_already = hdr_total - hdr_end_offset;
-
-                        /* Write any data bytes that came with the header read */
-                        if (data_already > 0 && actual_len > 0) {
-                            int to_write = (data_already > actual_len) ? actual_len : data_already;
-                            ring_write(s, (const uint8_t *)(nl + 1), to_write);
-                            actual_len -= to_write;
-                        }
-                        break;
-                    }
-                }
-            }
+        /* No header: an ERROR here means no data / link not open */
+        if (strstr(hdr, "ERROR")) {
+            return 0;
         }
     }
 
     if (!got_header) {
-        if (out_remaining) *out_remaining = 0;
         return 0;
     }
 
-    /* Track total bytes written to ring.
-     * Phase 1 may have piggybacked some data — actual_len was reduced. */
-    int orig_actual = actual_len;
-    {
-        int ln_dummy, parsed_actual = 0;
-        char *p2 = strstr(hdr, "+CIPRXGET: 2,");
-        if (p2) sscanf(p2, "+CIPRXGET: 2,%d,%d", &ln_dummy, &parsed_actual);
-        orig_actual = parsed_actual; /* original data length from modem */
+    int actual_len = h.read_len;
+    int total_written = 0;
+
+    /* Data bytes that arrived in the same read as the header */
+    int piggy = hdr_total - data_off;
+    if (piggy > 0 && actual_len > 0) {
+        int take = (piggy > actual_len) ? actual_len : piggy;
+        if (sock_ring_put(s, (const uint8_t *)(hdr + data_off), take) != (size_t)take) {
+            goto overflow;
+        }
+        total_written += take;
+        actual_len -= take;
     }
-    int total_written = orig_actual - actual_len; /* Phase 1 piggyback */
 
     /* Phase 2: Read remaining binary data bytes directly into ring buffer.
      * We know exactly how many bytes to expect — no string parsing needed.
      * Use a large buffer to minimize uart_read_bytes() calls (each call has
      * timeout overhead even when data is available). */
-    uint8_t chunk[1460];
+    uint8_t chunk[AT_MAX_SEND_CHUNK];
     while (actual_len > 0 && (esp_timer_get_time() - start) < timeout_us) {
         int want = (actual_len > (int)sizeof(chunk)) ? (int)sizeof(chunk) : actual_len;
         int n = uart_read_bytes(UART_NUM, chunk, want, pdMS_TO_TICKS(20));
         if (n > 0) {
-            size_t w = ring_write(s, chunk, n);
-            total_written += (int)w;
+            if (sock_ring_put(s, chunk, n) != (size_t)n) {
+                goto overflow;
+            }
+            total_written += n;
             actual_len -= n;
         }
+    }
+    if (actual_len > 0) {
+        ESP_LOGE(TAG, "link %d: timed out with %d of %d bytes missing",
+                 link_num, actual_len, h.read_len);
+        goto desync;
+    }
+
+    if (h.has_src) {
+        s->last_src_ip = h.src_ip;
+        s->last_src_port = h.src_port;
     }
 
     /* Phase 3: Consume trailing \r\nOK\r\n (don't care about exact content).
@@ -538,20 +680,25 @@ static int at_read_data_chunk(int link_num, int max_bytes, int *out_remaining)
     uint8_t trail[32];
     uart_read_bytes(UART_NUM, trail, sizeof(trail), pdMS_TO_TICKS(5));
 
-    if (out_remaining) *out_remaining = remaining;
+    if (out_remaining) *out_remaining = h.rest_len;
 
-    /* Throughput diagnostic: log every chunk at INFO level to see actual sizes.
-     * Key question: are chunks actually 1460 bytes or much smaller? */
     int64_t chunk_elapsed_ms = (esp_timer_get_time() - start) / 1000;
-    ESP_LOGI(TAG, "CHUNK: link=%d req=%d got=%d remaining=%d %lldms",
-             link_num, req_len, total_written, remaining, chunk_elapsed_ms);
+    ESP_LOGD(TAG, "CHUNK: link=%d req=%d got=%d remaining=%d %lldms",
+             link_num, req_len, total_written, h.rest_len, chunk_elapsed_ms);
 
     return total_written;
+
+overflow:
+    ESP_LOGE(TAG, "link %d: RX ring overflow (socket closed or ring full)", link_num);
+desync:
+    s->rx_error = true;
+    uart_flush_input(UART_NUM);
+    return -1;
 }
 
 /* Read ALL available data from modem into socket's ring buffer.
  * Keeps reading in a loop while remaining > 0.
- * Caller must hold at_mutex.
+ * Caller must hold the UART lock.
  * Returns total bytes read. Sets *out_remaining to bytes still in modem. */
 static int at_read_data(int link_num, int max_bytes, int *out_remaining)
 {
@@ -560,12 +707,12 @@ static int at_read_data(int link_num, int max_bytes, int *out_remaining)
 
     /* Read first chunk */
     int got = at_read_data_chunk(link_num, max_bytes, &remaining);
-    total += got;
+    if (got > 0) total += got;
 
     /* Keep reading while there's more data and ring buffer has space */
     while (remaining > 0 && got > 0 && ring_free(&s_at.socks[link_num]) > 0) {
         got = at_read_data_chunk(link_num, remaining, &remaining);
-        total += got;
+        if (got > 0) total += got;
     }
 
     if (out_remaining) *out_remaining = remaining;
@@ -588,15 +735,21 @@ esp_err_t ml_at_socket_init(void)
         s_at.socks[i].link_num = -1; /* Free */
     }
 
-    /* Create AT mutex */
-    s_at.at_mutex = xSemaphoreCreateMutex();
-    if (!s_at.at_mutex) {
-        ESP_LOGE(TAG, "Failed to create AT mutex");
-        return ESP_ERR_NO_MEM;
+    /* Ring lock: created once, never deleted (tasks may still hold a
+     * socket pointer after deinit; they re-check the slot under it). */
+    if (!s_at.sock_lock) {
+        s_at.sock_lock = xSemaphoreCreateMutex();
+        if (!s_at.sock_lock) {
+            ESP_LOGE(TAG, "Failed to create socket lock");
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     /* Close any existing network session */
-    xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
+    if (!ml_cellular_uart_lock()) {
+        ESP_LOGE(TAG, "Modem UART not initialized (call ml_cellular_init first)");
+        return ESP_ERR_INVALID_STATE;
+    }
     at_cmd_ok("AT+NETCLOSE", AT_TIMEOUT_MS);
     vTaskDelay(pdMS_TO_TICKS(1000));
 
@@ -606,7 +759,7 @@ esp_err_t ml_at_socket_init(void)
     /* Open network */
     char resp[AT_RESP_BUF_SIZE];
     at_cmd("AT+NETOPEN", resp, sizeof(resp), AT_LONG_TIMEOUT_MS);
-    xSemaphoreGive(s_at.at_mutex);
+    AT_UNLOCK();
 
     if (!strstr(resp, "OK") && !strstr(resp, "+NETOPEN: 0") && !strstr(resp, "already opened")) {
         ESP_LOGE(TAG, "AT+NETOPEN failed: %s", resp);
@@ -617,9 +770,9 @@ esp_err_t ml_at_socket_init(void)
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     /* Verify IP address */
-    xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
+    AT_LOCK();
     at_cmd("AT+IPADDR", resp, sizeof(resp), AT_TIMEOUT_MS);
-    xSemaphoreGive(s_at.at_mutex);
+    AT_UNLOCK();
 
     char *ip_start = strstr(resp, "+IPADDR:");
     if (ip_start) {
@@ -647,17 +800,15 @@ void ml_at_socket_deinit(void)
 
     /* Close network */
     if (s_at.net_open) {
-        xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
+        AT_LOCK();
         at_cmd_ok("AT+NETCLOSE", AT_TIMEOUT_MS);
-        xSemaphoreGive(s_at.at_mutex);
+        AT_UNLOCK();
         s_at.net_open = false;
     }
 
-    if (s_at.at_mutex) {
-        vSemaphoreDelete(s_at.at_mutex);
-        s_at.at_mutex = NULL;
-    }
-
+    /* The UART lock and sock_lock are intentionally not deleted: another
+     * task may be blocked on them, and deleting a semaphore with waiters is
+     * undefined. Such a task finds its socket closed (EBADF). */
     s_at.initialized = false;
     ESP_LOGI(TAG, "AT socket bridge deinitialized");
 }
@@ -665,6 +816,13 @@ void ml_at_socket_deinit(void)
 bool ml_at_socket_is_ready(void)
 {
     return s_at.initialized && s_at.net_open;
+}
+
+int ml_at_socket_cmd_locked(const char *cmd, char *resp, size_t resp_size, int timeout_ms)
+{
+    if (!s_at.initialized || !cmd || !resp || resp_size < 2) return -1;
+    int n = at_cmd(cmd, resp, resp_size, timeout_ms);
+    return (n > 0) ? n : -1;
 }
 
 /* ============================================================================
@@ -678,7 +836,7 @@ bool ml_at_socket_is_at_fd(int fd)
 
 static ml_at_sock_t *fd_to_sock(int fd)
 {
-    if (!ml_at_socket_is_at_fd(fd)) return NULL;
+    if (!s_at.initialized || !ml_at_socket_is_at_fd(fd)) return NULL;
     int idx = fd - AT_SOCK_FD_BASE;
     ml_at_sock_t *s = &s_at.socks[idx];
     return (s->link_num >= 0) ? s : NULL;
@@ -705,27 +863,28 @@ int ml_at_socket(int domain, int type, int protocol)
         return -1;
     }
 
-    /* Find free slot */
+    /* Allocate RX ring buffer (ml_psram_malloc falls back to internal RAM) */
+    uint8_t *rx_buf = ml_psram_malloc(RX_RING_SIZE);
+    if (!rx_buf) {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    /* Claim a free slot. Every field is set before link_num publishes the
+     * slot, so a concurrent select()/recv() never sees rx_size == 0. */
+    xSemaphoreTake(s_at.sock_lock, portMAX_DELAY);
     for (int i = 0; i < AT_SOCK_MAX; i++) {
         if (s_at.socks[i].link_num < 0) {
             ml_at_sock_t *s = &s_at.socks[i];
             memset(s, 0, sizeof(*s));
-            s->link_num = i;
+            s->link_num = -1;
             s->type = type;
             s->recv_timeout_ms = 10000; /* Default 10s */
             s->send_timeout_ms = 10000;
-
-            /* Allocate RX ring buffer */
             s->rx_size = RX_RING_SIZE;
-            s->rx_buf = ml_psram_malloc(RX_RING_SIZE);
-            if (!s->rx_buf) {
-                s->rx_buf = malloc(RX_RING_SIZE);
-            }
-            if (!s->rx_buf) {
-                s->link_num = -1;
-                errno = ENOMEM;
-                return -1;
-            }
+            s->rx_buf = rx_buf;
+            s->link_num = i;
+            xSemaphoreGive(s_at.sock_lock);
 
             int fd = AT_SOCK_FD_BASE + i;
             ESP_LOGI(TAG, "socket(%s) -> fd=%d link=%d",
@@ -733,6 +892,8 @@ int ml_at_socket(int domain, int type, int protocol)
             return fd;
         }
     }
+    xSemaphoreGive(s_at.sock_lock);
+    free(rx_buf);
 
     ESP_LOGE(TAG, "No free AT sockets (max %d)", AT_SOCK_MAX);
     errno = EMFILE;
@@ -745,8 +906,11 @@ int ml_at_connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
     if (!s) { errno = EBADF; return -1; }
 
     char ip_str[INET6_ADDRSTRLEN];  /* 46 bytes — fits IPv4 and IPv6 */
-    uint16_t port;
-    sockaddr_to_str(addr, ip_str, sizeof(ip_str), &port);
+    uint16_t port = 0;
+    if (!sockaddr_to_str(addr, addrlen, ip_str, sizeof(ip_str), &port)) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
 
     const char *proto = (s->type == SOCK_STREAM) ? "TCP" : "UDP";
     char cmd[192];  /* Larger for IPv6 addresses */
@@ -765,22 +929,31 @@ int ml_at_connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
     s->connect_done = false;
     s->connect_ok = false;
 
-    /* For TCP, we need to wait for the async +CIPOPEN: N,0 URC.
-     * Use at_cmd_wait_urc to keep reading until we see it. */
+    /* For TCP, we need to wait for the async +CIPOPEN: N,0 URC for THIS
+     * link (a late result for another link must not count). */
+    char urc[24];
+    snprintf(urc, sizeof(urc), "+CIPOPEN: %d,", s->link_num);
     char resp[AT_RESP_BUF_SIZE];
-    xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
+    AT_LOCK();
+    if (s->link_num < 0) {          /* closed by another task meanwhile */
+        AT_UNLOCK();
+        errno = EBADF;
+        return -1;
+    }
 
     if (s->type == SOCK_STREAM) {
         /* TCP: wait for +CIPOPEN URC */
-        at_cmd_wait_urc(cmd, "+CIPOPEN:", resp, sizeof(resp), AT_LONG_TIMEOUT_MS);
+        at_cmd_wait_urc(cmd, urc, resp, sizeof(resp), AT_LONG_TIMEOUT_MS);
     } else {
         /* UDP: just need OK */
         at_cmd(cmd, resp, sizeof(resp), AT_LONG_TIMEOUT_MS);
     }
-    xSemaphoreGive(s_at.at_mutex);
+    AT_UNLOCK();
 
-    /* Check for inline connect result */
-    if (strstr(resp, "+CIPOPEN:") && strstr(resp, ",0")) {
+    /* Check for inline connect result: exactly "+CIPOPEN: <link>,0" */
+    const char *res = strstr(resp, urc);
+    int open_err = -1;
+    if (res && sscanf(res + strlen(urc), "%d", &open_err) == 1 && open_err == 0) {
         s->connected = true;
         ESP_LOGI(TAG, "connect: link %d connected", s->link_num);
         return 0;
@@ -821,7 +994,13 @@ ssize_t ml_at_send(int fd, const void *buf, size_t len, int flags)
         char cmd[64];
         snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%d,%d", s->link_num, (int)chunk);
 
-        xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
+        AT_LOCK();
+        if (s->link_num < 0) {      /* closed by another task meanwhile */
+            AT_UNLOCK();
+            if (total_sent > 0) return total_sent;
+            errno = EBADF;
+            return -1;
+        }
 
         /* Send the command and wait for '>' prompt */
         char resp[256];
@@ -836,6 +1015,7 @@ ssize_t ml_at_send(int fd, const void *buf, size_t len, int flags)
         memset(resp, 0, sizeof(resp));
         bool got_prompt = false;
         while ((esp_timer_get_time() - start) < (int64_t)AT_TIMEOUT_MS * 1000) {
+            if (resp_len >= (int)sizeof(resp) - 1) break;   /* full: no zero-length spin */
             int n = uart_read_bytes(UART_NUM,
                                      (uint8_t *)(resp + resp_len),
                                      sizeof(resp) - resp_len - 1,
@@ -852,7 +1032,7 @@ ssize_t ml_at_send(int fd, const void *buf, size_t len, int flags)
         }
 
         if (!got_prompt) {
-            xSemaphoreGive(s_at.at_mutex);
+            AT_UNLOCK();
             ESP_LOGW(TAG, "send: no '>' prompt for link %d", s->link_num);
             if (total_sent > 0) return total_sent;
             errno = EIO;
@@ -861,7 +1041,7 @@ ssize_t ml_at_send(int fd, const void *buf, size_t len, int flags)
 
         /* Send the raw data */
         int sent = at_send_raw(data + total_sent, chunk, s->send_timeout_ms);
-        xSemaphoreGive(s_at.at_mutex);
+        AT_UNLOCK();
 
         if (sent < 0) {
             ESP_LOGW(TAG, "send: data send failed for link %d", s->link_num);
@@ -876,37 +1056,54 @@ ssize_t ml_at_send(int fd, const void *buf, size_t len, int flags)
     return total_sent;
 }
 
+/* Ask the modem for pending bytes on link idx and drain them into the ring.
+ * Returns false if the socket was closed meanwhile. */
+static bool poll_link(ml_at_sock_t *s, int idx, int *drained, int *remaining)
+{
+    int got = 0, rem = 0;
+    AT_LOCK();
+    if (s->link_num != idx) {
+        AT_UNLOCK();
+        return false;
+    }
+    int pending = at_query_pending(idx);
+    if (pending > 0) {
+        /* at_read_data drains ALL pending data in a loop internally */
+        got = at_read_data(idx, pending, &rem);
+    }
+    AT_UNLOCK();
+    if (drained) *drained = got;
+    if (remaining) *remaining = rem;
+    return true;
+}
+
+/* Deliver buffered data, EOF or a pending error. Returns 1 if *ret is set. */
+static int recv_ready_result(ml_at_sock_t *s, void *buf, size_t len, ssize_t *ret)
+{
+    int n = sock_ring_take(s, (uint8_t *)buf, len);
+    if (n > 0) { *ret = n; return 1; }
+    if (n < 0) { errno = EBADF; *ret = -1; return 1; }
+    if (s->rx_error) { errno = EIO; *ret = -1; return 1; }
+    if (s->closed_by_remote) { *ret = 0; return 1; }   /* EOF */
+    return 0;
+}
+
 ssize_t ml_at_recv(int fd, void *buf, size_t len, int flags)
 {
     ml_at_sock_t *s = fd_to_sock(fd);
     if (!s) { errno = EBADF; return -1; }
+    int idx = fd - AT_SOCK_FD_BASE;
+    ssize_t ret;
+
+    if (len == 0) return 0;
 
     /* Check ring buffer first — fast path, no AT commands */
-    size_t avail = ring_used(s);
-    if (avail > 0) {
-        size_t to_read = (avail < len) ? avail : len;
-        return ring_read(s, (uint8_t *)buf, to_read);
-    }
-
-    /* Check if remote closed */
-    if (s->closed_by_remote) {
-        return 0; /* EOF */
-    }
+    if (recv_ready_result(s, buf, len, &ret)) return ret;
 
     /* Non-blocking mode */
     if (s->nonblocking) {
-        xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
-        int pending = at_query_pending(s->link_num);
-        if (pending > 0) {
-            at_read_data(s->link_num, pending, NULL);
-        }
-        xSemaphoreGive(s_at.at_mutex);
-
-        avail = ring_used(s);
-        if (avail > 0) {
-            size_t to_read = (avail < len) ? avail : len;
-            return ring_read(s, (uint8_t *)buf, to_read);
-        }
+        if (!poll_link(s, idx, NULL, NULL)) { errno = EBADF; return -1; }
+        if (recv_ready_result(s, buf, len, &ret)) return ret;
         errno = EAGAIN;
         return -1;
     }
@@ -928,38 +1125,18 @@ ssize_t ml_at_recv(int fd, void *buf, size_t len, int flags)
         }
         first_poll = false;
 
-        /* Drain mode: query once, then keep reading via at_read_data()'s
-         * internal remaining tracking. Only re-query if at_read_data()
-         * reports remaining > 0 but couldn't read (ring full). */
-        xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
-        int total_drained = 0;
-        int remaining = 0;
-        int pending = at_query_pending(s->link_num);
-        if (pending > 0) {
-            /* at_read_data drains ALL pending data in a loop internally */
-            int got = at_read_data(s->link_num, pending, &remaining);
-            total_drained += got;
-
-            /* If modem still has data (ring was full), try again after
-             * reading from ring — but this is rare with 8KB ring */
+        int total_drained = 0, remaining = 0;
+        if (!poll_link(s, idx, &total_drained, &remaining)) {
+            errno = EBADF;
+            return -1;
         }
-        xSemaphoreGive(s_at.at_mutex);
 
         if (total_drained > 0) {
-            ESP_LOGI(TAG, "DRAIN: link=%d drained=%d remaining=%d", s->link_num, total_drained, remaining);
+            ESP_LOGD(TAG, "DRAIN: link=%d drained=%d remaining=%d", idx, total_drained, remaining);
         }
 
-        /* Return data if available */
-        avail = ring_used(s);
-        if (avail > 0) {
-            size_t to_read = (avail < len) ? avail : len;
-            return ring_read(s, (uint8_t *)buf, to_read);
-        }
-
-        /* Check remote close */
-        if (s->closed_by_remote) {
-            return 0;
-        }
+        /* Return data, EOF or error if available */
+        if (recv_ready_result(s, buf, len, &ret)) return ret;
 
         /* No data — yield to let lower-priority tasks (DERP connect) run */
         vTaskDelay(1);
@@ -983,8 +1160,16 @@ ssize_t ml_at_sendto(int fd, const void *buf, size_t len, int flags,
     }
 
     char ip_str[INET6_ADDRSTRLEN];  /* 46 bytes — fits IPv4 and IPv6 */
-    uint16_t port;
-    sockaddr_to_str(dest_addr, ip_str, sizeof(ip_str), &port);
+    uint16_t port = 0;
+    if (!sockaddr_to_str(dest_addr, addrlen, ip_str, sizeof(ip_str), &port)) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+    if (len > AT_MAX_SEND_CHUNK) {
+        /* One CIPSEND per datagram: never send a silently truncated one */
+        errno = EMSGSIZE;
+        return -1;
+    }
 
     /* For UDP, if not yet "connected" (CIPOPEN), open it first */
     if (!s->connected) {
@@ -997,9 +1182,9 @@ ssize_t ml_at_sendto(int fd, const void *buf, size_t len, int flags,
                      s->link_num);
         }
 
-        xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
-        bool ok = at_cmd_ok(cmd, AT_LONG_TIMEOUT_MS);
-        xSemaphoreGive(s_at.at_mutex);
+        AT_LOCK();
+        bool ok = (s->link_num >= 0) && at_cmd_ok(cmd, AT_LONG_TIMEOUT_MS);
+        AT_UNLOCK();
 
         if (!ok) {
             ESP_LOGW(TAG, "sendto: CIPOPEN UDP failed for link %d", s->link_num);
@@ -1010,12 +1195,17 @@ ssize_t ml_at_sendto(int fd, const void *buf, size_t len, int flags,
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    size_t chunk = (len > AT_MAX_SEND_CHUNK) ? AT_MAX_SEND_CHUNK : len;
+    size_t chunk = len;
     char cmd[192];
     snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%d,%d,\"%s\",%u",
              s->link_num, (int)chunk, ip_str, port);
 
-    xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
+    AT_LOCK();
+    if (s->link_num < 0) {          /* closed by another task meanwhile */
+        AT_UNLOCK();
+        errno = EBADF;
+        return -1;
+    }
 
     /* Send command and wait for '>' */
     char resp[256];
@@ -1029,6 +1219,7 @@ ssize_t ml_at_sendto(int fd, const void *buf, size_t len, int flags,
     memset(resp, 0, sizeof(resp));
     bool got_prompt = false;
     while ((esp_timer_get_time() - start) < (int64_t)AT_TIMEOUT_MS * 1000) {
+        if (resp_len >= (int)sizeof(resp) - 1) break;   /* full: no zero-length spin */
         int n = uart_read_bytes(UART_NUM,
                                  (uint8_t *)(resp + resp_len),
                                  sizeof(resp) - resp_len - 1,
@@ -1042,14 +1233,14 @@ ssize_t ml_at_sendto(int fd, const void *buf, size_t len, int flags,
     }
 
     if (!got_prompt) {
-        xSemaphoreGive(s_at.at_mutex);
+        AT_UNLOCK();
         ESP_LOGW(TAG, "sendto: no '>' prompt for link %d", s->link_num);
         errno = EIO;
         return -1;
     }
 
     int sent = at_send_raw(buf, chunk, s->send_timeout_ms);
-    xSemaphoreGive(s_at.at_mutex);
+    AT_UNLOCK();
 
     if (sent < 0) {
         errno = EIO;
@@ -1067,7 +1258,8 @@ ssize_t ml_at_recvfrom(int fd, void *buf, size_t len, int flags,
 
     ssize_t n = ml_at_recv(fd, buf, len, flags);
 
-    /* Fill in source address from last URC if available */
+    /* Source address from the last +CIPRXGET header that carried one;
+     * 0.0.0.0:0 if the modem does not report it (see file header). */
     if (n > 0 && src_addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
         struct sockaddr_in *sin = (struct sockaddr_in *)src_addr;
         sin->sin_family = AF_INET;
@@ -1084,26 +1276,36 @@ int ml_at_close(int fd)
     ml_at_sock_t *s = fd_to_sock(fd);
     if (!s) { errno = EBADF; return -1; }
 
-    ESP_LOGI(TAG, "close: fd=%d link=%d", fd, s->link_num);
+    int idx = fd - AT_SOCK_FD_BASE;
+    ESP_LOGI(TAG, "close: fd=%d link=%d", fd, idx);
 
     /* Send AT+CIPCLOSE */
     char cmd[32];
-    snprintf(cmd, sizeof(cmd), "AT+CIPCLOSE=%d", s->link_num);
+    snprintf(cmd, sizeof(cmd), "AT+CIPCLOSE=%d", idx);
 
-    xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
-    at_cmd_ok(cmd, AT_TIMEOUT_MS);
-    xSemaphoreGive(s_at.at_mutex);
-
-    /* Free resources */
-    if (s->rx_buf) {
-        free(s->rx_buf);
-        s->rx_buf = NULL;
+    /* Hold the UART lock across the close so no RX read can be writing into
+     * the ring, then free it under sock_lock so no reader is copying out of
+     * it (they re-check link_num/rx_buf under the same lock). */
+    AT_LOCK();
+    if (s->link_num != idx) {       /* closed by another task meanwhile */
+        AT_UNLOCK();
+        errno = EBADF;
+        return -1;
     }
+    at_cmd_ok(cmd, AT_TIMEOUT_MS);
 
+    xSemaphoreTake(s_at.sock_lock, portMAX_DELAY);
+    uint8_t *rx_buf = s->rx_buf;
+    s->rx_buf = NULL;
+    s->rx_head = s->rx_tail = 0;
     s->link_num = -1;
     s->connected = false;
     s->closed_by_remote = false;
+    s->rx_error = false;
+    xSemaphoreGive(s_at.sock_lock);
+    AT_UNLOCK();
 
+    free(rx_buf);
     return 0;
 }
 
@@ -1202,7 +1404,7 @@ int ml_at_select(int nfds, fd_set *readfds, fd_set *writefds,
             if (!s) continue;
 
             if (readfds && FD_ISSET(fd, readfds)) {
-                if (ring_used(s) > 0 || s->closed_by_remote) {
+                if (sock_rx_ready(s)) {
                     FD_SET(fd, &rd_result);
                     ready_count++;
                 }
@@ -1218,25 +1420,26 @@ int ml_at_select(int nfds, fd_set *readfds, fd_set *writefds,
 
         if (ready_count > 0) break;
 
-        /* Second pass: query+drain for each socket in one mutex hold */
-        xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
+        /* Second pass: query+drain for each socket in one lock hold */
+        AT_LOCK();
         for (int fd = AT_SOCK_FD_BASE; fd < AT_SOCK_FD_BASE + AT_SOCK_MAX && fd < nfds; fd++) {
             ml_at_sock_t *s = fd_to_sock(fd);
             if (!s) continue;
+            int idx = fd - AT_SOCK_FD_BASE;
 
-            if (readfds && FD_ISSET(fd, readfds) && ring_used(s) == 0) {
-                int pending = at_query_pending(s->link_num);
+            if (readfds && FD_ISSET(fd, readfds) && !sock_rx_ready(s)) {
+                int pending = at_query_pending(idx);
                 if (pending > 0) {
-                    at_read_data(s->link_num, pending, NULL);
+                    at_read_data(idx, pending, NULL);
                 }
 
-                if (ring_used(s) > 0) {
+                if (sock_rx_ready(s)) {
                     FD_SET(fd, &rd_result);
                     ready_count++;
                 }
             }
         }
-        xSemaphoreGive(s_at.at_mutex);
+        AT_UNLOCK();
 
         if (ready_count > 0) break;
 
@@ -1294,18 +1497,27 @@ int ml_at_getaddrinfo(const char *hostname, const char *service,
         return 0;
     }
 
+    /* The name goes inside a quoted AT argument: anything but an RFC 1123
+     * host name (e.g. a '"' or CR/LF from a web-configured control host or
+     * a DERP map entry) could run arbitrary AT commands. */
+    if (!ml_at_valid_hostname(hostname)) {
+        ESP_LOGW(TAG, "DNS: refusing invalid host name (%u bytes)",
+                 (unsigned)strnlen(hostname, 1024));
+        return EAI_NONAME;
+    }
+
     /* Resolve via AT+CDNSGIP — this is an ASYNC command.
      * The modem replies "OK" immediately, then sends "+CDNSGIP: 1,..." as a URC.
      * We use at_cmd_wait_urc() to keep reading until we see the result. */
-    char cmd[256];
+    char cmd[ML_AT_HOSTNAME_MAX + 16];
     snprintf(cmd, sizeof(cmd), "AT+CDNSGIP=\"%s\"", hostname);
 
     ESP_LOGI(TAG, "DNS: resolving %s", hostname);
 
     char resp[512];
-    xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
+    AT_LOCK();
     at_cmd_wait_urc(cmd, "+CDNSGIP:", resp, sizeof(resp), DNS_TIMEOUT_MS);
-    xSemaphoreGive(s_at.at_mutex);
+    AT_UNLOCK();
 
     /* Parse +CDNSGIP: 1,"hostname","IP1"[,"IP2"[,"IP3"]]
      * Also handle error: +CDNSGIP: 0,8 (DNS error code)

@@ -17,6 +17,7 @@
 #include "ml_cellular.h"
 #include "ml_at_socket.h"
 #include "ml_config_httpd.h"
+#include "ml_at_validate.h"
 #include "microlink.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -595,6 +596,25 @@ esp_err_t ml_net_switch_init(const ml_net_switch_config_t *config)
 {
     if (s_ctx.initialized) return ESP_ERR_INVALID_STATE;
     if (!config || !config->tailscale_auth_key) return ESP_ERR_INVALID_ARG;
+
+    /* Cellular values are only used when WiFi fails; check them now so a
+     * bad value (they go into modem AT commands) fails loudly at startup
+     * instead of silently breaking failover later. */
+    if (config->apn && !ml_at_param_valid(ML_AT_PARAM_APN, config->apn, sizeof(s_ctx.apn) - 1)) {
+        ESP_LOGE(TAG, "Invalid APN: letters, digits, '-' and '.' only (max %u)",
+                 (unsigned)(sizeof(s_ctx.apn) - 1));
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (config->sim_pin && config->sim_pin[0] && !ml_at_valid_pin(config->sim_pin)) {
+        ESP_LOGE(TAG, "Invalid SIM PIN: must be 4-8 digits");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!ml_at_valid_credential(CONFIG_ML_CELLULAR_PPP_USER) ||
+        !ml_at_valid_credential(CONFIG_ML_CELLULAR_PPP_PASS)) {
+        ESP_LOGE(TAG, "Invalid CONFIG_ML_CELLULAR_PPP_USER/PASS: printable ASCII "
+                 "without '\"' or '\\', max %d", ML_AT_CRED_MAX);
+        return ESP_ERR_INVALID_ARG;
+    }
 
     memset(&s_ctx, 0, sizeof(s_ctx));
 
