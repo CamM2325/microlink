@@ -180,6 +180,17 @@ menu "MicroLink V2 Configuration"
                 Waveshare SIM7600X: GPIO43 (XIAO D6).
                 LILYGO T-SIM7670G-S3: GPIO11.
 
+        config ML_CELLULAR_FAST_BAUD
+            int "Switch modem UART to this baud after init (0 = keep initial baud)"
+            depends on ML_ENABLE_CELLULAR && !ML_BOARD_LILYGO_T_SIM7670G
+            default 0
+            help
+                After the modem answers at the initial baud rate, switch both
+                sides to this rate with AT+IPR (e.g. 460800 or 921600) for
+                faster PPP. Only reliable with short wiring and/or hardware
+                flow control; on failure the driver reverts. The modem stores
+                AT+IPR, and the driver normalises it back on the next boot.
+
         config ML_CELLULAR_RX_PIN
             int "Cellular UART RX GPIO pin"
             depends on ML_ENABLE_CELLULAR

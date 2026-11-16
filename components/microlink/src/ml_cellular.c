@@ -248,9 +248,30 @@ static esp_err_t modem_wait_ready(void)
                 vTaskDelay(pdMS_TO_TICKS(1100));
                 uart_flush_input(UART_NUM);
                 if (at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) {
+                    ESP_LOGI(TAG, "Modem responding at %d baud", try_bauds[b]);
+                    /* AT+IPR persists in the modem, so a modem left at another
+                     * speed (e.g. by an earlier fast-baud attempt) stays there
+                     * forever. Bring it back to the configured rate. */
+                    int want = s_cell.config.baud_rate;
+                    char ipr[32];
+                    snprintf(ipr, sizeof(ipr), "AT+IPR=%d", want);
+                    if (at_cmd_ok(ipr, AT_SHORT_TIMEOUT_MS)) {
+                        /* The modem acknowledged: it IS at `want` now. Give the
+                         * UART time to settle and retry the check a few times
+                         * rather than flipping back (which strands it). */
+                        vTaskDelay(pdMS_TO_TICKS(300));
+                        uart_set_baudrate(UART_NUM, want);
+                        for (int v = 0; v < 4; v++) {
+                            vTaskDelay(pdMS_TO_TICKS(300));
+                            uart_flush_input(UART_NUM);
+                            if (at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) break;
+                        }
+                        ESP_LOGI(TAG, "Modem baud restored to %d", want);
+                        s_cell.state = ML_CELL_STATE_AT_OK;
+                        return ESP_OK;
+                    }
                     s_cell.config.baud_rate = try_bauds[b];
                     s_cell.state = ML_CELL_STATE_AT_OK;
-                    ESP_LOGI(TAG, "Modem responding at %d baud", try_bauds[b]);
                     return ESP_OK;
                 }
             }
@@ -862,13 +883,15 @@ esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
      * Start at 115200 for reliable initial handshake, then switch to a higher
      * rate. SIM7670G lacks hardware flow control on most boards and has smaller
      * UART buffers — cap at 115200 to avoid data loss. SIM7600 handles 921600. */
-#ifdef CONFIG_ML_BOARD_LILYGO_T_SIM7670G
-    int fast_baud = 0;  /* Stay at 115200 — SIM7670G unreliable above this without flow control */
-    ESP_LOGI(TAG, "SIM7670G: keeping baud at 115200 (no HW flow control)");
+#if defined(CONFIG_ML_BOARD_LILYGO_T_SIM7670G) || !defined(CONFIG_ML_CELLULAR_FAST_BAUD)
+    int fast_baud = 0;  /* SIM7670G unreliable above 115200 without flow control */
 #else
-    int fast_baud = 921600;
+    /* Opt-in: without hardware flow control and short wiring, 921600 often
+     * fails (seen on SIM7600G-H with jumper wires and on A7670E). */
+    int fast_baud = CONFIG_ML_CELLULAR_FAST_BAUD;
 #endif
-    if (fast_baud && s_cell.config.baud_rate == 115200) {
+    const int base_baud = s_cell.config.baud_rate;
+    if (fast_baud && fast_baud != base_baud) {
         char ipr_cmd[32];
         snprintf(ipr_cmd, sizeof(ipr_cmd), "AT+IPR=%d", fast_baud);
         if (at_cmd_ok(ipr_cmd, AT_SHORT_TIMEOUT_MS)) {
@@ -881,12 +904,24 @@ esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
                 s_cell.config.baud_rate = fast_baud;
                 ESP_LOGI(TAG, "UART baud rate upgraded: 115200 -> %d", fast_baud);
             } else {
-                /* Fall back to 115200 */
-                ESP_LOGW(TAG, "Fast baud failed, reverting to 115200");
-                uart_set_baudrate(UART_NUM, 115200);
-                vTaskDelay(pdMS_TO_TICKS(100));
-                /* Reset modem baud rate */
-                at_cmd_ok("AT+IPR=115200", AT_SHORT_TIMEOUT_MS);
+                /* The modem is now at fast_baud (and AT+IPR persists), so the
+                 * revert must be sent at fast_baud: replies may be garbled but
+                 * the command usually gets through. Then return to base_baud. */
+                ESP_LOGW(TAG, "Fast baud %d failed, reverting to %d", fast_baud, base_baud);
+                char revert[32];
+                int rlen = snprintf(revert, sizeof(revert), "AT+IPR=%d\r", base_baud);
+                for (int r = 0; r < 3; r++) {
+                    uart_write_bytes(UART_NUM, revert, rlen);
+                    vTaskDelay(pdMS_TO_TICKS(150));
+                }
+                uart_set_baudrate(UART_NUM, base_baud);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                uart_flush_input(UART_NUM);
+                if (!at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) {
+                    ESP_LOGE(TAG, "Modem not responding after baud revert; it will be "
+                                  "re-detected (and normalised) on the next init");
+                    return ESP_ERR_TIMEOUT;
+                }
             }
         }
     }
