@@ -131,6 +131,19 @@ menu "MicroLink V2 Configuration"
             Match this to ML_H2_BUFFER_SIZE_KB unless you have a reason
             to set them differently.
 
+    config ML_UDP_RX_TASK_PRIO
+        int "UDP socket receive task priority"
+        default 7
+        range 1 22
+        help
+            FreeRTOS priority of the per-socket task that runs the callback
+            registered with microlink_udp_set_rx_callback().
+
+            The default (7) matches MicroLink's WireGuard manager and network
+            I/O tasks. If your receive callback does heavy or blocking work,
+            set this below 5 so it cannot delay the control-plane and DERP
+            tasks.
+
     menu "Cellular Modem"
 
         config ML_ENABLE_CELLULAR

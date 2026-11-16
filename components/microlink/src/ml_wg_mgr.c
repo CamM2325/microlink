@@ -930,9 +930,64 @@ static void process_peer_updates(microlink_t *ml) {
         case ML_PEER_SYNC_DONE:
             sweep_stale_peers(ml, update->netmap_gen);
             break;
+        case ML_PEER_REQ_HANDSHAKE:
+            ml_wg_mgr_trigger_handshake(ml, update->vpn_ip);
+            ml_wg_mgr_send_cmm(ml, update->vpn_ip);
+            break;
+        case ML_PEER_REQ_CMM_ALL:
+            /* (Re)start from the first slot; cmm_sweep_step() paces it. */
+            ml->cmm_sweep_active = true;
+            ml->cmm_sweep_next = 0;
+            break;
         }
         free(update);
     }
+}
+
+/* Paced CallMeMaybe sweep for ML_PEER_REQ_CMM_ALL: one peer per 50 ms so a
+ * large tailnet does not overflow the 16-deep DERP TX queue (each CMM is a
+ * non-blocking enqueue). This used to run inline in microlink_udp_create()
+ * on the application task, reading peers[] without owning it and blocking
+ * the caller for 50 ms per peer. */
+#define ML_CMM_SWEEP_INTERVAL_MS 50
+
+static void cmm_sweep_step(microlink_t *ml) {
+    if (!ml->cmm_sweep_active) return;
+    if (ml_at_socket_is_ready()) {  /* cellular: CMM useless (see ml_wg_mgr_send_cmm) */
+        ml->cmm_sweep_active = false;
+        return;
+    }
+    uint64_t now = ml_get_time_ms();
+    if (now - ml->cmm_sweep_last_ms < ML_CMM_SWEEP_INTERVAL_MS) return;
+
+    while (ml->cmm_sweep_next < ml->peer_count &&
+           !ml->peers[ml->cmm_sweep_next].active) {
+        ml->cmm_sweep_next++;
+    }
+    if (ml->cmm_sweep_next >= ml->peer_count) {
+        ml->cmm_sweep_active = false;
+        return;
+    }
+    disco_send_call_me_maybe(ml, ml->cmm_sweep_next++);
+    ml->cmm_sweep_last_ms = now;
+}
+
+esp_err_t ml_wg_mgr_post_request(microlink_t *ml, int action, uint32_t vpn_ip) {
+    if (!ml || !ml->peer_update_queue) return ESP_ERR_INVALID_STATE;
+    if (action != ML_PEER_REQ_HANDSHAKE && action != ML_PEER_REQ_CMM_ALL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ml_peer_update_t *req = ml_psram_calloc(1, sizeof(ml_peer_update_t));
+    if (!req) return ESP_ERR_NO_MEM;
+    req->action = action;
+    req->vpn_ip = vpn_ip;
+    /* Never block the caller: a full queue means wg_mgr is already busy
+     * applying a large MapResponse, and the request is only a nudge. */
+    if (xQueueSend(ml->peer_update_queue, &req, 0) != pdTRUE) {
+        free(req);
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
 }
 
 /* ============================================================================
@@ -1948,8 +2003,9 @@ void ml_wg_mgr_task(void *arg) {
     bool stun_cmm_sent = false;  /* One-shot: send CMMs after first STUN result */
 
     while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
-        /* Process peer updates from coord task */
+        /* Process peer updates from coord task (and app-side requests) */
         process_peer_updates(ml);
+        cmm_sweep_step(ml);
 
         /* Track DERP connection state for DISCO.
          * Note: We DON'T re-initiate WG handshakes on DERP connect because

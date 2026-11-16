@@ -262,12 +262,21 @@ uint32_t microlink_resolve(const microlink_t *ml, const char *hostname);
  *
  * Provides simple UDP send/receive over the Tailscale VPN tunnel.
  * Packets are routed through WireGuard for encryption.
+ *
+ * Thread safety: send, recv and set_rx_callback may be called from any task,
+ * including concurrently on the same socket and from the receive callback.
+ * close may be called from any task or from the receive callback, but must
+ * not race other calls on the same socket (the handle is invalid once close
+ * has been entered).
  * ========================================================================== */
 
 /* Opaque UDP socket handle */
 typedef struct microlink_udp_socket microlink_udp_socket_t;
 
-/* UDP receive callback (called from RX task context) */
+/* UDP receive callback. Runs on the socket's own RX task (priority
+ * CONFIG_ML_UDP_RX_TASK_PRIO, 4 KB stack); avoid long blocking work, since at
+ * most 4 packets are buffered while it runs. data is only valid during the
+ * call. */
 typedef void (*microlink_udp_rx_cb_t)(microlink_udp_socket_t *sock,
                                        uint32_t src_ip, uint16_t src_port,
                                        const uint8_t *data, size_t len,
@@ -279,12 +288,18 @@ typedef void (*microlink_udp_rx_cb_t)(microlink_udp_socket_t *sock,
  * @param local_port Port to bind (0 = auto-assign)
  * @return Socket handle, NULL on failure
  *
- * On creation, sends CallMeMaybe to all peers to trigger WG handshakes.
+ * On creation, queues a CallMeMaybe to every peer (sent by the WireGuard
+ * manager task, paced at one per 50 ms) to trigger WG handshakes.
  */
 microlink_udp_socket_t *microlink_udp_create(microlink_t *ml, uint16_t local_port);
 
 /**
  * @brief Close UDP socket and free resources
+ *
+ * Stops reception, then waits (up to 5 s) for an in-flight receive callback
+ * to return. After close returns the callback is not called again. If the
+ * callback is still running at the timeout, or close is called from the
+ * callback itself, the socket memory is released when the callback returns.
  */
 void microlink_udp_close(microlink_udp_socket_t *sock);
 
@@ -319,6 +334,9 @@ esp_err_t microlink_udp_recv(microlink_udp_socket_t *sock, uint32_t *src_ip,
  * @param sock Socket handle
  * @param cb Callback (NULL to clear)
  * @param user_data Passed to callback
+ *
+ * When called from another task, returns only after any in-flight call of the
+ * previous callback has finished, so its user_data can then be released.
  */
 esp_err_t microlink_udp_set_rx_callback(microlink_udp_socket_t *sock,
                                          microlink_udp_rx_cb_t cb, void *user_data);

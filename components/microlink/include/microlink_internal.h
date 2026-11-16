@@ -77,8 +77,10 @@ extern "C" {
 // reliably, matching the ML_TASK_WG_MGR tier rather than colliding with
 // a reserved system-level slot that can starve everything below it
 // (ml_coord's control-plane connection included) for as long as the
-// receive callback runs.
-#define ML_TASK_UDP_RX_PRIO     ML_TASK_WG_MGR_PRIO
+// receive callback runs. Kconfig ML_UDP_RX_TASK_PRIO (default 7, the
+// ML_TASK_WG_MGR tier) lets an application with a heavy receive callback
+// drop it below MicroLink's own tasks.
+#define ML_TASK_UDP_RX_PRIO     CONFIG_ML_UDP_RX_TASK_PRIO
 
 /* Queue depths */
 #define ML_DERP_TX_QUEUE_DEPTH  16
@@ -248,13 +250,17 @@ typedef enum {
     ML_CMD_FORCE_RECONNECT,     /* Force reconnection (after DERP failure, etc.) */
 } ml_coord_cmd_t;
 
-/* Peer update (from coord to wg_mgr) */
+/* Peer update (from coord to wg_mgr), or a request from an application-facing
+ * API (ml_udp.c) that needs the peer table: posting it here runs it on the
+ * wg_mgr task, which owns peers[], instead of on the caller's task. */
 typedef struct {
     enum {
         ML_PEER_ADD,
         ML_PEER_REMOVE,
         ML_PEER_UPDATE_ENDPOINT,
         ML_PEER_SYNC_DONE,      /* end of a full peer list: drop peers not in it */
+        ML_PEER_REQ_HANDSHAKE,  /* trigger WG handshake + CallMeMaybe to vpn_ip */
+        ML_PEER_REQ_CMM_ALL,    /* paced CallMeMaybe to every active peer */
     } action;
     int64_t node_id;            /* tailcfg NodeID (0 = unknown) */
     uint32_t netmap_gen;        /* full-netmap generation (0 = delta update) */
@@ -463,6 +469,11 @@ struct microlink_s {
     ml_peer_t peers[ML_MAX_PEERS];
     int peer_count;
 
+    /* Paced CallMeMaybe sweep requested via ML_PEER_REQ_CMM_ALL (wg_mgr only) */
+    bool cmm_sweep_active;
+    int cmm_sweep_next;
+    uint64_t cmm_sweep_last_ms;
+
     /* STUN results (written by coord, read by coord only) */
     uint32_t stun_public_ip;
     uint16_t stun_public_port;
@@ -558,6 +569,9 @@ void ml_wg_mgr_task(void *arg);
 void ml_wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip);
 esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip);
 bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip);
+/* Queue ML_PEER_REQ_HANDSHAKE / ML_PEER_REQ_CMM_ALL for the wg_mgr task.
+ * Non-blocking and safe from any task. */
+esp_err_t ml_wg_mgr_post_request(microlink_t *ml, int action, uint32_t vpn_ip);
 void ml_wg_mgr_update_transport(microlink_t *ml);
 
 /* ml_stun.c */
