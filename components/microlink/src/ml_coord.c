@@ -830,7 +830,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
         cJSON_AddStringToObject(root, "NodeKeyChallengeResponse", chalresp_str);
         ESP_LOGI(TAG, "Added NodeKeyChallengeResponse");
     } else {
-        ESP_LOGW(TAG, "No nodeKeyChallenge received - registration may fail!");
+        ESP_LOGI(TAG, "No nodeKeyChallenge from server (normal for Ionscale)");
     }
 
     char *json_str = cJSON_PrintUnformatted(root);

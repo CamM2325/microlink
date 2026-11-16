@@ -29,8 +29,17 @@ before you rely on it.
 
 ## Status and limitations
 
-**Tested by the maintainer:** ESP32-S3 (8 MB PSRAM) on WiFi with Tailscale's hosted control plane;
-Seeed XIAO ESP32S3 + Waveshare SIM7600G-H over PPP and the AT bridge.
+**Tested by the maintainer (Nov 2026, ESP32-S3 + 8 MB PSRAM, ESP-IDF 5.3):** registration, direct
+WireGuard path, ICMP and UDP echo with a real Tailscale client against
+
+| Control server | Transport | Result |
+|---|---|---|
+| Tailscale (hosted) | WiFi | direct path, 0% loss |
+| Tailscale (hosted) | 4G PPP, SIM7600G-H + Soracom | direct path through carrier NAT, ~390 ms RTT, 0% loss |
+| Headscale v0.29.7 (plain HTTP, Tailscale DERP map) | WiFi | direct path, 0% loss |
+| Ionscale 0.18.0 (plain HTTP, Tailscale DERP map) | WiFi | direct path, 0% loss |
+
+Also tested: repeated stop/start (no memory growth), reconnect after reboot.
 
 **Tested by contributors:** ESP32-C3 without PSRAM (small tailnet, see PR #43); a Headscale-based
 control plane over TLS (PR #22).
@@ -236,16 +245,16 @@ or flow control). If the modem was left at another rate, the driver detects it a
 For cellular-only apps, call `ml_cellular_init()` and `ml_cellular_connect()` before `microlink_init()`
 (see `examples/cellular_connect`).
 
-| Measured (SIM7600G-H, EIOT SIM, ~20-peer tailnet, 115200 baud, March 2026) | PPP | AT bridge |
+| Measured (SIM7600G-H, 115200 baud, ~16–20-peer tailnet) | PPP | AT bridge |
 |---|---|---|
-| UDP round trip | 300–600 ms (direct) | 3–15 s (DERP) |
-| Boot → connected | ~35–50 s | ~60–90 s |
-| Throughput | ~6.5 KB/s | ~0.45 KB/s |
+| UDP / ICMP round trip | 350–430 ms direct (Soracom, Nov 2026); 300–600 ms (EIOT, Mar 2026) | 3–15 s via DERP (Mar 2026) |
+| Boot → connected | 38 s (Soracom, Nov 2026); ~35–50 s (EIOT, Mar 2026) | ~60–90 s (Mar 2026) |
+| Throughput | ~6.5 KB/s (Mar 2026) | ~0.45 KB/s (Mar 2026) |
 
 | Carrier | APN | Auth | Status |
 |---|---|---|---|
 | EIOT / BICS | `america.bics` | PAP, empty credentials | Tested |
-| Soracom | `soracom.io` | CHAP `sora`/`sora` | Tested |
+| Soracom | `soracom.io` | CHAP `sora`/`sora` | Tested (Nov 2026, T-Mobile) |
 
 PPP uses CHAP when credentials are set, otherwise PAP with empty credentials.
 
@@ -257,10 +266,11 @@ backup, rebinding the VPN session when the network changes and falling back to a
 needed. If both fail, it keeps retrying with backoff. Don't cache the handle from
 `ml_net_switch_get_handle()`; it changes when the VPN is restarted.
 
-## Custom control servers (experimental)
+## Custom control servers (Headscale, Ionscale)
 
-MicroLink talks to `controlplane.tailscale.com` by default. For Headscale-style servers you need
-**both** the host and the server's Noise public key; the key is not fetched automatically.
+MicroLink talks to `controlplane.tailscale.com` by default. Headscale and Ionscale are tested (see
+[Status](#status-and-limitations)). You need **both** the host and the server's Noise public key;
+the key is not fetched automatically. The control connection uses port 80 (or 443 with TLS).
 
 ```
 CONFIG_ML_CTRL_HOST="headscale.example.com"
@@ -269,7 +279,10 @@ CONFIG_ML_CTRL_TLS=y          # if the server only listens on HTTPS (443)
 ```
 
 (or set `ctrl_host` / `ctrl_noise_pubkey` in `microlink_config_t`; the config UI can set only the host).
-Set `streaming_map_fetch = true` for controllers that ignore `Stream=false`. If your DERP or HTTPS
+Headscale doesn't answer the initial `Stream=false` map request; MicroLink detects this and switches
+to a streaming fetch automatically (or set `CONFIG_ML_CTRL_STREAMING_MAP_FETCH` /
+`streaming_map_fetch = true` to start that way). Erase NVS (`idf.py erase-flash`, or
+`parttool.py erase_partition --partition-name=nvs`) when moving a board between control servers. If your DERP or HTTPS
 endpoint uses a private CA, add it to the certificate bundle (`CONFIG_MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE`)
 or turn off `ML_DERP_VERIFY_CERT` / `ML_CTRL_TLS_VERIFY_CERT`.
 
