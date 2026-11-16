@@ -211,6 +211,27 @@ menu "MicroLink V2 Configuration"
                 Leave empty for SIMs that use IMSI-based auth (no credentials).
                 Soracom SIMs use "sora".
 
+        choice ML_CELLULAR_DATA_MODE
+            prompt "Cellular data mode"
+            depends on ML_ENABLE_CELLULAR
+            default ML_CELLULAR_DATA_AUTO
+            help
+                Select how the modem provides data connectivity.
+
+                Auto: Try PPP first, fall back to AT socket bridge if PPP fails.
+                PPP only: Use PPP exclusively. Fails if PPP auth is rejected.
+                AT socket only: Skip PPP, use AT socket bridge. The UART stays
+                in AT command mode so you can send AT commands (e.g. GPS queries)
+                alongside the data connection.
+
+            config ML_CELLULAR_DATA_AUTO
+                bool "Auto (PPP primary, AT socket fallback)"
+            config ML_CELLULAR_DATA_PPP_ONLY
+                bool "PPP only"
+            config ML_CELLULAR_DATA_AT_ONLY
+                bool "AT socket only"
+        endchoice
+
     endmenu
 
     menu "Network Switching"

@@ -1124,9 +1124,39 @@ esp_err_t ml_cellular_connect(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* --- Try PPP first --- */
+    esp_err_t ret;
+
+#ifdef CONFIG_ML_CELLULAR_DATA_AT_ONLY
+    /* AT socket only — skip PPP, keep UART in AT command mode */
+    ESP_LOGI(TAG, "=== Starting AT socket bridge (AT-only mode) ===");
+    ret = ml_cellular_data_start();
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "AT socket bridge connected — UART remains in AT command mode");
+        s_cell.data_mode = ML_DATA_MODE_AT_SOCKET;
+        return ESP_OK;
+    }
+    ESP_LOGE(TAG, "AT socket bridge failed");
+    s_cell.data_mode = ML_DATA_MODE_NONE;
+    return ret;
+
+#elif defined(CONFIG_ML_CELLULAR_DATA_PPP_ONLY)
+    /* PPP only — no AT socket fallback */
+    ESP_LOGI(TAG, "=== Attempting PPP data connection (PPP-only mode) ===");
+    ret = ml_cellular_ppp_start();
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "PPP connected — using lwIP standard sockets");
+        s_cell.data_mode = ML_DATA_MODE_PPP;
+        return ESP_OK;
+    }
+    ESP_LOGE(TAG, "PPP failed: %s", esp_err_to_name(ret));
+    ml_cellular_ppp_stop();
+    s_cell.data_mode = ML_DATA_MODE_NONE;
+    return ret;
+
+#else
+    /* Auto: try PPP first, fall back to AT socket bridge */
     ESP_LOGI(TAG, "=== Attempting PPP data connection ===");
-    esp_err_t ret = ml_cellular_ppp_start();
+    ret = ml_cellular_ppp_start();
 
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "PPP connected — using lwIP standard sockets");
@@ -1155,6 +1185,7 @@ esp_err_t ml_cellular_connect(void)
     ESP_LOGE(TAG, "Both PPP and AT socket bridge failed");
     s_cell.data_mode = ML_DATA_MODE_NONE;
     return ret;
+#endif
 }
 
 ml_cellular_data_mode_t ml_cellular_get_data_mode(void)
