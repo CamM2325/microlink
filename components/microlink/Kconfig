@@ -144,6 +144,19 @@ menu "MicroLink V2 Configuration"
             set this below 5 so it cannot delay the control-plane and DERP
             tasks.
 
+    config ML_STOP_TIMEOUT_MS
+        int "Max time microlink_stop() waits for the internal tasks (ms)"
+        default 30000
+        range 3000 300000
+        help
+            microlink_stop() asks the internal tasks to exit, shuts down the
+            control-plane and DERP sockets so blocking reads return, and then
+            waits up to this long for every task to exit. A DNS lookup or a
+            TCP connect cannot be interrupted and may take longer; in that
+            case microlink_stop() returns ESP_ERR_TIMEOUT without freeing
+            anything and can be called again, and microlink_destroy() defers
+            the free until the task has exited.
+
     menu "Cellular Modem"
 
         config ML_ENABLE_CELLULAR

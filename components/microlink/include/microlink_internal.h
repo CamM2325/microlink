@@ -230,6 +230,27 @@ typedef struct {
 #define ML_EVT_DERP_CONNECT_REQ     BIT8
 
 /* ============================================================================
+ * Worker Task Liveness
+ *
+ * One bit per task created by microlink_start(). The bit is set before the
+ * task is created and cleared by the task itself, as its very last access to
+ * the context, via ml_task_exit(). microlink_stop() waits for the mask to
+ * reach zero; a zero mask is the proof that nothing can touch ml, its queues
+ * or its event group again, and is what microlink_destroy() gates the free on.
+ *
+ * Kept in a plain atomic word rather than in ml->events: clearing a bit in an
+ * event group runs inside that event group's lock, so the stopping task could
+ * delete the group while the exiting task is still releasing it.
+ * ========================================================================== */
+
+#define ML_TASK_BIT_NET_IO          (1u << 0)
+#define ML_TASK_BIT_DERP_TX         (1u << 1)
+#define ML_TASK_BIT_COORD           (1u << 2)
+#define ML_TASK_BIT_WG_MGR          (1u << 3)
+#define ML_TASK_BIT_ALL             (ML_TASK_BIT_NET_IO | ML_TASK_BIT_DERP_TX | \
+                                     ML_TASK_BIT_COORD  | ML_TASK_BIT_WG_MGR)
+
+/* ============================================================================
  * Queue Message Types
  * ========================================================================== */
 
@@ -442,6 +463,15 @@ struct microlink_s {
     TaskHandle_t coord_task;
     TaskHandle_t wg_mgr_task;
 
+    /* ML_TASK_BIT_* mask of worker tasks still running. Set by
+     * microlink_start() before each create, cleared by the task in
+     * ml_task_exit(). Only accessed with __atomic builtins. */
+    uint32_t tasks_alive;
+
+    /* True from microlink_start() until microlink_stop() has joined every
+     * task and released the per-run resources. */
+    bool started;
+
     /* Queues */
     QueueHandle_t derp_tx_queue;        /* -> derp_tx task */
     QueueHandle_t disco_rx_queue;       /* net_io -> wg_mgr */
@@ -563,6 +593,21 @@ struct microlink_s {
 /* ============================================================================
  * Internal Function Declarations (per-module)
  * ========================================================================== */
+
+/* microlink.c - worker task lifecycle */
+
+/** ML_TASK_BIT_* mask of worker tasks still running (0 = all exited). */
+uint32_t ml_tasks_alive(const microlink_t *ml);
+
+/** True once microlink_stop() has requested shutdown. Long-running loops and
+ *  retry/backoff paths check this so stop does not have to wait out a full
+ *  network timeout. */
+bool ml_shutdown_requested(const microlink_t *ml);
+
+/** Terminate the calling worker task: clears its task handle and liveness bit,
+ *  then deletes the task. Never returns. The context must not be touched after
+ *  this call; clearing the bit is what allows microlink_destroy() to free it. */
+void ml_task_exit(microlink_t *ml, uint32_t task_bit) __attribute__((noreturn));
 
 /* ml_net_io.c */
 void ml_net_io_task(void *arg);

@@ -382,7 +382,14 @@ The `ml_net_switch` module calls `microlink_rebind()` automatically during WiFiâ
 ### Cleanup
 
 ```c
+// Close microlink_udp/microlink_tcp sockets first.
+// Stops the internal tasks and waits for them to exit (their blocking socket
+// reads are interrupted). Returns ESP_ERR_TIMEOUT if one is still stuck in a
+// DNS lookup or TCP connect after CONFIG_ML_STOP_TIMEOUT_MS; call it again to
+// keep waiting. After ESP_OK the same handle can be restarted with
+// microlink_start().
 microlink_stop(ml);
+// Frees the instance (deferred automatically if a task is still running).
 microlink_destroy(ml);
 ```
 

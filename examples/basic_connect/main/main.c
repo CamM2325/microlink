@@ -22,6 +22,8 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 
 #include "microlink.h"
 #include "microlink_internal.h"  /* For task handle access (diagnostic) */
@@ -210,6 +212,113 @@ static void wifi_init(void) {
 }
 
 /* ============================================================================
+ * Stop/start lifecycle test (CONFIG_ML_EXAMPLE_LIFECYCLE_CYCLES > 0)
+ * ========================================================================== */
+
+#if CONFIG_ML_EXAMPLE_LIFECYCLE_CYCLES > 0
+static bool wait_connected(int timeout_s) {
+    for (int i = 0; i < timeout_s * 2; i++) {
+        if (microlink_is_connected(ml)) return true;
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    return false;
+}
+
+static void log_heap(const char *what, int cycle, int total) {
+    ESP_LOGI(TAG, "LIFECYCLE %d/%d: %s heap internal=%u psram=%u min_internal=%u",
+             cycle, total, what,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+}
+
+/* Returns true if every cycle stopped cleanly and reconnected. The handle in
+ * `ml` is replaced on destroy/init cycles; callbacks are re-registered. */
+static bool lifecycle_test(const microlink_config_t *config) {
+    const int total = CONFIG_ML_EXAMPLE_LIFECYCLE_CYCLES;
+    int failures = 0;
+    size_t base_int = 0, base_ps = 0;
+
+    ESP_LOGI(TAG, "LIFECYCLE: starting %d stop/start cycles", total);
+
+    for (int c = 1; c <= total; c++) {
+        int variant = (c - 1) % 3;   /* 0 = connected, 1 = mid-connect, 2 = destroy */
+
+        if (variant == 1) {
+            /* Stop while coord is still registering / reading the netmap */
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            ESP_LOGI(TAG, "LIFECYCLE %d/%d: stopping mid-connect (state=%d)",
+                     c, total, microlink_get_state(ml));
+        } else if (!wait_connected(120)) {
+            ESP_LOGE(TAG, "LIFECYCLE %d/%d: FAIL not connected within 120 s", c, total);
+            failures++;
+        } else {
+            ESP_LOGI(TAG, "LIFECYCLE %d/%d: connected, %d peers",
+                     c, total, microlink_get_peer_count(ml));
+        }
+
+        int64_t t0 = esp_timer_get_time();
+        esp_err_t err = microlink_stop(ml);
+        int stop_ms = (int)((esp_timer_get_time() - t0) / 1000);
+        ESP_LOGI(TAG, "LIFECYCLE %d/%d: stop -> %s in %d ms",
+                 c, total, esp_err_to_name(err), stop_ms);
+        if (err != ESP_OK) failures++;
+
+        if (variant == 2) {
+            microlink_destroy(ml);
+            ml = microlink_init(config);
+            if (!ml) {
+                ESP_LOGE(TAG, "LIFECYCLE %d/%d: FAIL microlink_init", c, total);
+                return false;
+            }
+            microlink_set_state_callback(ml, on_state_change, NULL);
+            microlink_set_peer_callback(ml, on_peer_update, NULL);
+            ESP_LOGI(TAG, "LIFECYCLE %d/%d: destroyed and re-initialized", c, total);
+        }
+
+        /* Let the idle task reclaim the exited tasks' stacks first */
+        vTaskDelay(pdMS_TO_TICKS(200));
+        log_heap("stopped", c, total);
+        if (c == 1) {
+            base_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            base_ps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        }
+
+        err = microlink_start(ml);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "LIFECYCLE %d/%d: FAIL start -> %s", c, total, esp_err_to_name(err));
+            return false;
+        }
+    }
+
+    if (!wait_connected(120)) {
+        ESP_LOGE(TAG, "LIFECYCLE: FAIL not connected after the last cycle");
+        failures++;
+    }
+
+    /* Compare the free heap in the stopped state: the first cycle against the
+     * last one. Before the lifecycle fixes each cycle lost ~15 KB (WG device)
+     * plus whatever was queued. */
+    microlink_stop(ml);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    long d_int = (long)base_int - (long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    long d_ps = (long)base_ps - (long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    ESP_LOGI(TAG, "LIFECYCLE: heap lost since cycle 1: internal=%ld psram=%ld bytes (%d cycles)",
+             d_int, d_ps, total);
+    bool leak = total > 1 && (d_int + d_ps) / (total - 1 > 0 ? total - 1 : 1) > 1024;
+    if (leak) {
+        ESP_LOGE(TAG, "LIFECYCLE: more than 1 KB lost per cycle");
+        failures++;
+    }
+    ESP_ERROR_CHECK(microlink_start(ml));
+
+    ESP_LOGI(TAG, "LIFECYCLE RESULT: %s (%d cycles, %d failures)",
+             failures ? "FAIL" : "PASS", total, failures);
+    return failures == 0;
+}
+#endif /* CONFIG_ML_EXAMPLE_LIFECYCLE_CYCLES > 0 */
+
+/* ============================================================================
  * Main
  * ========================================================================== */
 
@@ -285,6 +394,15 @@ void app_main(void) {
     while (!microlink_is_connected(ml)) {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
+
+#if CONFIG_ML_EXAMPLE_LIFECYCLE_CYCLES > 0
+    /* Runs before the UDP socket exists: sockets created with
+     * microlink_udp_create() must be closed before stopping MicroLink. */
+    lifecycle_test(&config);
+    while (!microlink_is_connected(ml)) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+#endif
 
     /* Create UDP socket on port 9000 */
     udp_sock = microlink_udp_create(ml, MSG_PORT);

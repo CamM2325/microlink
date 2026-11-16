@@ -568,6 +568,9 @@ void ml_derp_tx_task(void *arg) {
                     } else {
                         ESP_LOGI(TAG, "DERP connect requested, connecting from I/O task");
                     }
+                    /* Each attempt can cost a DNS timeout plus a 20 s TLS
+                     * handshake; don't start one that stop will discard. */
+                    if (ml_shutdown_requested(ml)) break;
                     if (ml_derp_connect(ml) == ESP_OK) {
                         connected_since_ms = ml_get_time_ms();
                         verbose_phase = true;
@@ -589,6 +592,7 @@ void ml_derp_tx_task(void *arg) {
                         ESP_LOGW(TAG, "DERP reconnect retry %d/3 in 2s...", attempt + 1);
                         vTaskDelay(pdMS_TO_TICKS(2000));
                     }
+                    if (ml_shutdown_requested(ml)) break;
                     if (ml_derp_connect(ml) == ESP_OK) {
                         connected_since_ms = ml_get_time_ms();
                         verbose_phase = true;
@@ -667,8 +671,12 @@ void ml_derp_tx_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
+    /* Release the TLS session, the socket and any packets still queued for
+     * TX. Nobody else may: the connection is owned by this task. */
+    ml_derp_disconnect(ml);
+
     ESP_LOGI(TAG, "DERP I/O task exiting");
-    vTaskDelete(NULL);
+    ml_task_exit(ml, ML_TASK_BIT_DERP_TX);
 }
 
 /* ============================================================================
@@ -870,7 +878,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     const int64_t hs_deadline_us = esp_timer_get_time() + 20LL * 1000 * 1000;
     while ((ret = mbedtls_ssl_handshake(&ml->derp.ssl)) != 0) {
         if ((ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) &&
-            esp_timer_get_time() < hs_deadline_us) {
+            esp_timer_get_time() < hs_deadline_us && !ml_shutdown_requested(ml)) {
             continue;
         }
         char err_buf[128];

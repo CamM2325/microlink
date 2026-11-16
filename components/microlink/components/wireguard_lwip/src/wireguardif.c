@@ -1023,6 +1023,25 @@ void wireguardif_shutdown(struct netif *netif) {
 	sys_untimeout(wireguardif_tmr, device);
 }
 
+void wireguardif_free(struct netif *netif) {
+	if (!netif || !netif->state) {
+		return;
+	}
+	struct wireguard_device *device = (struct wireguard_device *)netif->state;
+	netif->state = NULL;
+
+	// Idempotent with wireguardif_shutdown: untimeout of a timer that is not
+	// armed is a no-op.
+	sys_untimeout(wireguardif_tmr, device);
+	if (device->udp_pcb) {
+		udp_remove(device->udp_pcb);
+		device->udp_pcb = NULL;
+	}
+	// The device holds the private key and every peer's session keys.
+	crypto_zero(device, sizeof(struct wireguard_device));
+	mem_free(device);
+}
+
 err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port) {
 	struct wireguard_peer *peer;
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);

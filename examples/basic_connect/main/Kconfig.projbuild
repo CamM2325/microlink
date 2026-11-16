@@ -8,4 +8,20 @@ menu "Example Configuration"
             Leave empty to only receive (no outgoing messages).
             The peer should run: nc -lu 9000
 
+    config ML_EXAMPLE_LIFECYCLE_CYCLES
+        int "Stop/start lifecycle test cycles (0 = disabled)"
+        default 0
+        range 0 1000
+        help
+            After the first connection, run this many microlink_stop() /
+            microlink_start() cycles before entering the normal loop. The
+            cycles rotate through three variants:
+              - stop after CONNECTED, then start the same handle
+              - stop 3 s after start (mid-registration / MapResponse, so
+                the control-plane task is blocked in a socket read)
+              - stop + microlink_destroy() + microlink_init() + start
+            Each cycle logs "LIFECYCLE n/N" lines with the stop duration and
+            free heap; the run ends with "LIFECYCLE RESULT: PASS" or "FAIL".
+            Leave at 0 for normal use.
+
 endmenu
