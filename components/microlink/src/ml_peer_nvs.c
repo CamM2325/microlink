@@ -64,6 +64,21 @@ static void load_table(void) {
     size_t len = sizeof(peer_nvs_table_t);
     if (nvs_get_blob(s_nvs, PEER_NVS_BLOB_KEY, s_table, &len) != ESP_OK) {
         memset(s_table, 0, sizeof(peer_nvs_table_t));
+        return;
+    }
+    /* Never trust stored lengths: clamp to what was actually read. */
+    size_t max_entries = (len >= sizeof(uint16_t) * 2)
+                         ? (len - sizeof(uint16_t) * 2) / sizeof(peer_nvs_entry_t) : 0;
+    if (s_table->count > max_entries || s_table->count > ML_NVS_MAX_PEERS) {
+        ESP_LOGW(TAG, "Peer cache count %u invalid (blob holds %u), resetting",
+                 (unsigned)s_table->count, (unsigned)max_entries);
+        memset(s_table, 0, sizeof(peer_nvs_table_t));
+        return;
+    }
+    for (int i = 0; i < s_table->count; i++) {
+        if (s_table->entries[i].endpoint_count > 2) {
+            s_table->entries[i].endpoint_count = 2;
+        }
     }
 }
 
@@ -220,6 +235,21 @@ int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers) {
 
     ESP_LOGI(TAG, "Loaded %d cached peers from NVS", loaded);
     return loaded;
+}
+
+/* Drop a peer from the cache (removed/revoked on the control plane), so it
+ * is not re-installed from flash on the next boot. */
+esp_err_t ml_peer_nvs_remove(const uint8_t *public_key) {
+    if (!s_initialized || !s_table) return ESP_ERR_INVALID_STATE;
+    for (int i = 0; i < s_table->count; i++) {
+        if (memcmp(s_table->entries[i].public_key, public_key, 32) == 0) {
+            s_table->entries[i] = s_table->entries[s_table->count - 1];
+            memset(&s_table->entries[s_table->count - 1], 0, sizeof(peer_nvs_entry_t));
+            s_table->count--;
+            return flush_table();
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
 }
 
 esp_err_t ml_peer_nvs_clear(void) {

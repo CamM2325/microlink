@@ -254,7 +254,12 @@ typedef struct {
         ML_PEER_ADD,
         ML_PEER_REMOVE,
         ML_PEER_UPDATE_ENDPOINT,
+        ML_PEER_SYNC_DONE,      /* end of a full peer list: drop peers not in it */
     } action;
+    int64_t node_id;            /* tailcfg NodeID (0 = unknown) */
+    uint32_t netmap_gen;        /* full-netmap generation (0 = delta update) */
+    bool key_valid;             /* public_key present (patches may omit it) */
+    bool disco_valid;           /* disco_key present (patches may omit it) */
     uint32_t vpn_ip;
     uint8_t public_key[32];
     uint8_t disco_key[32];
@@ -277,6 +282,8 @@ typedef struct {
 
 typedef struct {
     /* Identity */
+    int64_t node_id;            /* tailcfg NodeID (0 = not yet known, e.g. NVS cache) */
+    uint32_t netmap_gen;        /* last full-netmap generation that listed this peer */
     uint32_t vpn_ip;
     uint8_t public_key[32];
     uint8_t disco_key[32];
@@ -606,6 +613,7 @@ void ml_peer_nvs_deinit(void);
 esp_err_t ml_peer_nvs_save(const ml_peer_t *peer);
 int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers);
 esp_err_t ml_peer_nvs_clear(void);
+esp_err_t ml_peer_nvs_remove(const uint8_t *public_key);
 
 #ifdef CONFIG_ML_ZERO_COPY_WG
 /* ml_zerocopy.c */

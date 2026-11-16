@@ -507,6 +507,45 @@ static int find_peer_by_disco_key(microlink_t *ml, const uint8_t *disco_key) {
     return -1;
 }
 
+static int find_peer_by_node_id(microlink_t *ml, int64_t node_id) {
+    if (node_id == 0) return -1;
+    for (int i = 0; i < ml->peer_count; i++) {
+        if (ml->peers[i].active && ml->peers[i].node_id == node_id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Merge an endpoint list into a peer, preserving per-endpoint last_ping_ms
+ * for addresses that are still present (Tailscale's endpointState map isn't
+ * wholesale-replaced on a netmap refresh). Returns true if the set changed. */
+static bool merge_endpoints(ml_peer_t *p, const ml_peer_update_t *update) {
+    if (update->endpoint_count <= 0) return false;
+    bool changed = (p->endpoint_count != update->endpoint_count);
+    typeof(p->endpoints) old;
+    int old_count = p->endpoint_count;
+    memcpy(old, p->endpoints, sizeof(old));
+    p->endpoint_count = update->endpoint_count;
+    for (int i = 0; i < update->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
+        uint64_t preserved_last_ping = 0;
+        bool found = false;
+        for (int j = 0; j < old_count && j < ML_MAX_ENDPOINTS; j++) {
+            if (old[j].ip == update->endpoints[i].ip && old[j].port == update->endpoints[i].port) {
+                preserved_last_ping = old[j].last_ping_ms;
+                found = true;
+                break;
+            }
+        }
+        if (!found) changed = true;
+        p->endpoints[i].ip = update->endpoints[i].ip;
+        p->endpoints[i].port = update->endpoints[i].port;
+        p->endpoints[i].is_ipv6 = update->endpoints[i].is_ipv6;
+        p->endpoints[i].last_ping_ms = preserved_last_ping;
+    }
+    return changed;
+}
+
 static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     /* Peer allowlist filter: don't waste WG slots on non-allowed peers.
      * Still process updates for existing peers (they may become allowed later). */
@@ -517,7 +556,41 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     /* Check if peer already exists */
     int idx = find_peer_by_key(ml, update->public_key);
     if (idx >= 0) {
-        ESP_LOGI(TAG, "Updating existing peer %s (idx=%d)", update->hostname, idx);
+        ml_peer_t *e = &ml->peers[idx];
+        if (update->vpn_ip == 0 || e->vpn_ip == update->vpn_ip) {
+            /* Metadata refresh of a known peer: keep its WireGuard session,
+             * validated direct path and per-endpoint ping history. (Re-adding
+             * here used to reset all DISCO state on every PeersChanged.) */
+            bool persist = false;
+            if (update->node_id) e->node_id = update->node_id;
+            if (update->netmap_gen) e->netmap_gen = update->netmap_gen;
+            if (update->disco_valid && memcmp(e->disco_key, update->disco_key, 32) != 0) {
+                memcpy(e->disco_key, update->disco_key, 32);
+                e->has_direct_path = false;     /* new disco key: revalidate path */
+                e->trust_until_ms = 0;
+                persist = true;
+            }
+            if (update->hostname[0] && strcmp(e->hostname, update->hostname) != 0) {
+                strlcpy(e->hostname, update->hostname, sizeof(e->hostname));
+                persist = true;
+            }
+            if (update->derp_region > 0 && e->derp_region != update->derp_region) {
+                e->derp_region = update->derp_region;
+                persist = true;
+            }
+            if (update->online_valid) e->online = update->online;
+            if (merge_endpoints(e, update)) persist = true;
+            if (persist) ml_peer_nvs_save(e);   /* only write flash when something changed */
+            ESP_LOGD(TAG, "Refreshed peer %s (idx=%d)", e->hostname, idx);
+            return idx;
+        }
+        /* VPN IP changed: the WireGuard allowed-IP must follow, so drop the
+         * WG peer and fall through to a full re-add below. */
+        ESP_LOGI(TAG, "Peer %s changed VPN IP, re-installing", update->hostname);
+        if (e->wg_peer_index >= 0 && ml->wg_netif) {
+            wireguardif_remove_peer((struct netif *)ml->wg_netif, (u8_t)e->wg_peer_index);
+        }
+        e->wg_peer_index = -1;
     } else {
         /* Find free slot */
         idx = -1;
@@ -569,6 +642,8 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     }
 
     ml_peer_t *p = &ml->peers[idx];
+    p->node_id = update->node_id;
+    p->netmap_gen = update->netmap_gen;
     p->vpn_ip = update->vpn_ip;
     memcpy(p->public_key, update->public_key, 32);
     memcpy(p->disco_key, update->disco_key, 32);
@@ -728,25 +803,113 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     return idx;
 }
 
-static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
-    int idx = find_peer_by_key(ml, update->public_key);
-    if (idx < 0) return;
+/* Fully forget a peer: WireGuard slot, NVS cache entry, pending probes. */
+static void remove_peer_idx(microlink_t *ml, int idx) {
+    ml_peer_t *p = &ml->peers[idx];
+    if (ml->wg_netif && p->wg_peer_index >= 0) {
+        wireguardif_remove_peer((struct netif *)ml->wg_netif, (u8_t)p->wg_peer_index);
+    }
+    p->wg_peer_index = -1;
+    ml_peer_nvs_remove(p->public_key);
 
-    /* Remove from wireguard-lwip */
-    if (ml->wg_netif && ml->peers[idx].wg_peer_index >= 0) {
-        struct netif *netif = (struct netif *)ml->wg_netif;
-        wireguardif_remove_peer(netif, (u8_t)ml->peers[idx].wg_peer_index);
+    /* Pending probes keep a peer index; don't let a late pong for this peer
+     * update whichever peer reuses the slot. */
+    for (int i = 0; i < MAX_PENDING_PROBES; i++) {
+        if (pending_probes[i].active && pending_probes[i].peer_index == idx) {
+            pending_probes[i].active = false;
+        }
     }
 
     char ip_str[16];
-    microlink_ip_to_str(ml->peers[idx].vpn_ip, ip_str);
-    ESP_LOGI(TAG, "Peer removed: %s (%s)", ml->peers[idx].hostname, ip_str);
+    microlink_ip_to_str(p->vpn_ip, ip_str);
+    ESP_LOGI(TAG, "Peer removed: %s (%s)", p->hostname, ip_str);
 
-    ml->peers[idx].active = false;
+    memset(p, 0, sizeof(*p));
+    p->wg_peer_index = -1;
 
     /* Compact peer_count */
     while (ml->peer_count > 0 && !ml->peers[ml->peer_count - 1].active) {
         ml->peer_count--;
+    }
+}
+
+static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
+    int idx = update->node_id ? find_peer_by_node_id(ml, update->node_id) : -1;
+    if (idx < 0 && update->key_valid) {
+        idx = find_peer_by_key(ml, update->public_key);
+    }
+    if (idx >= 0) {
+        remove_peer_idx(ml, idx);
+    }
+}
+
+static void patch_peer(microlink_t *ml, const ml_peer_update_t *update) {
+    int idx = update->node_id ? find_peer_by_node_id(ml, update->node_id) : -1;
+    if (idx < 0 && update->key_valid && update->node_id == 0) {
+        idx = find_peer_by_key(ml, update->public_key);
+    }
+    if (idx < 0) return;
+    ml_peer_t *p = &ml->peers[idx];
+
+    if (update->key_valid && memcmp(p->public_key, update->public_key, 32) != 0) {
+        /* Node key rotated: the WireGuard peer must be re-created under the
+         * new key (the old key must stop being accepted). */
+        ml_peer_update_t *re = ml_psram_calloc(1, sizeof(ml_peer_update_t));
+        if (!re) return;
+        re->action = ML_PEER_ADD;
+        re->node_id = p->node_id;
+        re->netmap_gen = p->netmap_gen;
+        re->vpn_ip = p->vpn_ip;
+        memcpy(re->public_key, update->public_key, 32);
+        re->key_valid = true;
+        memcpy(re->disco_key, update->disco_valid ? update->disco_key : p->disco_key, 32);
+        re->disco_valid = true;
+        strlcpy(re->hostname, p->hostname, sizeof(re->hostname));
+        re->derp_region = update->derp_region > 0 ? update->derp_region : p->derp_region;
+        re->online = update->online_valid ? update->online : p->online;
+        re->online_valid = true;
+        const ml_peer_update_t *src_eps = update->endpoint_count > 0 ? update : NULL;
+        re->endpoint_count = src_eps ? src_eps->endpoint_count : p->endpoint_count;
+        for (int i = 0; i < re->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
+            re->endpoints[i].ip = src_eps ? src_eps->endpoints[i].ip : p->endpoints[i].ip;
+            re->endpoints[i].port = src_eps ? src_eps->endpoints[i].port : p->endpoints[i].port;
+            re->endpoints[i].is_ipv6 = src_eps ? src_eps->endpoints[i].is_ipv6 : p->endpoints[i].is_ipv6;
+        }
+        ESP_LOGI(TAG, "Peer %s rotated its node key, re-installing", p->hostname);
+        remove_peer_idx(ml, idx);
+        add_peer(ml, re);
+        free(re);
+        return;
+    }
+
+    if (update->disco_valid && memcmp(p->disco_key, update->disco_key, 32) != 0) {
+        memcpy(p->disco_key, update->disco_key, 32);
+        p->has_direct_path = false;
+        p->trust_until_ms = 0;
+    }
+    merge_endpoints(p, update);
+    if (update->derp_region > 0) {
+        p->derp_region = update->derp_region;
+    }
+    if (update->online_valid) {
+        p->online = update->online;
+    }
+    ESP_LOGD(TAG, "Peer patched: %s (eps=%d derp=%d online=%d)",
+             p->hostname, p->endpoint_count, p->derp_region, p->online);
+}
+
+/* End of a full peer list: anything not listed in this generation was removed
+ * or revoked on the control plane (or is a stale NVS-cached peer). */
+static void sweep_stale_peers(microlink_t *ml, uint32_t gen) {
+    int removed = 0;
+    for (int i = 0; i < ml->peer_count; i++) {
+        if (ml->peers[i].active && ml->peers[i].netmap_gen != gen) {
+            remove_peer_idx(ml, i);
+            removed++;
+        }
+    }
+    if (removed) {
+        ESP_LOGI(TAG, "Removed %d peer(s) no longer in the netmap", removed);
     }
 }
 
@@ -762,51 +925,10 @@ static void process_peer_updates(microlink_t *ml) {
             remove_peer(ml, update);
             break;
         case ML_PEER_UPDATE_ENDPOINT:
-            /* Update endpoint/DERP for existing peer (delta patch) */
-            {
-                int idx = find_peer_by_key(ml, update->public_key);
-                if (idx >= 0) {
-                    ml_peer_t *p = &ml->peers[idx];
-                    if (update->endpoint_count > 0) {
-                        /* Preserve last_ping_ms for an endpoint that's still
-                         * the same ip:port after this refresh - matching real
-                         * Tailscale's endpointState map (a MapResponse-driven
-                         * endpoint update there doesn't reset lastPing for an
-                         * address that's still valid; it's not a wholesale
-                         * replace). Old array's still valid here since we
-                         * haven't overwritten it yet. */
-                        int old_count = p->endpoint_count;
-                        p->endpoint_count = update->endpoint_count;
-                        for (int i = 0; i < update->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
-                            uint64_t preserved_last_ping = 0;
-                            for (int j = 0; j < old_count && j < ML_MAX_ENDPOINTS; j++) {
-                                if (p->endpoints[j].ip == update->endpoints[i].ip &&
-                                    p->endpoints[j].port == update->endpoints[i].port) {
-                                    preserved_last_ping = p->endpoints[j].last_ping_ms;
-                                    break;
-                                }
-                            }
-                            /* Must stage into locals before overwriting p->endpoints[i]
-                             * in place, since i may equal j for an unchanged entry. */
-                            uint32_t new_ip = update->endpoints[i].ip;
-                            uint16_t new_port = update->endpoints[i].port;
-                            bool new_is_ipv6 = update->endpoints[i].is_ipv6;
-                            p->endpoints[i].ip = new_ip;
-                            p->endpoints[i].port = new_port;
-                            p->endpoints[i].is_ipv6 = new_is_ipv6;
-                            p->endpoints[i].last_ping_ms = preserved_last_ping;
-                        }
-                    }
-                    if (update->derp_region > 0) {
-                        p->derp_region = update->derp_region;
-                    }
-                    if (update->online_valid) {
-                        p->online = update->online;
-                    }
-                    ESP_LOGI(TAG, "Peer patched: %s (eps=%d derp=%d online=%d)",
-                             p->hostname, p->endpoint_count, p->derp_region, p->online);
-                }
-            }
+            patch_peer(ml, update);
+            break;
+        case ML_PEER_SYNC_DONE:
+            sweep_stale_peers(ml, update->netmap_gen);
             break;
         }
         free(update);
