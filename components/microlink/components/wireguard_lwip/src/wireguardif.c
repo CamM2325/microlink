@@ -268,12 +268,10 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 
 	if (keypair->valid && (keypair->initiator || keypair->last_rx != 0)) {
 		// More debug: check expiry
-		uint32_t now_ms = wireguard_sys_now();
-		uint32_t age_ms = now_ms - keypair->keypair_millis;
 		bool expired = wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME);
-		WG_DEBUG("[WG_TX_DEBUG] keypair_millis=%lu, now=%lu, age_ms=%lu, expired=%d, counter=%lu\n",
-		       (unsigned long)keypair->keypair_millis, (unsigned long)now_ms,
-		       (unsigned long)age_ms, expired, (unsigned long)keypair->sending_counter);
+		WG_DEBUG("[WG_TX_DEBUG] keypair_millis=%lu, now=%lu, expired=%d, counter=%lu\n",
+		       (unsigned long)keypair->keypair_millis, (unsigned long)wireguard_sys_now(),
+		       expired, (unsigned long)keypair->sending_counter);
 
 		if (
 				!expired &&
@@ -1045,8 +1043,6 @@ err_t wireguardif_add_peer(struct netif *netif, struct wireguardif_peer *p, u8_t
 	size_t public_key_len = sizeof(public_key);
 	struct wireguard_peer *peer = NULL;
 
-	uint32_t t1 = wireguard_sys_now();
-
 	if (wireguard_base64_decode(p->public_key, public_key, &public_key_len)
 			&& (public_key_len == WIREGUARD_PUBLIC_KEY_LEN)) {
 
@@ -1084,9 +1080,6 @@ err_t wireguardif_add_peer(struct netif *netif, struct wireguardif_peer *p, u8_t
 	} else {
 		result = ERR_ARG;
 	}
-
-	uint32_t t2 = wireguard_sys_now();
-	WG_DEBUG("Adding peer took %ldms\r\n", (t2-t1));
 
 	if (peer_index) {
 		if (peer) {
@@ -1282,18 +1275,14 @@ err_t wireguardif_init(struct netif *netif) {
 		if (wireguard_base64_decode(init_data->private_key, private_key, &private_key_len)
 				&& (private_key_len == WIREGUARD_PRIVATE_KEY_LEN)) {
 
-			// In magicsock mode, skip creating UDP socket - packets come via inject_packet
+			// In magicsock mode, skip creating UDP socket - packets come via wireguardif_network_rx
 			if (g_disable_socket_bind) {
 				WG_DEBUG("[WG] Socket binding disabled - using magicsock mode\n");
 				device = (struct wireguard_device *)mem_calloc(1, sizeof(struct wireguard_device));
 				if (device) {
 					device->netif = netif;
 					device->udp_pcb = NULL;  // No internal socket
-					uint32_t t1 = wireguard_sys_now();
 					if (wireguard_device_init(device, private_key)) {
-						uint32_t t2 = wireguard_sys_now();
-						WG_DEBUG("Device init took %ldms\r\n", (t2-t1));
-
 #if LWIP_CHECKSUM_CTRL_PER_NETIF
 						NETIF_SET_CHECKSUM_CTRL(netif, NETIF_CHECKSUM_ENABLE_ALL);
 #endif
@@ -1337,11 +1326,7 @@ err_t wireguardif_init(struct netif *netif) {
 							}
 							device->udp_pcb = udp;
 							// Per-wireguard netif/device setup
-							uint32_t t1 = wireguard_sys_now();
 							if (wireguard_device_init(device, private_key)) {
-								uint32_t t2 = wireguard_sys_now();
-								WG_DEBUG("Device init took %ldms\r\n", (t2-t1));
-
 #if LWIP_CHECKSUM_CTRL_PER_NETIF
 								NETIF_SET_CHECKSUM_CTRL(netif, NETIF_CHECKSUM_ENABLE_ALL);
 #endif
