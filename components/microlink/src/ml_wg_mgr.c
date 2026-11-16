@@ -642,7 +642,12 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     int idx = find_peer_by_key(ml, update->public_key);
     if (idx >= 0) {
         ml_peer_t *e = &ml->peers[idx];
-        if (update->vpn_ip == 0 || e->vpn_ip == update->vpn_ip) {
+        /* Fast path only for a peer that is already installed in WireGuard.
+         * Peers preloaded from the NVS cache at boot have no WG slot yet
+         * (the netif didn't exist) and must take the full add below, or
+         * every handshake from them fails with "peer not found". */
+        bool installed = (e->wg_peer_index >= 0) || (ml->wg_netif == NULL);
+        if (installed && (update->vpn_ip == 0 || e->vpn_ip == update->vpn_ip)) {
             /* Metadata refresh of a known peer: keep its WireGuard session,
              * validated direct path and per-endpoint ping history. (Re-adding
              * here used to reset all DISCO state on every PeersChanged.) */
@@ -671,7 +676,9 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
         }
         /* VPN IP changed: the WireGuard allowed-IP must follow, so drop the
          * WG peer and fall through to a full re-add below. */
-        ESP_LOGI(TAG, "Peer %s changed VPN IP, re-installing", update->hostname);
+        if (installed) {
+            ESP_LOGI(TAG, "Peer %s changed VPN IP, re-installing", update->hostname);
+        }
         if (e->wg_peer_index >= 0 && ml->wg_netif) {
             wireguardif_remove_peer((struct netif *)ml->wg_netif, (u8_t)e->wg_peer_index);
         }
