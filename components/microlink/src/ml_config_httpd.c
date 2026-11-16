@@ -14,6 +14,7 @@
 #ifdef CONFIG_ML_ENABLE_CONFIG_HTTPD
 
 #include "ml_config_httpd.h"
+#include "ml_at_validate.h"
 #include "microlink.h"
 #include "microlink_internal.h"
 #include "esp_log.h"
@@ -79,6 +80,52 @@ struct ml_config_ctx {
 
 static void config_save_peers(ml_config_ctx_t *ctx);  /* forward decl for migration */
 
+/* Fields that end up in modem AT commands (APN, PIN, PPP credentials) or in
+ * the control-plane connection / AT DNS lookup (ctrl_host) must never hold
+ * '"', CR/LF or other characters outside their grammar. These checks are
+ * shared by the web API (reject with 400) and the NVS loaders (drop the
+ * value, fall back to Kconfig). Returns NULL if valid, else a message. */
+#define FIELD_MAX(f) (sizeof(((ml_config_settings_t *)0)->f) - 1)
+
+static const char *check_cellular_apn(const char *v) {
+    return ml_at_param_valid(ML_AT_PARAM_APN, v, FIELD_MAX(cellular_apn)) ? NULL :
+        "cellular_apn: letters, digits, '-' and '.' only (max 31)";
+}
+static const char *check_sim_pin(const char *v) {
+    return (v[0] == '\0' || ml_at_param_valid(ML_AT_PARAM_PIN, v, FIELD_MAX(cellular_sim_pin))) ? NULL :
+        "cellular_sim_pin: 4-8 digits";
+}
+static const char *check_ppp_user(const char *v) {
+    return ml_at_param_valid(ML_AT_PARAM_CREDENTIAL, v, FIELD_MAX(ppp_user)) ? NULL :
+        "ppp_user: printable ASCII without '\"' or '\\' (max 31)";
+}
+static const char *check_ppp_pass(const char *v) {
+    return ml_at_param_valid(ML_AT_PARAM_CREDENTIAL, v, FIELD_MAX(ppp_pass)) ? NULL :
+        "ppp_pass: printable ASCII without '\"' or '\\' (max 31)";
+}
+static const char *check_ctrl_host(const char *v) {
+    return (v[0] == '\0' || ml_at_param_valid(ML_AT_PARAM_HOSTNAME, v, FIELD_MAX(ctrl_host))) ? NULL :
+        "ctrl_host: host name of letters, digits, '-' and '.' (max 63)";
+}
+
+/* Settings blobs from older firmware were stored without validation (and a
+ * blob is not guaranteed to be NUL-terminated): clear any invalid field. */
+static void config_sanitize_settings(ml_config_settings_t *st) {
+    #define SANITIZE(field, check) do { \
+        (field)[sizeof(field) - 1] = '\0'; \
+        if ((check)(field) != NULL) { \
+            ESP_LOGW(TAG, "Ignoring invalid saved %s (re-enter it in the web UI)", #field); \
+            memset((field), 0, sizeof(field)); \
+        } \
+    } while (0)
+    SANITIZE(st->cellular_apn, check_cellular_apn);
+    SANITIZE(st->cellular_sim_pin, check_sim_pin);
+    SANITIZE(st->ppp_user, check_ppp_user);
+    SANITIZE(st->ppp_pass, check_ppp_pass);
+    SANITIZE(st->ctrl_host, check_ctrl_host);
+    #undef SANITIZE
+}
+
 static void config_load_settings(ml_config_ctx_t *ctx) {
     /* Read whatever size blob exists — v1 blobs are smaller than v2 struct */
     memset(&ctx->settings, 0, sizeof(ml_config_settings_t));
@@ -120,6 +167,8 @@ static void config_load_settings(ml_config_ctx_t *ctx) {
     }
 
     #undef SEED_STR
+
+    config_sanitize_settings(&ctx->settings);
 
     ESP_LOGI(TAG, "Settings v%d (wifi=%s, prefix=%s, name=%s, max_peers=%d, ctrl=%s, pip=%s)",
              ctx->settings.version,
@@ -326,6 +375,7 @@ uint32_t ml_config_get_priority_peer_ip(const ml_config_ctx_t *ctx) {
 
 const char *ml_config_get_ctrl_host(const ml_config_ctx_t *ctx) {
     if (!ctx || ctx->settings.ctrl_host[0] == '\0') return NULL;
+    if (check_ctrl_host(ctx->settings.ctrl_host) != NULL) return NULL;
     return ctx->settings.ctrl_host;
 }
 
@@ -623,6 +673,29 @@ static esp_err_t handler_post_settings(httpd_req_t *req) {
     if (!json) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
         return ESP_FAIL;
+    }
+
+    /* Validate every field that reaches a modem AT command or the control
+     * connection BEFORE changing anything, so a rejected request leaves the
+     * stored settings untouched. Over-long values are rejected, not
+     * truncated. Masked placeholders / empty secrets mean "keep". */
+    {
+        const cJSON *it;
+        const char *bad = NULL;
+        #define STR_ITEM(name) (((it = cJSON_GetObjectItem(json, (name))) && cJSON_IsString(it)) \
+                                ? it->valuestring : NULL)
+        const char *v;
+        if (!bad && (v = STR_ITEM("cellular_apn"))) bad = check_cellular_apn(v);
+        if (!bad && (v = STR_ITEM("cellular_sim_pin")) && strcmp(v, "****") != 0) bad = check_sim_pin(v);
+        if (!bad && (v = STR_ITEM("ppp_user"))) bad = check_ppp_user(v);
+        if (!bad && (v = STR_ITEM("ppp_pass")) && strcmp(v, "********") != 0) bad = check_ppp_pass(v);
+        if (!bad && (v = STR_ITEM("ctrl_host"))) bad = check_ctrl_host(v);
+        #undef STR_ITEM
+        if (bad) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, bad);
+            return ESP_FAIL;
+        }
     }
 
     /* Helper macro: clear field, copy new value, ensure null termination */
@@ -1174,6 +1247,14 @@ bool ml_config_get_nvs_ppp(char *user, size_t user_len,
         free(settings);
         return false;
     }
+    settings->ppp_user[sizeof(settings->ppp_user) - 1] = '\0';
+    settings->ppp_pass[sizeof(settings->ppp_pass) - 1] = '\0';
+    if (check_ppp_user(settings->ppp_user) || check_ppp_pass(settings->ppp_pass)) {
+        ESP_LOGW(TAG, "Ignoring invalid PPP credentials in NVS");
+        ml_at_secure_zero(settings, sizeof(*settings));
+        free(settings);
+        return false;
+    }
 
     if (user && user_len > 0) {
         strncpy(user, settings->ppp_user, user_len - 1);
@@ -1185,6 +1266,7 @@ bool ml_config_get_nvs_ppp(char *user, size_t user_len,
     }
 
     ESP_LOGI(TAG, "PPP credentials from NVS: user=%s", settings->ppp_user);
+    ml_at_secure_zero(settings, sizeof(*settings));
     free(settings);
     return true;
 }
@@ -1202,6 +1284,12 @@ bool ml_config_get_nvs_apn(char *apn, size_t apn_len) {
     nvs_close(nvs);
 
     if (err != ESP_OK || len < 1 || settings->cellular_apn[0] == '\0') {
+        free(settings);
+        return false;
+    }
+    settings->cellular_apn[sizeof(settings->cellular_apn) - 1] = '\0';
+    if (check_cellular_apn(settings->cellular_apn)) {
+        ESP_LOGW(TAG, "Ignoring invalid APN in NVS");
         free(settings);
         return false;
     }

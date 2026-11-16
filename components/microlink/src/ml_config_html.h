@@ -349,6 +349,7 @@ static const char CONFIG_PAGE_HTML[] =
 "};"
 "try{"
 "const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});"
+"if(!r.ok){showMsg('settingsMsg','Save failed: '+(await r.text()),false);return;}"
 "const d=await r.json();"
 "showMsg('settingsMsg','Saved. Restart device for changes to take effect.',true);"
 "}catch(e){showMsg('settingsMsg','Save failed: '+e,false);}"

@@ -7,6 +7,7 @@
  */
 
 #include "microlink_internal.h"
+#include "ml_at_validate.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -188,8 +189,18 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     if (ml->config.max_peers > ML_MAX_PEERS) ml->config.max_peers = ML_MAX_PEERS;
     ml->config.enable_derp = true;  /* Always need DERP for relay */
 
-    /* Custom control plane from config struct (NVS override below still wins) */
+    /* Custom control plane from config struct (NVS override below still wins).
+     * It is used as a DNS name (an AT command over the cellular bridge), in
+     * HTTP Host headers and as the TLS server name, so it must be a plain
+     * host name; reject rather than truncate or pass anything else through. */
     if (config->ctrl_host && config->ctrl_host[0]) {
+        if (!ml_at_param_valid(ML_AT_PARAM_HOSTNAME, config->ctrl_host,
+                               sizeof(ml->ctrl_host) - 1)) {
+            ESP_LOGE(TAG, "Invalid ctrl_host: must be a host name of letters, "
+                     "digits, '-' and '.' (max %u)", (unsigned)(sizeof(ml->ctrl_host) - 1));
+            free(ml);
+            return NULL;
+        }
         strncpy(ml->ctrl_host, config->ctrl_host, sizeof(ml->ctrl_host) - 1);
         ESP_LOGI(TAG, "Control plane from config: %s", ml->ctrl_host);
     }
