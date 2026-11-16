@@ -31,6 +31,10 @@ CONFIG_MBEDTLS_CHACHAPOLY_C=y
 CONFIG_MBEDTLS_HKDF_C=y
 CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
 
+# Compiler: optimise for size (-Os). The crypto sources are still built
+# with -O2, see the microlink and wireguard_lwip CMakeLists.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
 # FreeRTOS
 CONFIG_FREERTOS_HZ=1000
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096

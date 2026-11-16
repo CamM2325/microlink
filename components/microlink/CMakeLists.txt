@@ -54,3 +54,9 @@ idf_component_register(
     PRIV_REQUIRES
         wireguard_lwip
 )
+
+# DISCO crypto_box (XSalsa20-Poly1305) runs on every DISCO packet: -O2 like
+# the wireguard_lwip crypto (see that CMakeLists).
+if(NOT CONFIG_COMPILER_OPTIMIZATION_NONE)
+    set_source_files_properties(src/nacl_box.c PROPERTIES COMPILE_OPTIONS "-O2")
+endif()
