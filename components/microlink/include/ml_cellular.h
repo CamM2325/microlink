@@ -182,17 +182,54 @@ esp_err_t ml_cellular_get_info(ml_cellular_info_t *info);
  */
 const char *ml_cellular_get_imei(void);
 
+/** Upper bound for the timeout of an application AT command (the modem
+ *  UART, and with it the AT socket bridge, is blocked for that long). */
+#define ML_CELLULAR_AT_CMD_MAX_TIMEOUT_MS  30000
+
 /**
- * Send a raw AT command and get response.
- * Only works when NOT in PPP mode.
+ * Send one application AT command (e.g. a GPS query) and get the response.
+ *
+ * Thread-safe: takes the modem UART lock shared with the driver and the AT
+ * socket bridge, so it can be used while the bridge carries the Tailscale
+ * connection (CONFIG_ML_CELLULAR_DATA_AT_ONLY, or AUTO after PPP fell back).
+ *
+ * The command must be a single line starting with "AT", printable ASCII
+ * only (no CR, LF, Ctrl-Z or ESC), at most ML_AT_CMD_MAX characters.
+ * While the AT socket bridge is active, only "AT", "ATI" and one extended
+ * "AT+..." command without ';' are accepted, and commands that would break
+ * the bridge or the UART link (+CIP*, +NET*, +CDNS*, +IPR, +ICF, +IFC, +CFUN,
+ * +CMUX, +CGACT, +CRESET, +CPOF, +CSCLK) are refused; see
+ * ml_at_cmd_allowed_with_bridge() in ml_at_validate.h.
+ *
+ * Not available while PPP owns the UART (state PPP_CONNECTING/CONNECTED):
+ * returns -1. Use the modem's second UART/USB port for GNSS in PPP mode.
+ *
+ * Notes: the bridge is paused for the duration of the command, so keep
+ * timeouts short. URCs that arrive in the response (e.g. "+IPCLOSE") are
+ * still processed by the bridge. Unsolicited GNSS NMEA output on the main
+ * UART is not supported.
  *
  * @param cmd        AT command string (without \r\n)
- * @param response   Buffer for response
+ * @param response   Buffer for the response (NUL-terminated, >= 2 bytes)
  * @param resp_size  Size of response buffer
- * @param timeout_ms Timeout in milliseconds
- * @return Number of bytes received, or -1 on timeout
+ * @param timeout_ms Timeout in ms (<= 0: 5000; capped at
+ *                   ML_CELLULAR_AT_CMD_MAX_TIMEOUT_MS)
+ * @return Number of bytes received, or -1 if rejected, in the wrong state,
+ *         or no response before the timeout
+ */
+int ml_cellular_send_at_cmd(const char *cmd, char *response, size_t resp_size, int timeout_ms);
+
+/**
+ * Same as ml_cellular_send_at_cmd() (kept for compatibility).
  */
 int ml_cellular_send_at(const char *cmd, char *response, size_t resp_size, int timeout_ms);
+
+/* ============================================================================
+ * Internal: modem UART lock (used by ml_at_socket.c; never deleted once
+ * created by ml_cellular_init()). Not for application use.
+ * ========================================================================== */
+bool ml_cellular_uart_lock(void);
+void ml_cellular_uart_unlock(void);
 
 #ifdef __cplusplus
 }
