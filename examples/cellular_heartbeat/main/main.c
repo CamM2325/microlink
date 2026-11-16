@@ -261,8 +261,8 @@ static void hb_update(microlink_udp_socket_t *sock, uint64_t now_ms) {
         if (now_ms - hb_ctx.last_hb_recv_ms > HB_TIMEOUT_MS) {
             hb_ctx.state = HB_STATE_FAULT;
             hb_ctx.hb_timeout_count++;
-            ESP_LOGW(TAG, "HB: → FAULT (heartbeat timeout: %llu ms since last)",
-                     (unsigned long long)(now_ms - hb_ctx.last_hb_recv_ms));
+            ESP_LOGW(TAG, "HB: → FAULT (heartbeat timeout: %lu ms since last)",
+                     (unsigned long)(now_ms - hb_ctx.last_hb_recv_ms));
             robot_emergency_stop();
         }
     }

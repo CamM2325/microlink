@@ -496,8 +496,8 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 				// Decrypt the packet
 				memset(pbuf->payload, 0, pbuf->tot_len);
 				bool decrypt_ok = wireguard_decrypt_packet(pbuf->payload, src, src_len, nonce, keypair);
-				WG_DEBUG("[WG_DECRYPT] result=%d, src_len=%u, nonce=%llu",
-				       decrypt_ok, (unsigned)src_len, (unsigned long long)nonce);
+				WG_DEBUG("[WG_DECRYPT] result=%d, src_len=%u, nonce=%lu",
+				       decrypt_ok, (unsigned)src_len, (unsigned long)nonce);
 
 				// SECURITY: the anti-replay check runs immediately after authentication
 				// and BEFORE any peer/keypair state is touched - for every packet,
@@ -574,7 +574,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 					}
 				} else if (decrypt_ok) {
 					// Authenticated but duplicate / replayed / too old: change nothing
-					WG_DEBUG("[WG_RX] DROPPED: replayed or too old, nonce=%llu", (unsigned long long)nonce);
+					WG_DEBUG("[WG_RX] DROPPED: replayed or too old, nonce=%lu", (unsigned long)nonce);
 				}
 
 				if (pbuf) {

@@ -1400,8 +1400,8 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
             continue;
         }
 
-        ESP_LOGD(TAG, "DISCO PONG from %s: RTT=%llu ms (via %s)",
-                 p->hostname, (unsigned long long)rtt_ms,
+        ESP_LOGD(TAG, "DISCO PONG from %s: RTT=%lu ms (via %s)",
+                 p->hostname, (unsigned long)rtt_ms,
                  pkt->via_derp ? "DERP" : "direct");
 
         p->last_pong_recv_ms = now;
@@ -2185,7 +2185,7 @@ void ml_wg_mgr_task(void *arg) {
             wireguardif_periodic((struct netif *)ml->wg_netif);
             uint64_t dt = ml_get_time_ms() - t0;
             last_wg_periodic_ms = now;
-            ESP_LOGD(TAG, "wireguardif_periodic: %llu ms", (unsigned long long)dt);
+            ESP_LOGD(TAG, "wireguardif_periodic: %lu ms", (unsigned long)dt);
         }
 
         /* Periodic DISCO probes (every 1s check) */
@@ -2195,7 +2195,7 @@ void ml_wg_mgr_task(void *arg) {
             disco_periodic_probes(ml);
             uint64_t dt = ml_get_time_ms() - t0;
             last_disco_probe_ms = now;
-            ESP_LOGD(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
+            ESP_LOGD(TAG, "disco_periodic_probes: %lu ms", (unsigned long)dt);
         }
 
         /* No trailing delay: the blocking receive above paces the loop and

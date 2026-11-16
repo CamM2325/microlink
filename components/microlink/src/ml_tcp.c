@@ -190,8 +190,8 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
     }
 
     int64_t t_end = esp_timer_get_time();
-    ESP_LOGI(TAG, "TCP connected to %s:%u (%lld ms)", ip_str, dest_port,
-             (t_end - t_start) / 1000);
+    ESP_LOGI(TAG, "TCP connected to %s:%u (%ld ms)", ip_str, dest_port,
+             (long)((t_end - t_start) / 1000));
 
     /* Allocate handle */
     microlink_tcp_socket_t *sock = calloc(1, sizeof(microlink_tcp_socket_t));

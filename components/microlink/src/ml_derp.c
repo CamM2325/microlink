@@ -763,7 +763,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     }
 
     int64_t t_derp_dns = esp_timer_get_time();
-    ESP_LOGD(TAG, "[TIMING] DERP DNS: %lld ms", (t_derp_dns - t_derp_start) / 1000);
+    ESP_LOGD(TAG, "[TIMING] DERP DNS: %ld ms", (long)((t_derp_dns - t_derp_start) / 1000));
 
     /* TCP connect — use address family from DNS result */
     int sock = ml_socket(res->ai_family, SOCK_STREAM, 0);
@@ -786,7 +786,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     ml_freeaddrinfo(res);
 
     int64_t t_derp_tcp = esp_timer_get_time();
-    ESP_LOGD(TAG, "[TIMING] DERP TCP connect: %lld ms", (t_derp_tcp - t_derp_dns) / 1000);
+    ESP_LOGD(TAG, "[TIMING] DERP TCP connect: %ld ms", (long)((t_derp_tcp - t_derp_dns) / 1000));
 
     /* TLS setup */
     mbedtls_ssl_init(&ml->derp.ssl);
@@ -899,7 +899,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     }
 
     int64_t t_derp_tls = esp_timer_get_time();
-    ESP_LOGD(TAG, "[TIMING] DERP TLS handshake: %lld ms", (t_derp_tls - t_derp_tcp) / 1000);
+    ESP_LOGD(TAG, "[TIMING] DERP TLS handshake: %ld ms", (long)((t_derp_tls - t_derp_tcp) / 1000));
     ESP_LOGD(TAG, "TLS connected to DERP");
 
     /* HTTP Upgrade: GET /derp with Upgrade: DERP header */
@@ -1149,12 +1149,12 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECTED);
 
     int64_t t_derp_done = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] DERP total: %lld ms (DNS=%lld, TCP=%lld, TLS=%lld, proto=%lld)",
-             (t_derp_done - t_derp_start) / 1000,
-             (t_derp_dns - t_derp_start) / 1000,
-             (t_derp_tcp - t_derp_dns) / 1000,
-             (t_derp_tls - t_derp_tcp) / 1000,
-             (t_derp_done - t_derp_tls) / 1000);
+    ESP_LOGI(TAG, "[TIMING] DERP total: %ld ms (DNS=%ld, TCP=%ld, TLS=%ld, proto=%ld)",
+             (long)((t_derp_done - t_derp_start) / 1000),
+             (long)((t_derp_dns - t_derp_start) / 1000),
+             (long)((t_derp_tcp - t_derp_dns) / 1000),
+             (long)((t_derp_tls - t_derp_tcp) / 1000),
+             (long)((t_derp_done - t_derp_tls) / 1000));
     ESP_LOGI(TAG, "DERP handshake complete, connected");
     return ESP_OK;
 }
