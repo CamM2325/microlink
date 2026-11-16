@@ -61,8 +61,13 @@ extern "C" {
 
 /* Queue depths */
 #define ML_DERP_TX_QUEUE_DEPTH  16
-#define ML_DISCO_RX_QUEUE_DEPTH 8
-#define ML_WG_RX_QUEUE_DEPTH    8
+#define ML_DISCO_RX_QUEUE_DEPTH 16
+/* Deep enough to hold a TCP window's worth of packets while the manager task
+ * is busy with a handshake or a DISCO probe round. The enqueue in
+ * ml_net_io.c is non-blocking, so an overflow here is a silent drop; at 8 a
+ * bulk transfer lost enough packets to collapse TCP. Each slot holds a
+ * pointer and a few fields, not the packet. */
+#define ML_WG_RX_QUEUE_DEPTH    64
 #define ML_STUN_RX_QUEUE_DEPTH  4
 #define ML_COORD_CMD_QUEUE_DEPTH 4
 #define ML_PEER_UPDATE_QUEUE_DEPTH 400
