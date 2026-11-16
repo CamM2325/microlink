@@ -5,6 +5,7 @@
 
 #include "wireguard-platform.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "lwip/sys.h"
 #include <string.h>
 #include <sys/time.h>
