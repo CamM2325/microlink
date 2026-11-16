@@ -817,12 +817,26 @@ esp_err_t microlink_stop(microlink_t *ml) {
      * then shut down the sockets the network tasks may be blocked reading
      * (coord's MapResponse read waits up to 60 s, DERP TLS reads up to 10 s). */
     uint32_t alive = ml_join_tasks(ml, ML_STOP_GRACE_MS);
-    if (alive) {
-        if (alive & ML_TASK_BIT_COORD)   ml_unblock_socket(ml->coord_sock);
-        if (alive & ML_TASK_BIT_DERP_TX) ml_unblock_socket(ml->derp.sockfd);
-        uint32_t rest = CONFIG_ML_STOP_TIMEOUT_MS > ML_STOP_GRACE_MS
-                      ? CONFIG_ML_STOP_TIMEOUT_MS - ML_STOP_GRACE_MS : 0;
-        alive = ml_join_tasks(ml, rest);
+    uint32_t waited = ML_STOP_GRACE_MS;
+    int coord_fd_done = -1, derp_fd_done = -1;
+    while (alive && waited < CONFIG_ML_STOP_TIMEOUT_MS) {
+        /* A task that was between connections (DNS, TCP connect) may open a
+         * new socket after the first pass; shut that one down too. Each
+         * descriptor is shut down once. */
+        int fd = ml->coord_sock;
+        if ((alive & ML_TASK_BIT_COORD) && fd >= 0 && fd != coord_fd_done) {
+            ml_unblock_socket(fd);
+            coord_fd_done = fd;
+        }
+        fd = ml->derp.sockfd;
+        if ((alive & ML_TASK_BIT_DERP_TX) && fd >= 0 && fd != derp_fd_done) {
+            ml_unblock_socket(fd);
+            derp_fd_done = fd;
+        }
+        uint32_t slice = CONFIG_ML_STOP_TIMEOUT_MS - waited;
+        if (slice > 2000) slice = 2000;
+        alive = ml_join_tasks(ml, slice);
+        waited += slice;
     }
 
     int join_ms = (int)((esp_timer_get_time() - t_start) / 1000);
