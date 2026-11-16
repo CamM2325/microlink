@@ -24,6 +24,7 @@
 #include "lwip/ip_addr.h"
 #include "lwip/ip.h"
 #include "lwip/tcpip.h"
+#include "arch/sys_arch.h" /* sys_thread_tcpip() - detects whether we're already on tcpip_thread */
 #include "nacl_box.h"
 #include "wireguardif.h"
 #include "wireguard.h"
@@ -181,6 +182,23 @@ static err_t wg_derp_output_cb(const uint8_t *peer_public_key,
  * on that thread. */
 static struct udp_pcb *s_wg_output_pcb = NULL;
 
+/* Context for dispatching udp_sendto() onto tcpip_thread when wg_udp_output_cb
+ * isn't already running there. */
+typedef struct {
+    struct udp_pcb *pcb;
+    struct pbuf *p;
+    ip_addr_t dst;
+    u16_t port;
+    err_t result;
+    SemaphoreHandle_t done;
+} wg_udp_send_ctx_t;
+
+static void wg_udp_sendto_in_tcpip(void *arg) {
+    wg_udp_send_ctx_t *sctx = (wg_udp_send_ctx_t *)arg;
+    sctx->result = udp_sendto(sctx->pcb, sctx->p, &sctx->dst, sctx->port);
+    xSemaphoreGive(sctx->done);
+}
+
 static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
                                 const uint8_t *data, size_t len, void *ctx) {
     microlink_t *ml = (microlink_t *)ctx;
@@ -195,7 +213,6 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
              (int)dest_port,
              len >= 1 ? data[0] : -1);
 
-    /* Use raw PCB to send — safe from any thread context */
     if (!s_wg_output_pcb) return ERR_CONN;
 
     struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
@@ -206,7 +223,40 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
     IP_SET_TYPE_VAL(dst, IPADDR_TYPE_V4);
     ip4_addr_set_u32(ip_2_ip4(&dst), dest_ip);  /* already network byte order */
 
-    err_t err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
+    /* udp_sendto() is raw lwIP core API - not thread-safe unless called from
+     * tcpip_thread. This callback runs from two different contexts: from
+     * tcpip_thread itself (when an app socket's send routes through the WG
+     * netif) and directly from ml_wg_mgr's own task (handshakes, keepalives,
+     * periodic housekeeping - confirmed on real hardware via
+     * CONFIG_LWIP_CHECK_THREAD_SAFETY, which caught this exact call during a
+     * one-shot handshake triggered from process_disco_pong()). Calling
+     * tcpip_callback() and blocking for the result when *already* on
+     * tcpip_thread would deadlock (tcpip_thread can't service its own queued
+     * callback while blocked waiting on it) - hence the explicit check
+     * rather than always dispatching. pbuf_alloc()/pbuf_free() aren't core
+     * state and don't need this - only the actual PCB send does. */
+    err_t err;
+    if (sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER)) {
+        err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
+    } else {
+        wg_udp_send_ctx_t sctx = {
+            .pcb = s_wg_output_pcb, .p = p, .dst = dst, .port = dest_port,
+            .done = xSemaphoreCreateBinary(),
+        };
+        if (!sctx.done) {
+            pbuf_free(p);
+            return ERR_MEM;
+        }
+        err_t cb_err = tcpip_callback(wg_udp_sendto_in_tcpip, &sctx);
+        if (cb_err != ERR_OK) {
+            vSemaphoreDelete(sctx.done);
+            pbuf_free(p);
+            return cb_err;
+        }
+        xSemaphoreTake(sctx.done, portMAX_DELAY);
+        vSemaphoreDelete(sctx.done);
+        err = sctx.result;
+    }
     pbuf_free(p);
     return err;
 }
@@ -214,6 +264,49 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
 /* ============================================================================
  * WireGuard Interface Initialization
  * ========================================================================== */
+
+/* Splices netif into lwIP's global netif_list and brings it up. Like
+ * netif_set_up()/netif_set_link_up() themselves, direct netif_list
+ * manipulation is core lwIP state and must only happen on tcpip_thread -
+ * confirmed on real hardware via CONFIG_LWIP_CHECK_THREAD_SAFETY, which
+ * asserts immediately if this runs anywhere else (this used to run inline
+ * on ml_wg_mgr's own task). Dispatched via tcpip_callback() + a semaphore,
+ * matching the same pattern ml_zerocopy.c already uses for its own PCB
+ * setup - this runs once at startup, not per-packet, so the round-trip
+ * cost is irrelevant. */
+typedef struct {
+    struct netif *netif;
+    SemaphoreHandle_t done;
+} wg_netif_up_ctx_t;
+
+static void wg_netif_bring_up_in_tcpip(void *arg) {
+    wg_netif_up_ctx_t *ctx = (wg_netif_up_ctx_t *)arg;
+    ctx->netif->next = netif_list;
+    netif_list = ctx->netif;
+    netif_set_up(ctx->netif);
+    netif_set_link_up(ctx->netif);
+    xSemaphoreGive(ctx->done);
+}
+
+/* udp_new() (raw lwIP PCB allocation) has the same tcpip_thread-only
+ * requirement - confirmed via the same CONFIG_LWIP_CHECK_THREAD_SAFETY
+ * assertion once wg_netif_bring_up_in_tcpip() above stopped masking it.
+ * Same dispatch pattern; only touches the module-static s_wg_output_pcb,
+ * so no per-call context struct needed beyond the semaphore. */
+static SemaphoreHandle_t s_wg_output_pcb_done;
+static void wg_output_pcb_create_in_tcpip(void *arg) {
+    (void)arg;
+    s_wg_output_pcb = udp_new();
+    if (s_wg_output_pcb) {
+        /* Set source port to 51820 (matching DISCO socket) WITHOUT calling
+         * udp_bind — avoids registering for input which would steal WG
+         * responses from the DISCO BSD socket. udp_sendto uses local_port. */
+        s_wg_output_pcb->local_port = 51820;
+        /* DSCP 46 (EF) → WMM AC_VO for low-latency WiFi scheduling */
+        s_wg_output_pcb->tos = 0xB8;
+    }
+    xSemaphoreGive(s_wg_output_pcb_done);
+}
 
 static esp_err_t wg_init_interface(microlink_t *ml) {
     /* Convert our WG private key to base64 */
@@ -264,28 +357,46 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
      * callback uses raw udp_sendto (not BSD sendto) to avoid deadlock. */
     netif->input = tcpip_input;
 
-    /* Add to lwIP netif list (bypass netif_add which wants init callback) */
-    netif->next = netif_list;
-    netif_list = netif;
-
-    /* Bring interface up */
-    netif_set_up(netif);
-    netif_set_link_up(netif);
+    /* Add to lwIP netif list and bring up on tcpip_thread (bypass netif_add
+     * which wants init callback) - see wg_netif_bring_up_in_tcpip() above. */
+    {
+        wg_netif_up_ctx_t ctx = { .netif = netif, .done = xSemaphoreCreateBinary() };
+        if (!ctx.done) {
+            ESP_LOGE(TAG, "Failed to allocate netif-up semaphore");
+            free(netif);
+            return ESP_FAIL;
+        }
+        err_t cb_err = tcpip_callback(wg_netif_bring_up_in_tcpip, &ctx);
+        if (cb_err != ERR_OK) {
+            ESP_LOGE(TAG, "tcpip_callback failed to queue netif bring-up: %d", cb_err);
+            vSemaphoreDelete(ctx.done);
+            free(netif);
+            return ESP_FAIL;
+        }
+        xSemaphoreTake(ctx.done, portMAX_DELAY);
+        vSemaphoreDelete(ctx.done);
+    }
 
     /* Create raw UDP PCB for WG output (avoids BSD sendto deadlock on TCPIP
-     * thread).  Bind to port 51820 to match the DISCO socket source port.
-     * The existing BSD disco_sock4 is only used from the wg_mgr task for
-     * DISCO/STUN; this raw PCB is used from the TCPIP thread for WG output. */
+     * thread).  Bind to port 51820 to match the DISCO socket source port. */
     if (!s_wg_output_pcb) {
-        s_wg_output_pcb = udp_new();
-        if (s_wg_output_pcb) {
-            /* Set source port to 51820 (matching DISCO socket) WITHOUT calling
-             * udp_bind — avoids registering for input which would steal WG
-             * responses from the DISCO BSD socket. udp_sendto uses local_port. */
-            s_wg_output_pcb->local_port = 51820;
-            /* DSCP 46 (EF) → WMM AC_VO for low-latency WiFi scheduling */
-            s_wg_output_pcb->tos = 0xB8;
+        s_wg_output_pcb_done = xSemaphoreCreateBinary();
+        if (!s_wg_output_pcb_done) {
+            ESP_LOGE(TAG, "Failed to allocate WG output PCB semaphore");
+            free(netif);
+            return ESP_FAIL;
         }
+        err_t cb_err = tcpip_callback(wg_output_pcb_create_in_tcpip, NULL);
+        if (cb_err != ERR_OK) {
+            ESP_LOGE(TAG, "tcpip_callback failed to queue WG output PCB creation: %d", cb_err);
+            vSemaphoreDelete(s_wg_output_pcb_done);
+            s_wg_output_pcb_done = NULL;
+            free(netif);
+            return ESP_FAIL;
+        }
+        xSemaphoreTake(s_wg_output_pcb_done, portMAX_DELAY);
+        vSemaphoreDelete(s_wg_output_pcb_done);
+        s_wg_output_pcb_done = NULL;
     }
 
     /* Register output callbacks for magicsock mode */
