@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 
+# microlink, plus wireguard_lwip which lives inside it
 set(EXTRA_COMPONENT_DIRS
     "../../components"
+    "../../components/microlink/components"
 )
 
 # Optional, git-ignored credentials (copy sdkconfig.credentials.example).

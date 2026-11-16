@@ -108,8 +108,8 @@ echo "hi" | nc -u -w1 <device-vpn-ip> 9000     # basic_connect replies "ECHO: hi
 
 ## Using MicroLink in your project
 
-Add `components/microlink` (and `components/microlink/components/wireguard_lwip`) to your
-project's component directories, then:
+Add `components/microlink` and `components/microlink/components` (which holds `wireguard_lwip`)
+to your project's `EXTRA_COMPONENT_DIRS`, as the examples do, then:
 
 ```c
 #include "microlink.h"
