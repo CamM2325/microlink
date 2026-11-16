@@ -25,13 +25,6 @@ void wireguard_tai64n_now(uint8_t *output) {
     uint64_t seconds = now_us / 1000000ULL;
     uint32_t nanoseconds = (now_us % 1000000ULL) * 1000;
 
-    // Log raw uptime before TAI offset (only every ~5s to avoid spam)
-    static uint64_t last_log_s = 0;
-    if (seconds - last_log_s >= 5) {
-        printf("[TAI64N] uptime=%llu s, nano=%lu\n", (unsigned long long)seconds, (unsigned long)nanoseconds);
-        last_log_s = seconds;
-    }
-
     // TAI64 starts at 1970-01-01 00:00:10 TAI (Unix epoch + 10 seconds)
     // Add TAI offset: 2^62 + Unix time
     seconds += 0x400000000000000AULL;

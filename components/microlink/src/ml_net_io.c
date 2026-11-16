@@ -53,8 +53,11 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
                               uint32_t src_ip, uint16_t src_port) {
     pkt_type_t type = classify_packet(data, len);
 
-    /* Log ALL direct UDP packets for debugging */
-    ESP_LOGI(TAG, "UDP RX: %d bytes from %d.%d.%d.%d:%d type=%s hdr=%02x",
+    /* Per-packet trace, kept at DEBUG. At INFO this line is emitted for every
+     * tunnelled packet, and the UART write blocks the receive task for roughly
+     * 6 ms per packet at 115200 baud — on its own that caps the datapath at
+     * ~165 pps and backs the lwIP UDP mailbox up behind it. */
+    ESP_LOGD(TAG, "UDP RX: %d bytes from %d.%d.%d.%d:%d type=%s hdr=%02x",
              (int)len,
              (int)((src_ip >> 24) & 0xFF), (int)((src_ip >> 16) & 0xFF),
              (int)((src_ip >> 8) & 0xFF), (int)(src_ip & 0xFF),
