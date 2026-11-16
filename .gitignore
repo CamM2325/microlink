@@ -9,6 +9,8 @@ sdkconfig.credentials
 
 # Managed components (downloaded by idf.py)
 **/managed_components/
+# Component manager lock files (differ per ESP-IDF version)
+**/dependencies.lock
 
 # Backups
 backups/
