@@ -16,6 +16,7 @@ set(SRCS
     "src/ml_zerocopy.c"
     "src/ml_cellular.c"
     "src/ml_at_socket.c"
+    "src/ml_at_validate.c"
     "src/ml_net_switch.c"
     "src/ml_config_httpd.c"
 )
