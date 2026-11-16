@@ -1444,7 +1444,7 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                                  (int)pkt->src_port, p->hostname);
                     }
                 } else {
-                    ESP_LOGI(TAG, "WG endpoint stored (no session): %d.%d.%d.%d:%d for %s",
+                    ESP_LOGD(TAG, "WG endpoint stored (no session): %d.%d.%d.%d:%d for %s",
                              (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
                              (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
                              (int)pkt->src_port, p->hostname);
@@ -1775,7 +1775,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
                 plaintext[pt_len++] = local_port & 0xFF;
                 ep_count++;
 
-                ESP_LOGI(TAG, "CMM endpoint: LAN %lu.%lu.%lu.%lu:%u",
+                ESP_LOGD(TAG, "CMM endpoint: LAN %lu.%lu.%lu.%lu:%u",
                          (unsigned long)((local_ip >> 24) & 0xFF),
                          (unsigned long)((local_ip >> 16) & 0xFF),
                          (unsigned long)((local_ip >> 8) & 0xFF),
@@ -1800,7 +1800,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
         plaintext[pt_len++] = pub_port & 0xFF;
         ep_count++;
 
-        ESP_LOGI(TAG, "CMM endpoint: STUN %lu.%lu.%lu.%lu:%u",
+        ESP_LOGD(TAG, "CMM endpoint: STUN %lu.%lu.%lu.%lu:%u",
                  (unsigned long)((pub_ip >> 24) & 0xFF),
                  (unsigned long)((pub_ip >> 16) & 0xFF),
                  (unsigned long)((pub_ip >> 8) & 0xFF),
@@ -1833,7 +1833,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     /* Send via DERP */
     esp_err_t err = ml_derp_queue_send(ml, p->public_key, pkt, pos);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "CallMeMaybe sent to %s (%d endpoints)", p->hostname, ep_count);
+        ESP_LOGD(TAG, "CallMeMaybe sent to %s (%d endpoints)", p->hostname, ep_count);
     } else {
         ESP_LOGW(TAG, "CallMeMaybe send failed for %s: %d", p->hostname, err);
     }
@@ -1919,13 +1919,21 @@ bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip) {
         if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
             struct wireguard_peer *wp = &dev->peers[p->wg_peer_index];
             bool key_match = (memcmp(wp->public_key, p->public_key, 32) == 0);
-            ESP_LOGI(TAG, "WG peer UP: %s wg_idx=%d ep=%s:%u key=%02x%02x%02x%02x %s",
-                     p->hostname, p->wg_peer_index,
-                     ip_addr_isany(&cur_ip) ? "DERP" : ipaddr_ntoa(&cur_ip),
-                     cur_port,
-                     wp->public_key[0], wp->public_key[1],
-                     wp->public_key[2], wp->public_key[3],
-                     key_match ? "KEY_OK" : "KEY_MISMATCH!");
+            if (key_match) {
+                ESP_LOGD(TAG, "WG peer UP: %s wg_idx=%d ep=%s:%u key=%02x%02x%02x%02x",
+                         p->hostname, p->wg_peer_index,
+                         ip_addr_isany(&cur_ip) ? "DERP" : ipaddr_ntoa(&cur_ip),
+                         cur_port,
+                         wp->public_key[0], wp->public_key[1],
+                         wp->public_key[2], wp->public_key[3]);
+            } else {
+                ESP_LOGW(TAG, "WG peer UP but KEY_MISMATCH: %s wg_idx=%d ep=%s:%u key=%02x%02x%02x%02x",
+                         p->hostname, p->wg_peer_index,
+                         ip_addr_isany(&cur_ip) ? "DERP" : ipaddr_ntoa(&cur_ip),
+                         cur_port,
+                         wp->public_key[0], wp->public_key[1],
+                         wp->public_key[2], wp->public_key[3]);
+            }
         }
     }
     return up;

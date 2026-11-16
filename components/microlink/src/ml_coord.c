@@ -2402,7 +2402,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     }
     free(h2_buf);
 
-    ESP_LOGI(TAG, "Endpoint update sent on H2 stream %lu", (unsigned long)sid);
+    ESP_LOGD(TAG, "Endpoint update sent on H2 stream %lu", (unsigned long)sid);
     /* Response body is discarded — server may send empty response or
      * we'll consume it in the next poll_map_update() iteration.
      * Only the HTTP status code matters (200 = success). */
@@ -2951,7 +2951,7 @@ void ml_coord_task(void *arg) {
                                 ml->stun_public_port = port6;
                             }
                             ml->stun_retry_count = 0;  /* Got a result, stop retrying */
-                            ESP_LOGI(TAG, "STUN IPv6 result obtained, port %u", port6);
+                            ESP_LOGD(TAG, "STUN IPv6 result obtained, port %u", port6);
                             /* Trigger NAT type check if not done yet */
                             if (!ml->stun_nat_checked && ml->stun_fallback_ip) {
                                 ml_stun_send_probe_to(ml, ml->stun_fallback_ip,
