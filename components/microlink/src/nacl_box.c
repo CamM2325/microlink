@@ -110,7 +110,7 @@ static void hsalsa20(uint8_t *out, const uint8_t *nonce, const uint8_t *key) {
     int i;
 
     /* sigma = "expand 32-byte k" */
-    static const uint8_t sigma[16] = "expand 32-byte k";
+    static const uint8_t sigma[16] __attribute__((nonstring)) = "expand 32-byte k";
 
     x[0]  = load32_le(sigma);
     x[5]  = load32_le(sigma + 4);
@@ -191,7 +191,7 @@ static void xsalsa20(uint8_t *out, const uint8_t *in, size_t len,
     hsalsa20(subkey, nonce, key);
 
     /* sigma = "expand 32-byte k" */
-    static const uint8_t sigma[16] = "expand 32-byte k";
+    static const uint8_t sigma[16] __attribute__((nonstring)) = "expand 32-byte k";
 
     /* Set up state for Salsa20 with remaining 8 bytes of nonce
      * Salsa20 state layout (16 x 32-bit words):
@@ -422,7 +422,7 @@ static int secretbox(uint8_t *ciphertext,
     uint8_t subkey[32];
     uint8_t block0[64];
     uint8_t state[64];
-    static const uint8_t sigma[16] = "expand 32-byte k";
+    static const uint8_t sigma[16] __attribute__((nonstring)) = "expand 32-byte k";
 
     NACL_LOG_HEX("secretbox key", key, 32);
     NACL_LOG_HEX("secretbox nonce", nonce, 24);
@@ -651,7 +651,7 @@ static int secretbox_open(uint8_t *plaintext,
     uint8_t block0[64];
     uint8_t state[64];
     uint8_t computed_mac[16];
-    static const uint8_t sigma[16] = "expand 32-byte k";
+    static const uint8_t sigma[16] __attribute__((nonstring)) = "expand 32-byte k";
 
     if (ciphertext_len < NACL_BOX_MACBYTES) {
         return -1;
