@@ -34,7 +34,9 @@ The crypto routines supplied are:
 - POLY1305 - taken from https://github.com/floodyberry/poly1305-donna
 - CHACHA20POLY1305 - implemented from scratch following description here https://tools.ietf.org/html/rfc7539
 - AEAD_XChaCha20_Poly1305 - implemented from scratch following description here https://tools.ietf.org/id/draft-arciszewski-xchacha-02.html
-- X25519 - taken from STROBE project at https://sourceforge.net/p/strobe, in addition there is a version optimised for Cortex-M0 processors which requires very little stack taken from https://munacl.cryptojedi.org/curve25519-cortexm0.shtml
+- X25519 - taken from STROBE project at https://sourceforge.net/p/strobe
+
+MicroLink note: upstream also ships a Cortex-M0 assembly X25519 (src/crypto/cortex) and a generic platform file (example/wireguard-platform.c). Neither was ever compiled here (the assembly cannot run on Xtensa or RISC-V), so this copy drops them; see https://github.com/smartalock/wireguard-lwip for the originals. The ESP32 platform file is src/wireguard-platform-esp32.c.
 
 # Integrating into your platform
 
