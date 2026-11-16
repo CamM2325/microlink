@@ -408,8 +408,8 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
 
     ESP_LOGI(TAG, "HTTP response received: %d bytes", total);
 
-    /* Verify 101 Switching Protocols */
-    if (strstr((char *)resp, "101") == NULL) {
+    /* Verify 101 Switching Protocols (status line only, not anywhere in the body) */
+    if (strncmp((char *)resp, "HTTP/1.1 101", 12) != 0) {
         ESP_LOGE(TAG, "Noise upgrade rejected: %.200s", resp);
         free(resp);
         return -1;
@@ -433,7 +433,9 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     int body_buf_len = 0;
 
     if (body_len > 0) {
-        body_buf = ml_psram_malloc(body_len);
+        /* The 3-byte header read below may write into this buffer even when
+         * body_len is 1-2 bytes; never allocate less than it may receive. */
+        body_buf = ml_psram_malloc(body_len < 512 ? 512 : body_len);
         if (body_buf) {
             memcpy(body_buf, body_start, body_len);
             body_buf_len = body_len;
@@ -465,6 +467,15 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
 
     if (msg_type != 0x02) {
         ESP_LOGE(TAG, "Unexpected Noise msg type: 0x%02x (expected 0x02)", msg_type);
+        free(body_buf);
+        return -1;
+    }
+
+    /* Noise IK msg2 is exactly the 32-byte ephemeral key + 16-byte tag.
+     * Anything else is not a coordinator we understand - refuse it rather
+     * than decrypting an attacker-chosen length. */
+    if (payload_len != 48) {
+        ESP_LOGE(TAG, "Unexpected Noise msg2 length: %d (expected 48)", payload_len);
         free(body_buf);
         return -1;
     }
