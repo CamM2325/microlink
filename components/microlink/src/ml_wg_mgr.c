@@ -597,6 +597,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->best_ip = 0;
     p->best_port = 0;
     p->wg_peer_index = -1;
+    p->last_hs_kick_ms = 0;
 
     char ip_str[16];
     microlink_ip_to_str(update->vpn_ip, ip_str);
@@ -1170,8 +1171,22 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                      * seconds, see wireguard.h), a plain wireguardif_connect()
                      * gets real, bounded retries instead of exactly one
                      * unretried shot. */
-                    wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-                    ESP_LOGI(TAG, "WG handshake initiated to %s (direct path discovered)", p->hostname);
+                    /* [triage fixup] Without a gate this runs on EVERY direct
+                     * pong (heartbeat = 3 s) while there is no session, and
+                     * wireguardif_connect() resets handshake_attempts, so the
+                     * new MAX_TIMER_HANDSHAKES cap never fires: a peer that
+                     * answers DISCO but not WG gets an initiation every ~3 s
+                     * forever. Only kick when wireguard_lwip isn't already
+                     * retrying, and at most once per REKEY_ATTEMPT_TIME. */
+                    struct wireguard_device *dev = (struct wireguard_device *)netif->state;
+                    bool retrying = dev && p->wg_peer_index < WIREGUARD_MAX_PEERS &&
+                                    dev->peers[p->wg_peer_index].active;
+                    if (!retrying && (p->last_hs_kick_ms == 0 ||
+                                      now - p->last_hs_kick_ms >= (uint64_t)REKEY_ATTEMPT_TIME * 1000)) {
+                        p->last_hs_kick_ms = now;
+                        wireguardif_connect(netif, (u8_t)p->wg_peer_index);
+                        ESP_LOGI(TAG, "WG handshake initiated to %s (direct path discovered)", p->hostname);
+                    }
                 }
             }
         }

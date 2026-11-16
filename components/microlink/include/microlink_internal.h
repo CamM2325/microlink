@@ -305,6 +305,11 @@ typedef struct {
 
     /* WireGuard peer index in wireguard-lwip */
     int wg_peer_index;
+
+    /* [triage fixup for #39] last time a direct DISCO pong kicked a WG
+     * handshake for a peer without a session (rate limit, see
+     * process_disco_pong). */
+    uint64_t last_hs_kick_ms;
 } ml_peer_t;
 
 /* ============================================================================
