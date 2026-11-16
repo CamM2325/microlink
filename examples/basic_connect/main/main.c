@@ -240,6 +240,9 @@ static bool lifecycle_test(const microlink_config_t *config) {
     size_t base_int = 0, base_ps = 0;
 
     ESP_LOGI(TAG, "LIFECYCLE: starting %d stop/start cycles", total);
+    /* Per-step free-heap trace inside microlink_stop() and the task exits.
+     * Only printed when built with CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y. */
+    esp_log_level_set("ml_heap", ESP_LOG_DEBUG);
 
     for (int c = 1; c <= total; c++) {
         int variant = (c - 1) % 3;   /* 0 = connected, 1 = mid-connect, 2 = destroy */
@@ -289,6 +292,7 @@ static bool lifecycle_test(const microlink_config_t *config) {
             ESP_LOGE(TAG, "LIFECYCLE %d/%d: FAIL start -> %s", c, total, esp_err_to_name(err));
             return false;
         }
+        log_heap("started", c, total);
     }
 
     if (!wait_connected(120)) {

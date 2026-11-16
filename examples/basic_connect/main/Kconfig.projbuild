@@ -22,6 +22,8 @@ menu "Example Configuration"
               - stop + microlink_destroy() + microlink_init() + start
             Each cycle logs "LIFECYCLE n/N" lines with the stop duration and
             free heap; the run ends with "LIFECYCLE RESULT: PASS" or "FAIL".
+            Also set CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y to get an "ml_heap"
+            line with the free internal RAM after each teardown step.
             Leave at 0 for normal use.
 
 endmenu
