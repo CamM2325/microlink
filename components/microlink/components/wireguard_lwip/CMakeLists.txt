@@ -23,6 +23,11 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     WIREGUARD_CRYPTO_REFC=1
 )
 
+# Follow microlink's CONFIG_ML_LOG_LEVEL_* (see components/microlink/Kconfig)
+if(CONFIG_ML_LOG_LEVEL AND NOT CONFIG_ML_LOG_LEVEL_DEFAULT)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE LOG_LOCAL_LEVEL=${CONFIG_ML_LOG_LEVEL})
+endif()
+
 # Disable stringop-overread warning for x25519.c (false positive in GCC array bounds check)
 set_source_files_properties(
     src/crypto/refc/x25519.c

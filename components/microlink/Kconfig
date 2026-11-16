@@ -157,6 +157,50 @@ menu "MicroLink V2 Configuration"
             anything and can be called again, and microlink_destroy() defers
             the free until the task has exited.
 
+    choice ML_LOG_LEVEL_CHOICE
+        prompt "MicroLink log verbosity (compile time)"
+        default ML_LOG_LEVEL_DEFAULT
+        help
+            Highest level of MicroLink's own log messages (the microlink and
+            wireguard_lwip components) that is compiled into the firmware.
+            Messages above it are removed by the compiler together with their
+            strings. ESP-IDF's own log levels are not changed.
+
+            - Same as ESP-IDF: follow CONFIG_LOG_MAXIMUM_LEVEL (normally the
+              default log level, INFO in the examples).
+            - Warning: drop all INFO messages; saves roughly 17-23 KB of flash
+              in the examples.
+            - Info: state changes (connected, peers added/removed, DERP up/down,
+              path switched) even if ESP-IDF itself is built quieter.
+            - Debug / Verbose: also compile in per-packet and periodic messages
+              (Verbose adds the per-packet WireGuard trace, tag "wg"). They are
+              still filtered at run time by each tag's level, which starts at
+              CONFIG_LOG_DEFAULT_LEVEL, so also call for example
+              esp_log_level_set("ml_wg_mgr", ESP_LOG_DEBUG).
+
+        config ML_LOG_LEVEL_DEFAULT
+            bool "Same as ESP-IDF"
+        config ML_LOG_LEVEL_WARN
+            bool "Warning"
+        config ML_LOG_LEVEL_INFO
+            bool "Info"
+        config ML_LOG_LEVEL_DEBUG
+            bool "Debug"
+        config ML_LOG_LEVEL_VERBOSE
+            bool "Verbose"
+    endchoice
+
+    config ML_LOG_LEVEL
+        int
+        default 2 if ML_LOG_LEVEL_WARN
+        default 3 if ML_LOG_LEVEL_INFO
+        default 4 if ML_LOG_LEVEL_DEBUG
+        default 5 if ML_LOG_LEVEL_VERBOSE
+        default 3
+        help
+            esp_log_level_t value used as LOG_LOCAL_LEVEL for MicroLink's
+            sources. Not used with ML_LOG_LEVEL_DEFAULT.
+
     menu "Cellular Modem"
 
         config ML_ENABLE_CELLULAR

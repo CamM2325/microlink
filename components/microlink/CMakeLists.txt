@@ -55,6 +55,12 @@ idf_component_register(
         wireguard_lwip
 )
 
+# CONFIG_ML_LOG_LEVEL_*: compile MicroLink's logs at their own level. A -D is
+# seen before any esp_log.h include, unlike a #define in the sources.
+if(CONFIG_ML_LOG_LEVEL AND NOT CONFIG_ML_LOG_LEVEL_DEFAULT)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE LOG_LOCAL_LEVEL=${CONFIG_ML_LOG_LEVEL})
+endif()
+
 # DISCO crypto_box (XSalsa20-Poly1305) runs on every DISCO packet: -O2 like
 # the wireguard_lwip crypto (see that CMakeLists).
 if(NOT CONFIG_COMPILER_OPTIMIZATION_NONE)

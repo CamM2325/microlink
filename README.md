@@ -203,6 +203,7 @@ override the Kconfig defaults at runtime.
 | `ML_ZERO_COPY_WG` | n | High-throughput receive path on a raw lwIP PCB (contributed by dj-oyu). |
 | `ML_UDP_RX_TASK_PRIO` | 7 | UDP callback task priority. |
 | `ML_STOP_TIMEOUT_MS` | 30000 | How long `microlink_stop()` waits. |
+| MicroLink log verbosity | Same as ESP-IDF | Compile-time level for MicroLink's own logs (`ML_LOG_LEVEL_WARN` / `_INFO` / `_DEBUG` / `_VERBOSE`). Warning saves about 17–23 KB of flash. Debug/Verbose messages also need `esp_log_level_set("<tag>", ...)` at run time. |
 | **Credentials** | | `ML_WIFI_SSID`, `ML_WIFI_PASSWORD`, `ML_TAILSCALE_AUTH_KEY`, `ML_DEVICE_NAME` (compiled into the image). |
 | **Control Plane** | | `ML_CTRL_HOST`, `ML_CTRL_TLS`, `ML_CTRL_TLS_VERIFY_CERT` (y), `ML_CTRL_NOISE_PUBKEY_HEX`. |
 | **Cellular Modem** | | `ML_ENABLE_CELLULAR`, board preset, pins, `ML_CELLULAR_APN`, `ML_CELLULAR_SIM_PIN`, `ML_CELLULAR_PPP_USER/PASS`, data mode, `ML_CELLULAR_FAST_BAUD` (0). |
