@@ -384,25 +384,31 @@ menu "MicroLink V2 Configuration"
             int "WiFi connect timeout (ms)"
             depends on ML_ENABLE_NET_SWITCH
             default 30000
+            range 1000 600000
             help
                 How long to wait for WiFi connection before falling back
-                to cellular.
+                to cellular. Used when ml_net_switch_config_t.wifi_timeout_ms
+                is 0.
 
         config ML_NET_SWITCH_HEALTH_INTERVAL_MS
             int "Health check interval (ms)"
             depends on ML_ENABLE_NET_SWITCH
             default 30000
+            range 1000 3600000
             help
                 Interval between health checks when connected.
                 After 3 consecutive failures, triggers network switch.
+                Used when ml_net_switch_config_t.health_check_interval_ms is 0.
 
         config ML_NET_SWITCH_FAILBACK_MS
             int "WiFi failback check interval (ms)"
             depends on ML_ENABLE_NET_SWITCH
             default 120000
+            range 0 3600000
             help
                 When on cellular, how often to check if WiFi has recovered.
-                Set to 0 to disable automatic failback.
+                Set to 0 to disable automatic failback. Used when
+                ml_net_switch_config_t.failback_check_ms is 0.
 
     endmenu
 

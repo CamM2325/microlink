@@ -207,7 +207,7 @@ override the Kconfig defaults at runtime.
 | **Credentials** | | `ML_WIFI_SSID`, `ML_WIFI_PASSWORD`, `ML_TAILSCALE_AUTH_KEY`, `ML_DEVICE_NAME` (compiled into the image). |
 | **Control Plane** | | `ML_CTRL_HOST`, `ML_CTRL_TLS`, `ML_CTRL_TLS_VERIFY_CERT` (y), `ML_CTRL_NOISE_PUBKEY_HEX`. |
 | **Cellular Modem** | | `ML_ENABLE_CELLULAR`, board preset, pins, `ML_CELLULAR_APN`, `ML_CELLULAR_SIM_PIN`, `ML_CELLULAR_PPP_USER/PASS`, data mode, `ML_CELLULAR_FAST_BAUD` (0). |
-| **Network Switching** | | `ML_ENABLE_NET_SWITCH` (timing is set in `ml_net_switch_config_t`). |
+| **Network Switching** | | `ML_ENABLE_NET_SWITCH`, `ML_NET_SWITCH_WIFI_TIMEOUT_MS` (30000), `ML_NET_SWITCH_HEALTH_INTERVAL_MS` (30000), `ML_NET_SWITCH_FAILBACK_MS` (120000, 0 = no failback): defaults for the `ml_net_switch_config_t` timing fields left at 0. |
 | **HTTP Config Server** | | `ML_ENABLE_CONFIG_HTTPD` (n), `ML_CONFIG_HTTPD_PASSWORD`, `ML_CONFIG_HTTPD_ALLOW_LAN` (n), `ML_CONFIG_MAX_ALLOWED_PEERS`. |
 
 APN, SIM PIN, PPP credentials and the control host are validated; invalid values are rejected at
