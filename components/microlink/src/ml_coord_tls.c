@@ -59,12 +59,15 @@ int ml_coord_tls_handshake(microlink_t *ml, const char *hostname) {
 
     mbedtls_ssl_init(&t->ssl);
     mbedtls_ssl_config_init(&t->ssl_conf);
+    int ret;
+#if ML_TLS_LEGACY_RNG
     mbedtls_entropy_init(&t->entropy);
     mbedtls_ctr_drbg_init(&t->ctr_drbg);
 
-    int ret = mbedtls_ctr_drbg_seed(&t->ctr_drbg, mbedtls_entropy_func,
-                                     &t->entropy, NULL, 0);
+    ret = mbedtls_ctr_drbg_seed(&t->ctr_drbg, mbedtls_entropy_func,
+                                &t->entropy, NULL, 0);
     if (ret != 0) goto fail;
+#endif
 
     ret = mbedtls_ssl_config_defaults(&t->ssl_conf,
                                        MBEDTLS_SSL_IS_CLIENT,
@@ -79,7 +82,9 @@ int ml_coord_tls_handshake(microlink_t *ml, const char *hostname) {
 #else
     mbedtls_ssl_conf_authmode(&t->ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
 #endif
+#if ML_TLS_LEGACY_RNG
     mbedtls_ssl_conf_rng(&t->ssl_conf, mbedtls_ctr_drbg_random, &t->ctr_drbg);
+#endif
 
     ret = mbedtls_ssl_setup(&t->ssl, &t->ssl_conf);
     if (ret != 0) goto fail;
@@ -157,8 +162,10 @@ void ml_coord_tls_free(microlink_t *ml) {
     ml_coord_tls_t *t = &ml->coord_tls;
     mbedtls_ssl_free(&t->ssl);
     mbedtls_ssl_config_free(&t->ssl_conf);
+#if ML_TLS_LEGACY_RNG
     mbedtls_ctr_drbg_free(&t->ctr_drbg);
     mbedtls_entropy_free(&t->entropy);
+#endif
     t->sockfd = -1;
     t->active = false;
 }

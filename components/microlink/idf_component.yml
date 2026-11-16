@@ -1,0 +1,8 @@
+## IDF Component Manager manifest for microlink
+dependencies:
+  idf: ">=5.3"
+  # ESP-IDF 6 dropped its built-in `json` component; ESP-IDF 5 keeps it.
+  espressif/cjson:
+    version: "^1.7.19"
+    rules:
+      - if: "idf_version >=6.0"

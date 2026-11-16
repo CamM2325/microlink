@@ -24,8 +24,17 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "mbedtls/ssl.h"
+/* mbedTLS 4 (ESP-IDF 6) draws TLS randomness from PSA (ESP-IDF calls
+ * psa_crypto_init() at startup), removed mbedtls_ssl_conf_rng() and made the
+ * entropy and CTR-DRBG modules private. mbedTLS 3 (ESP-IDF 5) still needs an
+ * explicit CTR-DRBG as the TLS RNG. */
+#if MBEDTLS_VERSION_MAJOR < 4
+#define ML_TLS_LEGACY_RNG 1
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
+#else
+#define ML_TLS_LEGACY_RNG 0
+#endif
 #include "esp_heap_caps.h"
 
 #ifdef CONFIG_ML_ZERO_COPY_WG
@@ -389,8 +398,10 @@ typedef struct {
     int sockfd;                     /* Raw TCP socket */
     mbedtls_ssl_context ssl;        /* TLS context (owned exclusively by DERP I/O task) */
     mbedtls_ssl_config ssl_conf;
+#if ML_TLS_LEGACY_RNG
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
+#endif
     bool connected;
     uint64_t last_recv_ms;          /* For keepalive watchdog */
 } ml_derp_conn_t;
@@ -402,8 +413,10 @@ typedef struct {
 typedef struct {
     mbedtls_ssl_context ssl;        /* Owned exclusively by coord task */
     mbedtls_ssl_config ssl_conf;
+#if ML_TLS_LEGACY_RNG
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
+#endif
     int sockfd;                     /* Copy of coord_sock for the BIO callbacks */
     bool active;                    /* TLS session established */
 } ml_coord_tls_t;
