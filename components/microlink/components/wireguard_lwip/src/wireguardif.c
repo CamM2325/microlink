@@ -125,13 +125,6 @@ static void wireguardif_mark_link_down(struct netif *netif) {
 	tcpip_callback(netif_set_link_down_in_tcpip, netif);
 }
 
-bool wireguardif_is_wireguard_packet(const uint8_t *data, size_t len) {
-	if (len < 4) return false;
-	// WireGuard message types are 1-4 in the first 32-bit LE word
-	uint32_t type = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
-	return (type >= 1 && type <= 4);
-}
-
 
 static void update_peer_addr(struct wireguard_peer *peer, const ip_addr_t *addr, u16_t port) {
 	// Don't overwrite a valid endpoint with 0.0.0.0 (DERP-injected packets have no real source)
@@ -967,21 +960,6 @@ err_t wireguardif_connect(struct netif *netif, u8_t peer_index) {
 	return result;
 }
 
-err_t wireguardif_disconnect(struct netif *netif, u8_t peer_index) {
-	struct wireguard_peer *peer;
-	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
-	if (result == ERR_OK) {
-		// Set the flag that we want to try connecting
-		peer->active = false;
-		// Wipe out current keys
-		keypair_destroy(&peer->next_keypair);
-		keypair_destroy(&peer->curr_keypair);
-		keypair_destroy(&peer->prev_keypair);
-		result = ERR_OK;
-	}
-	return result;
-}
-
 err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *current_ip, u16_t *current_port) {
 	struct wireguard_peer *peer;
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
@@ -1495,39 +1473,4 @@ err_t wireguardif_connect_derp(struct netif *netif, u8_t peer_index) {
 		result = ERR_OK;
 	}
 	return result;
-}
-
-err_t wireguardif_inject_packet(struct netif *netif, uint32_t src_ip, uint16_t src_port,
-                                 const uint8_t *data, size_t len) {
-	if (!netif || !netif->state || !data || len == 0) {
-		return ERR_ARG;
-	}
-
-	struct wireguard_device *device = (struct wireguard_device *)netif->state;
-
-	// Allocate a pbuf for the data
-	struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
-	if (!p) {
-		return ERR_MEM;
-	}
-
-	// Copy data into pbuf
-	memcpy(p->payload, data, len);
-
-	// Build IP address from src_ip (network byte order)
-	ip_addr_t addr;
-	if (src_ip == 0) {
-		// DERP packet - use any address
-		ip_addr_set_any(false, &addr);
-	} else {
-		// Direct packet - src_ip is already in network byte order
-		// Use ip_addr_set_ip4_u32_val which expects network byte order
-		IP_SET_TYPE_VAL(addr, IPADDR_TYPE_V4);
-		ip4_addr_set_u32(ip_2_ip4(&addr), src_ip);
-	}
-
-	// Call the network RX handler (which will free the pbuf)
-	wireguardif_network_rx(device, NULL, p, &addr, src_port);
-
-	return ERR_OK;
 }

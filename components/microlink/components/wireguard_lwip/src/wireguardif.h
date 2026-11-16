@@ -125,9 +125,6 @@ err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip
 // Try and connect to the given peer
 err_t wireguardif_connect(struct netif *netif, u8_t peer_index);
 
-// Stop trying to connect to the given peer
-err_t wireguardif_disconnect(struct netif *netif, u8_t peer_index);
-
 // Is the given peer "up"? A peer is up if it has a valid session key it can communicate with
 err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *current_ip, u16_t *current_port);
 
@@ -141,20 +138,6 @@ void wireguardif_set_derp_output(struct netif *netif, wireguard_derp_output_fn f
 // Use this for peers where connect() would fail due to no direct endpoint
 // The handshake will be routed through the DERP callback if set
 err_t wireguardif_connect_derp(struct netif *netif, u8_t peer_index);
-
-// Inject a received packet into the WireGuard interface (for magicsock demux)
-// This allows an external unified socket to receive all packets and route
-// WireGuard packets to this interface. The packet data is copied internally.
-// src_ip: source IP in network byte order (0 for DERP)
-// src_port: source port in host byte order
-// data: raw packet data
-// len: packet length
-err_t wireguardif_inject_packet(struct netif *netif, uint32_t src_ip, uint16_t src_port,
-                                 const uint8_t *data, size_t len);
-
-// Check if packet looks like a WireGuard packet (type 1-4)
-// Returns true if this appears to be a WireGuard packet
-bool wireguardif_is_wireguard_packet(const uint8_t *data, size_t len);
 
 // Shutdown WireGuard interface - cancels all timers before freeing resources
 // MUST be called before netif_remove/mem_free to prevent use-after-free in wireguardif_tmr
@@ -175,7 +158,7 @@ void wireguardif_periodic(struct netif *netif);
 
 // Disable WireGuard's internal UDP socket binding
 // Call before wireguardif_init to prevent WireGuard from binding its own socket.
-// The caller is then responsible for receiving packets and calling wireguardif_inject_packet.
+// The caller is then responsible for receiving packets and calling wireguardif_network_rx.
 void wireguardif_disable_socket_bind(void);
 
 // Set the UDP output callback for magicsock mode

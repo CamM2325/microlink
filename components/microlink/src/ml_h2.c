@@ -86,23 +86,6 @@ static int hpack_literal_indexed(uint8_t *out, int name_index,
     return pos;
 }
 
-/* HPACK literal header without indexing, new name */
-static int hpack_literal_new(uint8_t *out, const char *name, const char *value) {
-    int pos = 0;
-    out[pos++] = 0x00;  /* Literal without indexing, new name */
-
-    size_t nlen = strlen(name);
-    out[pos++] = (uint8_t)nlen;
-    memcpy(out + pos, name, nlen);
-    pos += nlen;
-
-    size_t vlen = strlen(value);
-    out[pos++] = (uint8_t)vlen;
-    memcpy(out + pos, value, vlen);
-    pos += vlen;
-    return pos;
-}
-
 /* Well-known HPACK static table indices */
 #define HPACK_METHOD_POST   3
 #define HPACK_METHOD_GET    2
