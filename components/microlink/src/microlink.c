@@ -12,6 +12,7 @@
 #include "esp_timer.h"
 #include "esp_mac.h"
 #include "esp_wifi.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
@@ -159,6 +160,240 @@ esp_err_t microlink_factory_reset(void) {
 }
 
 /* ============================================================================
+ * Task Lifecycle
+ *
+ * The four worker tasks (net_io, derp_tx, coord, wg_mgr) hold a raw pointer
+ * to the context for their whole life. ml->tasks_alive has one bit per task:
+ * microlink_start() sets it before creating the task, and the task clears it
+ * in ml_task_exit() as its last access to the context. microlink_stop() waits
+ * for the mask to reach zero instead of sleeping a fixed time, and nothing
+ * that a task can still reach is freed while its bit is set.
+ *
+ * A context whose tasks did not exit within CONFIG_ML_STOP_TIMEOUT_MS (a task
+ * stuck in getaddrinfo() or a TCP connect, which cannot be interrupted) is
+ * not freed by microlink_destroy(); it is parked and released by a later
+ * microlink_init()/microlink_destroy() once the task is gone.
+ *
+ * Approach from fugo101 6a7d8c5 (task-liveness bitmask, orphan parking).
+ * ========================================================================== */
+
+#ifndef CONFIG_ML_STOP_TIMEOUT_MS
+#define CONFIG_ML_STOP_TIMEOUT_MS 30000
+#endif
+
+/* Time the tasks get to notice the shutdown bit on their own before stop
+ * shuts down their sockets to unblock reads. */
+#define ML_STOP_GRACE_MS    1000
+#define ML_JOIN_POLL_MS     20
+
+/* Every bit a FreeRTOS event group can hold (24 with 32-bit ticks). */
+#define ML_EVT_ALL_BITS     0x00FFFFFFu
+
+/* Contexts whose free had to be deferred. */
+#define ML_MAX_ORPHANS      4
+static microlink_t *s_orphans[ML_MAX_ORPHANS];
+static portMUX_TYPE s_orphan_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* Contexts allocated and not yet freed (including parked ones). The peer
+ * NVS cache is process-wide and is closed when the last one goes. */
+static int s_live_contexts;
+
+uint32_t ml_tasks_alive(const microlink_t *ml) {
+    if (!ml) return 0;
+    return __atomic_load_n(&ml->tasks_alive, __ATOMIC_ACQUIRE);
+}
+
+bool ml_shutdown_requested(const microlink_t *ml) {
+    if (!ml || !ml->events) return true;
+    return (xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST) != 0;
+}
+
+void ml_task_exit(microlink_t *ml, uint32_t task_bit) {
+    if (ml) {
+        if (task_bit & ML_TASK_BIT_NET_IO)  ml->net_io_task = NULL;
+        if (task_bit & ML_TASK_BIT_DERP_TX) ml->derp_tx_task = NULL;
+        if (task_bit & ML_TASK_BIT_COORD)   ml->coord_task = NULL;
+        if (task_bit & ML_TASK_BIT_WG_MGR)  ml->wg_mgr_task = NULL;
+        /* From here on ml may be freed by another task at any moment. */
+        __atomic_fetch_and(&ml->tasks_alive, ~task_bit, __ATOMIC_RELEASE);
+    }
+    vTaskDelete(NULL);
+    for (;;) { vTaskDelay(portMAX_DELAY); }  /* not reached */
+}
+
+static void ml_describe_tasks(uint32_t mask, char *out, size_t out_len) {
+    snprintf(out, out_len, "%s%s%s%s",
+             (mask & ML_TASK_BIT_NET_IO)  ? " net_io"  : "",
+             (mask & ML_TASK_BIT_DERP_TX) ? " derp_tx" : "",
+             (mask & ML_TASK_BIT_COORD)   ? " coord"   : "",
+             (mask & ML_TASK_BIT_WG_MGR)  ? " wg_mgr"  : "");
+}
+
+/* Wait until every task has exited or timeout_ms passes. Returns the mask of
+ * tasks still running. */
+static uint32_t ml_join_tasks(const microlink_t *ml, uint32_t timeout_ms) {
+    uint32_t waited = 0;
+    uint32_t alive;
+    while ((alive = ml_tasks_alive(ml)) != 0 && waited < timeout_ms) {
+        vTaskDelay(pdMS_TO_TICKS(ML_JOIN_POLL_MS));
+        waited += ML_JOIN_POLL_MS;
+    }
+    return alive;
+}
+
+/* shutdown() a task's TCP socket so a recv()/send() blocked in it returns at
+ * once instead of after its SO_RCVTIMEO (up to 60 s for a MapResponse). The
+ * owning task still closes the descriptor itself. AT-bridge descriptors are
+ * not lwIP sockets; those tasks are left to their own timeouts. */
+static void ml_unblock_socket(int fd) {
+    if (fd < 0 || ml_at_socket_is_at_fd(fd)) return;
+    shutdown(fd, SHUT_RDWR);
+}
+
+/* Free every packet buffer still sitting in the queues. Each item owns heap
+ * memory that vQueueDelete()/xQueueReset() would otherwise drop. Precondition:
+ * no task is running. */
+static void ml_drain_queues(microlink_t *ml) {
+    int dropped = 0;
+    ml_rx_packet_t pkt;
+    QueueHandle_t rxq[] = { ml->disco_rx_queue, ml->wg_rx_queue, ml->stun_rx_queue };
+    for (size_t i = 0; i < sizeof(rxq) / sizeof(rxq[0]); i++) {
+        if (!rxq[i]) continue;
+        while (xQueueReceive(rxq[i], &pkt, 0) == pdTRUE) { free(pkt.data); dropped++; }
+    }
+    if (ml->derp_tx_queue) {
+        ml_derp_tx_item_t item;
+        while (xQueueReceive(ml->derp_tx_queue, &item, 0) == pdTRUE) { free(item.data); dropped++; }
+    }
+    if (ml->peer_update_queue) {
+        ml_peer_update_t *upd;
+        while (xQueueReceive(ml->peer_update_queue, &upd, 0) == pdTRUE) { free(upd); dropped++; }
+    }
+    if (ml->coord_cmd_queue) xQueueReset(ml->coord_cmd_queue);
+    if (dropped) ESP_LOGI(TAG, "Freed %d queued buffers", dropped);
+}
+
+/* Release what one start/stop run owns and reset per-run state so the next
+ * microlink_start() begins clean. Precondition: no task is running. */
+static void ml_release_run_resources(microlink_t *ml) {
+#ifdef CONFIG_ML_ZERO_COPY_WG
+    ml_zerocopy_deinit(ml);
+#endif
+    if (ml->disco_sock4 >= 0) { ml_close_sock(ml->disco_sock4); ml->disco_sock4 = -1; }
+    if (ml->disco_sock6 >= 0) { ml_close_sock(ml->disco_sock6); ml->disco_sock6 = -1; }
+    if (ml->stun_sock >= 0)   { ml_close_sock(ml->stun_sock);   ml->stun_sock = -1; }
+    if (ml->stun_sock6 >= 0)  { ml_close_sock(ml->stun_sock6);  ml->stun_sock6 = -1; }
+    /* coord and derp_tx close their own connections on exit (coord_close_conn,
+     * ml_derp_disconnect); these only catch a task that never ran. */
+    if (ml->coord_sock >= 0)  { ml_close_sock(ml->coord_sock);  ml->coord_sock = -1; }
+    if (ml->derp.sockfd >= 0) { ml_derp_disconnect(ml); }
+
+    if (ml->wg_netif) {
+        /* wg_mgr removes and frees the netif on exit; if it is still here
+         * the tcpip_thread could not be reached, and freeing it now could
+         * crash that thread. Leak it rather than risk that. */
+        ESP_LOGE(TAG, "WireGuard netif still attached after stop; leaking it");
+        ml->wg_netif = NULL;
+    }
+
+    ml_drain_queues(ml);
+
+    /* Peer table: wg_peer_index values refer to the WireGuard device that
+     * wg_mgr just freed, and wg_mgr only overwrites the table on the next
+     * start when the NVS cache is non-empty. */
+    memset(ml->peers, 0, sizeof(ml->peers));
+    ml->peer_count = 0;
+    ml->vpn_ip = 0;
+    ml->derp.connected = false;
+    ml->disco_local_port = 0;
+    ml->stun_public_ip = 0;
+    ml->stun_public_port = 0;
+    memset(ml->stun_public_ip6, 0, sizeof(ml->stun_public_ip6));
+    ml->stun_public_port6 = 0;
+    ml->stun_has_ipv6 = false;
+    ml->stun_secondary_port = 0;
+    ml->stun_nat_checked = false;
+    ml->nat_mapping_varies = false;
+
+    if (ml->events) xEventGroupClearBits(ml->events, ML_EVT_ALL_BITS);
+}
+
+/* Free the context. Precondition: no task is running. */
+static void ml_release(microlink_t *ml) {
+    if (ml->config_httpd) {
+        ml_config_httpd_deinit(ml->config_httpd);
+        ml->config_httpd = NULL;
+    }
+
+    ml_release_run_resources(ml);
+
+    if (ml->derp_tx_queue)     { vQueueDelete(ml->derp_tx_queue);     ml->derp_tx_queue = NULL; }
+    if (ml->disco_rx_queue)    { vQueueDelete(ml->disco_rx_queue);    ml->disco_rx_queue = NULL; }
+    if (ml->wg_rx_queue)       { vQueueDelete(ml->wg_rx_queue);       ml->wg_rx_queue = NULL; }
+    if (ml->stun_rx_queue)     { vQueueDelete(ml->stun_rx_queue);     ml->stun_rx_queue = NULL; }
+    if (ml->coord_cmd_queue)   { vQueueDelete(ml->coord_cmd_queue);   ml->coord_cmd_queue = NULL; }
+    if (ml->peer_update_queue) { vQueueDelete(ml->peer_update_queue); ml->peer_update_queue = NULL; }
+    if (ml->events)            { vEventGroupDelete(ml->events);       ml->events = NULL; }
+
+    /* Clear keys from memory */
+    memset(ml->machine_private_key, 0, 32);
+    memset(ml->wg_private_key, 0, 32);
+    memset(ml->disco_private_key, 0, 32);
+
+    free(ml);
+
+    bool last;
+    portENTER_CRITICAL(&s_orphan_mux);
+    last = (--s_live_contexts <= 0);
+    if (s_live_contexts < 0) s_live_contexts = 0;
+    portEXIT_CRITICAL(&s_orphan_mux);
+    if (last) ml_peer_nvs_deinit();
+
+    ESP_LOGI(TAG, "Destroyed");
+}
+
+static void ml_orphan_park(microlink_t *ml) {
+    int slot = -1;
+    portENTER_CRITICAL(&s_orphan_mux);
+    for (int i = 0; i < ML_MAX_ORPHANS; i++) {
+        if (!s_orphans[i]) { s_orphans[i] = ml; slot = i; break; }
+    }
+    portEXIT_CRITICAL(&s_orphan_mux);
+
+    if (slot < 0) {
+        /* Several teardowns in a row left tasks behind. A permanent leak is
+         * still better than a use-after-free. */
+        ESP_LOGE(TAG, "Orphan table full; context %p leaked", ml);
+    } else {
+        ESP_LOGW(TAG, "Context %p parked until its tasks exit (slot %d)", ml, slot);
+    }
+}
+
+static void ml_reap_orphans(void) {
+    for (int i = 0; i < ML_MAX_ORPHANS; i++) {
+        microlink_t *ripe = NULL;
+        portENTER_CRITICAL(&s_orphan_mux);
+        if (s_orphans[i] && ml_tasks_alive(s_orphans[i]) == 0) {
+            ripe = s_orphans[i];
+            s_orphans[i] = NULL;
+        }
+        portEXIT_CRITICAL(&s_orphan_mux);
+        if (ripe) {
+            ESP_LOGW(TAG, "Freeing parked context %p (its tasks have exited)", ripe);
+            ml_release(ripe);
+        }
+    }
+}
+
+/* True when called from one of this context's own worker tasks (e.g. from a
+ * state callback). Such a caller can never see itself exit. */
+static bool ml_called_from_worker(const microlink_t *ml) {
+    TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    return self == ml->net_io_task || self == ml->derp_tx_task ||
+           self == ml->coord_task || self == ml->wg_mgr_task;
+}
+
+/* ============================================================================
  * Public API
  * ========================================================================== */
 
@@ -167,6 +402,9 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         ESP_LOGE(TAG, "Invalid config: auth_key required");
         return NULL;
     }
+
+    /* Free any earlier context whose tasks have exited since its destroy */
+    ml_reap_orphans();
 
     /* Route cJSON to PSRAM */
     cJSON_Hooks hooks = {
@@ -224,6 +462,11 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         free(ml);
         return NULL;
     }
+
+    /* From here on, failures go through ml_release(), which undoes this. */
+    portENTER_CRITICAL(&s_orphan_mux);
+    s_live_contexts++;
+    portEXIT_CRITICAL(&s_orphan_mux);
 
     /* Initialize peer NVS cache */
     ml_peer_nvs_init();
@@ -295,7 +538,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->events = xEventGroupCreate();
     if (!ml->events) {
         ESP_LOGE(TAG, "Failed to create event group");
-        free(ml);
+        ml_release(ml);
         return NULL;
     }
 
@@ -310,7 +553,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     if (!ml->derp_tx_queue || !ml->disco_rx_queue || !ml->wg_rx_queue ||
         !ml->stun_rx_queue || !ml->coord_cmd_queue || !ml->peer_update_queue) {
         ESP_LOGE(TAG, "Failed to create queues");
-        microlink_destroy(ml);
+        ml_release(ml);
         return NULL;
     }
 
@@ -320,11 +563,26 @@ microlink_t *microlink_init(const microlink_config_t *config) {
 
 esp_err_t microlink_start(microlink_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
-    if (ml->state != ML_STATE_IDLE) {
+    uint32_t stragglers = ml_tasks_alive(ml);
+    if (stragglers) {
+        /* A second generation of tasks would share the liveness bits with
+         * the first, and the first to exit would clear the other's bit. */
+        char names[40];
+        ml_describe_tasks(stragglers, names, sizeof(names));
+        ESP_LOGE(TAG, "Cannot start: tasks from the previous run still running:%s "
+                      "(call microlink_stop() again)", names);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (ml->started) {
         ESP_LOGW(TAG, "Already started (state=%d)", ml->state);
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Start from a clean event group: a SHUTDOWN_REQUEST left over from the
+     * previous stop would make every new task exit at once, and stale
+     * COORD_REGISTERED/WG_READY/DERP_* bits would skip startup steps. */
+    xEventGroupClearBits(ml->events, ML_EVT_ALL_BITS);
+    ml->started = true;
     ml->state = ML_STATE_WIFI_WAIT;
 
     /* Set WiFi TX power if configured */
@@ -388,35 +646,39 @@ skip_bsd_socket:
     ;
 #endif
 
-    /* Create tasks */
-    BaseType_t ret;
+    /* Create tasks. Each liveness bit goes up before its create: from the
+     * moment the task exists it may hold the context, and only the task may
+     * clear the bit again. If a create fails, no task exists to clear that
+     * bit, so it is cleared here and the tasks already running are joined
+     * by microlink_stop(). */
+    static const struct {
+        TaskFunction_t fn;
+        const char *name;
+        uint32_t stack;
+        UBaseType_t prio;
+        BaseType_t core;
+        uint32_t bit;
+    } tasks[] = {
+        { ml_net_io_task,  "ml_net_io",  ML_TASK_NET_IO_STACK,  ML_TASK_NET_IO_PRIO,  ML_TASK_NET_IO_CORE,  ML_TASK_BIT_NET_IO },
+        { ml_derp_tx_task, "ml_derp_tx", ML_TASK_DERP_TX_STACK, ML_TASK_DERP_TX_PRIO, ML_TASK_DERP_TX_CORE, ML_TASK_BIT_DERP_TX },
+        { ml_coord_task,   "ml_coord",   ML_TASK_COORD_STACK,   ML_TASK_COORD_PRIO,   ML_TASK_COORD_CORE,   ML_TASK_BIT_COORD },
+        { ml_wg_mgr_task,  "ml_wg_mgr",  ML_TASK_WG_MGR_STACK,  ML_TASK_WG_MGR_PRIO,  ML_TASK_WG_MGR_CORE,  ML_TASK_BIT_WG_MGR },
+    };
+    TaskHandle_t *handles[] = { &ml->net_io_task, &ml->derp_tx_task, &ml->coord_task, &ml->wg_mgr_task };
 
-    ret = xTaskCreatePinnedToCore(ml_net_io_task, "ml_net_io", ML_TASK_NET_IO_STACK,
-                                   ml, ML_TASK_NET_IO_PRIO, &ml->net_io_task, ML_TASK_NET_IO_CORE);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create net_io task");
-        return ESP_FAIL;
-    }
-
-    ret = xTaskCreatePinnedToCore(ml_derp_tx_task, "ml_derp_tx", ML_TASK_DERP_TX_STACK,
-                                   ml, ML_TASK_DERP_TX_PRIO, &ml->derp_tx_task, ML_TASK_DERP_TX_CORE);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create derp_tx task");
-        return ESP_FAIL;
-    }
-
-    ret = xTaskCreatePinnedToCore(ml_coord_task, "ml_coord", ML_TASK_COORD_STACK,
-                                   ml, ML_TASK_COORD_PRIO, &ml->coord_task, ML_TASK_COORD_CORE);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create coord task");
-        return ESP_FAIL;
-    }
-
-    ret = xTaskCreatePinnedToCore(ml_wg_mgr_task, "ml_wg_mgr", ML_TASK_WG_MGR_STACK,
-                                   ml, ML_TASK_WG_MGR_PRIO, &ml->wg_mgr_task, ML_TASK_WG_MGR_CORE);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create wg_mgr task");
-        return ESP_FAIL;
+    for (size_t i = 0; i < sizeof(tasks) / sizeof(tasks[0]); i++) {
+        __atomic_fetch_or(&ml->tasks_alive, tasks[i].bit, __ATOMIC_RELEASE);
+        if (xTaskCreatePinnedToCore(tasks[i].fn, tasks[i].name, tasks[i].stack, ml,
+                                    tasks[i].prio, handles[i], tasks[i].core) != pdPASS) {
+            __atomic_fetch_and(&ml->tasks_alive, ~tasks[i].bit, __ATOMIC_RELEASE);
+            *handles[i] = NULL;
+            ESP_LOGE(TAG, "Failed to create %s task (free internal=%u psram=%u); rolling back",
+                     tasks[i].name,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            microlink_stop(ml);
+            return ESP_FAIL;
+        }
     }
 
     /* WiFi is expected to be connected before microlink_start() is called.
@@ -528,74 +790,85 @@ rebind_wg_update:
 
 esp_err_t microlink_stop(microlink_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
+    if (!ml->events) return ESP_ERR_INVALID_STATE;
+    if (!ml->started && ml_tasks_alive(ml) == 0) return ESP_OK;  /* already stopped */
+    if (ml_called_from_worker(ml)) {
+        ESP_LOGE(TAG, "microlink_stop() called from a MicroLink task (callback?); "
+                      "call it from an application task");
+        return ESP_ERR_INVALID_STATE;
+    }
 
+    int64_t t_start = esp_timer_get_time();
     ESP_LOGI(TAG, "Stopping...");
     xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
 
-    /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST).
-     * Tasks call vTaskDelete(NULL) to self-delete, so we must NOT call
-     * vTaskDelete() on them again — that causes a crash in uxListRemove
-     * because the task's list node is already invalid. Just wait and
-     * NULL the handles. */
-    vTaskDelay(pdMS_TO_TICKS(3000));
-
-    ml->net_io_task = NULL;
-    ml->derp_tx_task = NULL;
-    ml->coord_task = NULL;
-    ml->wg_mgr_task = NULL;
-
-    /* Stop HTTP config server */
+    /* The config UI's handlers call into ml; stop serving them first. */
     if (ml->config_httpd) {
         ml_config_httpd_stop(ml->config_httpd);
     }
 
-    /* Clean up zero-copy PCB if active */
-#ifdef CONFIG_ML_ZERO_COPY_WG
-    ml_zerocopy_deinit(ml);
-#endif
+    /* coord's reconnect backoff blocks on its command queue for up to 30 s;
+     * a command wakes it, and the loop then sees the shutdown bit. */
+    ml_coord_cmd_t wake = ML_CMD_DISCONNECT;
+    xQueueSendToFront(ml->coord_cmd_queue, &wake, 0);
 
-    /* Close sockets */
-    if (ml->disco_sock4 >= 0) { ml_close_sock(ml->disco_sock4); ml->disco_sock4 = -1; }
-    if (ml->stun_sock >= 0) { ml_close_sock(ml->stun_sock); ml->stun_sock = -1; }
-    if (ml->stun_sock6 >= 0) { ml_close_sock(ml->stun_sock6); ml->stun_sock6 = -1; }
+    /* Tasks never call vTaskDelete() on each other; each one exits by itself
+     * through ml_task_exit(). Give them a moment to notice the shutdown bit,
+     * then shut down the sockets the network tasks may be blocked reading
+     * (coord's MapResponse read waits up to 60 s, DERP TLS reads up to 10 s). */
+    uint32_t alive = ml_join_tasks(ml, ML_STOP_GRACE_MS);
+    if (alive) {
+        if (alive & ML_TASK_BIT_COORD)   ml_unblock_socket(ml->coord_sock);
+        if (alive & ML_TASK_BIT_DERP_TX) ml_unblock_socket(ml->derp.sockfd);
+        uint32_t rest = CONFIG_ML_STOP_TIMEOUT_MS > ML_STOP_GRACE_MS
+                      ? CONFIG_ML_STOP_TIMEOUT_MS - ML_STOP_GRACE_MS : 0;
+        alive = ml_join_tasks(ml, rest);
+    }
 
+    int join_ms = (int)((esp_timer_get_time() - t_start) / 1000);
     ml->state = ML_STATE_IDLE;
-    ESP_LOGI(TAG, "Stopped");
+
+    if (alive) {
+        /* Releasing anything now would pull it out from under a live task.
+         * Keep everything; another microlink_stop() resumes the wait, and
+         * microlink_destroy() parks the context instead of freeing it. */
+        char names[40];
+        ml_describe_tasks(alive, names, sizeof(names));
+        ESP_LOGE(TAG, "Stop timed out after %d ms; still running:%s", join_ms, names);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    ml_release_run_resources(ml);
+    ml->started = false;
+    ml->state = ML_STATE_IDLE;
+    ESP_LOGI(TAG, "Stopped (all tasks exited in %d ms)", join_ms);
     return ESP_OK;
 }
 
 void microlink_destroy(microlink_t *ml) {
     if (!ml) return;
 
-    microlink_stop(ml);
-
-    /* Deinitialize peer NVS */
-    ml_peer_nvs_deinit();
-
-    /* Deinitialize HTTP config server */
-    if (ml->config_httpd) {
-        ml_config_httpd_deinit(ml->config_httpd);
-        ml->config_httpd = NULL;
+    if (ml_called_from_worker(ml)) {
+        /* Cannot join ourselves; freeing would be a use-after-free. */
+        ESP_LOGE(TAG, "microlink_destroy() called from a MicroLink task; ignored");
+        return;
     }
 
-    /* Delete queues */
-    if (ml->derp_tx_queue) vQueueDelete(ml->derp_tx_queue);
-    if (ml->disco_rx_queue) vQueueDelete(ml->disco_rx_queue);
-    if (ml->wg_rx_queue) vQueueDelete(ml->wg_rx_queue);
-    if (ml->stun_rx_queue) vQueueDelete(ml->stun_rx_queue);
-    if (ml->coord_cmd_queue) vQueueDelete(ml->coord_cmd_queue);
-    if (ml->peer_update_queue) vQueueDelete(ml->peer_update_queue);
+    microlink_stop(ml);
 
-    /* Delete event group */
-    if (ml->events) vEventGroupDelete(ml->events);
+    /* Free anything parked by an earlier teardown that has drained since. */
+    ml_reap_orphans();
 
-    /* Clear keys from memory */
-    memset(ml->machine_private_key, 0, 32);
-    memset(ml->wg_private_key, 0, 32);
-    memset(ml->disco_private_key, 0, 32);
+    uint32_t alive = ml_tasks_alive(ml);
+    if (alive) {
+        char names[40];
+        ml_describe_tasks(alive, names, sizeof(names));
+        ESP_LOGE(TAG, "Deferring free:%s still running", names);
+        ml_orphan_park(ml);
+        return;
+    }
 
-    free(ml);
-    ESP_LOGI(TAG, "Destroyed");
+    ml_release(ml);
 }
 
 /* ============================================================================

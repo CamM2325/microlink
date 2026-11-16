@@ -1786,8 +1786,9 @@ void ml_wg_mgr_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     ESP_LOGI(TAG, "WG Manager task started (Core %d)", xPortGetCoreID());
 
-    /* Initialize probe tracking */
+    /* Initialize probe tracking (module statics survive a stop/start) */
     memset(pending_probes, 0, sizeof(pending_probes));
+    disco_probe_start_idx = 0;
 
     /* Load cached peers from NVS for fast boot */
     int cached = ml_peer_nvs_load_all(ml->peers, ML_MAX_PEERS);
@@ -1803,8 +1804,7 @@ void ml_wg_mgr_task(void *arg) {
 
     if (wait_bits & ML_EVT_SHUTDOWN_REQUEST) {
         ESP_LOGI(TAG, "Shutdown requested before registration, exiting");
-        vTaskDelete(NULL);
-        return;  /* Not reached */
+        ml_task_exit(ml, ML_TASK_BIT_WG_MGR);
     }
 
     ESP_LOGI(TAG, "Coord registered, initializing WireGuard...");
@@ -1944,5 +1944,5 @@ void ml_wg_mgr_task(void *arg) {
     }
 
     ESP_LOGI(TAG, "WG Manager task exiting");
-    vTaskDelete(NULL);
+    ml_task_exit(ml, ML_TASK_BIT_WG_MGR);
 }

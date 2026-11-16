@@ -123,10 +123,15 @@ microlink_t *microlink_init(const microlink_config_t *config);
 /**
  * @brief Start connecting to Tailscale
  * @param ml Handle from microlink_init()
- * @return ESP_OK on success
+ * @return ESP_OK on success,
+ *         ESP_ERR_INVALID_STATE if already started or if tasks from a previous
+ *         run are still exiting (call microlink_stop() again first),
+ *         ESP_FAIL if a task could not be created (the partial start is rolled
+ *         back; the handle is left stopped).
  *
  * WiFi must be connected before calling this.
  * Connection proceeds asynchronously - use callbacks or poll state.
+ * May be called again after microlink_stop() returned ESP_OK.
  */
 esp_err_t microlink_start(microlink_t *ml);
 
@@ -151,15 +156,26 @@ esp_err_t microlink_rebind(microlink_t *ml);
 /**
  * @brief Stop and disconnect from Tailscale
  * @param ml Handle
- * @return ESP_OK on success
+ * @return ESP_OK once every internal task has exited and the per-run
+ *         resources (sockets, queued packets, WireGuard interface) are released;
+ *         ESP_ERR_TIMEOUT if a task was still blocked in a network call when
+ *         CONFIG_ML_STOP_TIMEOUT_MS expired. Nothing is freed in that case;
+ *         calling microlink_stop() again resumes the wait.
  *
- * Gracefully shuts down all tasks and closes connections.
+ * Requests shutdown, unblocks the tasks' blocking socket calls, and waits for
+ * the tasks to exit. Safe to call when already stopped. After ESP_OK the
+ * handle can be started again with microlink_start().
  */
 esp_err_t microlink_stop(microlink_t *ml);
 
 /**
  * @brief Destroy MicroLink instance and free all resources
  * @param ml Handle (NULL-safe)
+ *
+ * Calls microlink_stop(). If a task is still running after that, the instance
+ * is not freed (that would be a use-after-free once the task wakes up): it is
+ * parked and freed by a later microlink_init() or microlink_destroy() once the
+ * task has exited. Either way the caller must not use the handle again.
  */
 void microlink_destroy(microlink_t *ml);
 

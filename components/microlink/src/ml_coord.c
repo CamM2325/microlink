@@ -2571,8 +2571,7 @@ void ml_coord_task(void *arg) {
                              pdFALSE, pdFALSE, portMAX_DELAY);
         if (wb & ML_EVT_SHUTDOWN_REQUEST) {
             ESP_LOGI(TAG, "Shutdown requested before WiFi, exiting");
-            vTaskDelete(NULL);
-            return;
+            ml_task_exit(ml, ML_TASK_BIT_COORD);
         }
     }
 
@@ -2732,8 +2731,9 @@ void ml_coord_task(void *arg) {
                 xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
                 /* Wait for DERP to connect (up to 15s) before continuing */
                 ESP_LOGI(TAG, "Waiting for DERP I/O task to connect...");
-                xEventGroupWaitBits(ml->events, ML_EVT_DERP_CONNECTED,
-                                    pdFALSE, pdTRUE, pdMS_TO_TICKS(15000));
+                xEventGroupWaitBits(ml->events,
+                                    ML_EVT_DERP_CONNECTED | ML_EVT_SHUTDOWN_REQUEST,
+                                    pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
             }
 
             /* Start streaming long-poll for incremental updates.
@@ -3062,5 +3062,5 @@ void ml_coord_task(void *arg) {
     memset(&noise, 0, sizeof(noise));
 
     ESP_LOGI(TAG, "Coord task exiting");
-    vTaskDelete(NULL);
+    ml_task_exit(ml, ML_TASK_BIT_COORD);
 }
