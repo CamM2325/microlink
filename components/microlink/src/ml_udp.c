@@ -5,8 +5,22 @@
  * Provides simple UDP send/receive over the Tailscale VPN tunnel.
  * Uses lwIP UDP PCB bound to the WireGuard netif for encrypted transport.
  *
- * On socket creation, sends CallMeMaybe to all peers to trigger
- * peer-initiated WireGuard handshakes (NAT traversal).
+ * On socket creation, asks the wg_mgr task to send CallMeMaybe to all peers
+ * to trigger peer-initiated WireGuard handshakes (NAT traversal).
+ *
+ * Threading model:
+ * - The PCB is only touched on tcpip_thread (raw lwIP API is not thread-safe):
+ *   create/bind/send/remove go through udp_tcpip_call(), and udp_recv_cb runs
+ *   there anyway.
+ * - Received packets are handed from tcpip_thread to the consumer through two
+ *   FreeRTOS queues of slot pointers (free slots and filled slots), so the
+ *   RX task and microlink_udp_recv() callers can consume concurrently.
+ * - The per-socket RX task owns the callback invocation. close() removes the
+ *   PCB, then joins the RX task; if close() runs on the RX task itself (from
+ *   the callback) or the callback outlives the join timeout, the RX task
+ *   frees the socket when it exits.
+ * - Peer-table work (handshake trigger, CallMeMaybe) is posted to the wg_mgr
+ *   task, which owns ml->peers[].
  *
  * Reference: microlink v1 microlink_udp.c
  */
@@ -17,12 +31,23 @@
 #include "lwip/pbuf.h"
 #include "lwip/netif.h"
 #include "lwip/ip_addr.h"
+#include "lwip/tcpip.h"
+#include "lwip/priv/tcpip_priv.h"  /* tcpip_api_call() */
+#include "arch/sys_arch.h"         /* sys_thread_tcpip() */
 #include <string.h>
 
 static const char *TAG = "ml_udp";
 
-#define UDP_RX_QUEUE_SIZE   4
-#define UDP_MAX_PKT_SIZE    1400
+#define UDP_RX_QUEUE_SIZE       4
+#define UDP_MAX_PKT_SIZE        1400
+#define UDP_RX_TASK_STACK       4096
+/* How long close() waits for an in-flight RX callback before handing the
+ * final free to the RX task. */
+#define UDP_CLOSE_JOIN_MS       5000
+/* Handshake retrigger on send failure: at most once per destination per
+ * UDP_HS_RETRIGGER_MS, tracking up to UDP_HS_SLOTS destinations per socket. */
+#define UDP_HS_RETRIGGER_MS     10000
+#define UDP_HS_SLOTS            4
 
 /* ============================================================================
  * Internal Types
@@ -31,31 +56,50 @@ static const char *TAG = "ml_udp";
 typedef struct {
     uint32_t src_ip;
     uint16_t src_port;
+    uint16_t len;
     uint8_t data[UDP_MAX_PKT_SIZE];
-    size_t len;
-    bool valid;
 } udp_rx_pkt_t;
+
+typedef struct {
+    uint32_t ip;
+    uint64_t last_ms;       /* 0 = never triggered */
+} udp_hs_slot_t;
+
+/* Who frees the socket once the RX task is done with it */
+enum {
+    UDP_OWNER_SHARED = 0,   /* RX task running, close() not finished */
+    UDP_OWNER_CLOSER,       /* RX task exited; close() frees */
+    UDP_OWNER_RX_TASK,      /* close() gave up waiting / ran on RX task; RX task frees */
+};
 
 struct microlink_udp_socket {
     microlink_t *ml;
-    struct udp_pcb *pcb;
+    struct udp_pcb *pcb;            /* tcpip_thread only */
     uint16_t local_port;
 
-    /* RX ring buffer */
-    udp_rx_pkt_t rx_queue[UDP_RX_QUEUE_SIZE];
-    volatile uint8_t rx_head;
-    volatile uint8_t rx_tail;
+    /* RX path: tcpip_thread takes a slot from free_q, fills it and posts it
+     * to rx_q; whoever consumes it returns it to free_q. */
+    udp_rx_pkt_t rx_slots[UDP_RX_QUEUE_SIZE];
+    QueueHandle_t free_q;           /* udp_rx_pkt_t * */
+    QueueHandle_t rx_q;             /* udp_rx_pkt_t * */
 
-    /* RX notification */
-    SemaphoreHandle_t rx_sem;
-
-    /* User callback */
+    /* User callback. cb_lock (recursive) is held while the callback runs, so
+     * set_rx_callback() from another task returns only after an in-flight
+     * call of the previous callback has finished. */
+    SemaphoreHandle_t cb_lock;
     microlink_udp_rx_cb_t rx_cb;
     void *rx_cb_data;
 
-    /* Dedicated RX task */
+    /* Dedicated RX task and shutdown handshake */
     TaskHandle_t rx_task;
-    volatile bool rx_running;
+    SemaphoreHandle_t rx_exited;    /* given by RX task on exit when owner == CLOSER */
+    volatile bool closing;          /* close() started: API calls are refused */
+    volatile bool rx_stop;          /* PCB gone: RX task exits, no more callbacks */
+    int owner;                      /* UDP_OWNER_*, accessed atomically */
+
+    /* Per-socket, per-destination handshake retrigger limiter */
+    portMUX_TYPE hs_mux;
+    udp_hs_slot_t hs_slots[UDP_HS_SLOTS];
 };
 
 /* ============================================================================
@@ -80,40 +124,69 @@ static uint32_t lwip_to_ip(const ip_addr_t *addr) {
            ((ip >> 24) & 0xFF);
 }
 
+/* Run fn(arg) on tcpip_thread and return its result. tcpip_api_call() takes
+ * the core lock when CONFIG_LWIP_TCPIP_CORE_LOCKING is set and otherwise
+ * posts to tcpip_thread and waits on the caller's per-thread semaphore. If
+ * we already are tcpip_thread (or hold the core lock), call fn directly:
+ * waiting on our own mailbox would deadlock. Same detection as
+ * wg_udp_sendto_any_ctx() in ml_wg_mgr.c. */
+typedef struct {
+    struct tcpip_api_call_data call;   /* must be first */
+    err_t (*fn)(void *arg);
+    void *arg;
+} udp_tcpip_call_t;
+
+static err_t udp_tcpip_trampoline(struct tcpip_api_call_data *call) {
+    udp_tcpip_call_t *c = (udp_tcpip_call_t *)call;
+    return c->fn(c->arg);
+}
+
+static err_t udp_tcpip_call(err_t (*fn)(void *arg), void *arg) {
+    if (sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER)) {
+        return fn(arg);
+    }
+    udp_tcpip_call_t c = { .fn = fn, .arg = arg };
+    return tcpip_api_call(udp_tcpip_trampoline, &c.call);
+}
+
+static void udp_sock_free(microlink_udp_socket_t *sock) {
+    if (sock->rx_q) vQueueDelete(sock->rx_q);
+    if (sock->free_q) vQueueDelete(sock->free_q);
+    if (sock->cb_lock) vSemaphoreDelete(sock->cb_lock);
+    if (sock->rx_exited) vSemaphoreDelete(sock->rx_exited);
+    free(sock);
+}
+
 /* ============================================================================
  * lwIP UDP Callback (runs from tcpip thread)
  * ========================================================================== */
 
 static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
                          const ip_addr_t *addr, u16_t port) {
+    (void)pcb;
     microlink_udp_socket_t *sock = (microlink_udp_socket_t *)arg;
     if (!sock || !p) {
         if (p) pbuf_free(p);
         return;
     }
 
-    uint8_t next = (sock->rx_head + 1) % UDP_RX_QUEUE_SIZE;
-    if (next == sock->rx_tail) {
-        /* Queue full */
+    udp_rx_pkt_t *pkt;
+    if (xQueueReceive(sock->free_q, &pkt, 0) != pdTRUE) {
+        /* All slots in use: drop */
         pbuf_free(p);
         return;
     }
 
-    udp_rx_pkt_t *pkt = &sock->rx_queue[sock->rx_head];
     pkt->src_ip = lwip_to_ip(addr);
     pkt->src_port = port;
     pkt->len = (p->tot_len > UDP_MAX_PKT_SIZE) ? UDP_MAX_PKT_SIZE : p->tot_len;
     pbuf_copy_partial(p, pkt->data, pkt->len, 0);
-    pkt->valid = true;
-
-    __sync_synchronize();
-    sock->rx_head = next;
-
-    if (sock->rx_sem) {
-        xSemaphoreGive(sock->rx_sem);
-    }
-
     pbuf_free(p);
+
+    /* Cannot fail: rx_q and free_q together hold exactly UDP_RX_QUEUE_SIZE
+     * slot pointers. */
+    xQueueSend(sock->rx_q, &pkt, 0);
+    xTaskNotifyGive(sock->rx_task);
 }
 
 /* ============================================================================
@@ -123,25 +196,134 @@ static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 static void udp_rx_task(void *arg) {
     microlink_udp_socket_t *sock = (microlink_udp_socket_t *)arg;
 
-    while (sock->rx_running) {
-        if (xSemaphoreTake(sock->rx_sem, pdMS_TO_TICKS(100)) == pdTRUE) {
-            while (sock->rx_tail != sock->rx_head) {
-                udp_rx_pkt_t *pkt = &sock->rx_queue[sock->rx_tail];
-                if (pkt->valid && sock->rx_cb) {
-                    sock->rx_cb(sock, pkt->src_ip, pkt->src_port,
-                                pkt->data, pkt->len, sock->rx_cb_data);
-                    pkt->valid = false;
-                    sock->rx_tail = (sock->rx_tail + 1) % UDP_RX_QUEUE_SIZE;
-                } else if (!sock->rx_cb) {
-                    break;  /* No callback, leave for polling */
-                } else {
-                    sock->rx_tail = (sock->rx_tail + 1) % UDP_RX_QUEUE_SIZE;
-                }
+    while (!sock->rx_stop) {
+        /* Woken by udp_recv_cb, set_rx_callback and close */
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        for (;;) {
+            xSemaphoreTakeRecursive(sock->cb_lock, portMAX_DELAY);
+            if (sock->rx_stop || !sock->rx_cb) {
+                /* Stopping, or no callback: leave packets for
+                 * microlink_udp_recv() */
+                xSemaphoreGiveRecursive(sock->cb_lock);
+                break;
             }
+            udp_rx_pkt_t *pkt;
+            if (xQueueReceive(sock->rx_q, &pkt, 0) != pdTRUE) {
+                xSemaphoreGiveRecursive(sock->cb_lock);
+                break;
+            }
+            sock->rx_cb(sock, pkt->src_ip, pkt->src_port,
+                        pkt->data, pkt->len, sock->rx_cb_data);
+            xQueueSend(sock->free_q, &pkt, 0);
+            xSemaphoreGiveRecursive(sock->cb_lock);
         }
     }
 
+    /* close() has removed the PCB, so nothing produces any more. Decide who
+     * frees the socket: if close() is still waiting, hand it over and signal
+     * (that give is our last touch of sock); otherwise close() already left,
+     * and the socket is ours. */
+    int expected = UDP_OWNER_SHARED;
+    if (__atomic_compare_exchange_n(&sock->owner, &expected, UDP_OWNER_CLOSER,
+                                    false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        xSemaphoreGive(sock->rx_exited);
+    } else {
+        udp_sock_free(sock);
+        ESP_LOGI(TAG, "UDP socket freed by RX task");
+    }
     vTaskDelete(NULL);
+}
+
+/* ============================================================================
+ * tcpip_thread work
+ * ========================================================================== */
+
+typedef struct {
+    microlink_udp_socket_t *sock;
+    uint16_t local_port;
+} udp_open_args_t;
+
+static err_t udp_open_in_tcpip(void *arg) {
+    udp_open_args_t *a = (udp_open_args_t *)arg;
+    microlink_udp_socket_t *sock = a->sock;
+    microlink_t *ml = sock->ml;
+
+    struct udp_pcb *pcb = udp_new();
+    if (!pcb) return ERR_MEM;
+
+    /* Bind to WG netif */
+    if (ml->wg_netif) {
+        udp_bind_netif(pcb, (struct netif *)ml->wg_netif);
+    }
+
+    /* Bind to VPN IP + port */
+    ip_addr_t local_ip;
+    ip_to_lwip(ml->vpn_ip, &local_ip);
+    err_t err = udp_bind(pcb, &local_ip, a->local_port);
+    if (err != ERR_OK) {
+        udp_remove(pcb);
+        return err;
+    }
+
+    sock->pcb = pcb;
+    sock->local_port = pcb->local_port;
+    udp_recv(pcb, udp_recv_cb, sock);
+    return ERR_OK;
+}
+
+static err_t udp_remove_in_tcpip(void *arg) {
+    /* Unlinks the PCB from udp_pcbs, so udp_recv_cb can no longer run for it */
+    udp_remove((struct udp_pcb *)arg);
+    return ERR_OK;
+}
+
+typedef struct {
+    struct udp_pcb *pcb;
+    ip_addr_t dest;
+    uint16_t dest_port;
+    const void *data;
+    size_t len;
+} udp_send_args_t;
+
+static err_t udp_send_in_tcpip(void *arg) {
+    udp_send_args_t *a = (udp_send_args_t *)arg;
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, a->len, PBUF_RAM);
+    if (!p) return ERR_MEM;
+    memcpy(p->payload, a->data, a->len);
+    err_t err = udp_sendto(a->pcb, p, &a->dest, a->dest_port);
+    pbuf_free(p);
+    return err;
+}
+
+/* True if a handshake retrigger toward dest_ip is due for this socket */
+static bool udp_hs_retrigger_due(microlink_udp_socket_t *sock, uint32_t dest_ip) {
+    uint64_t now = ml_get_time_ms();
+    bool due = false;
+
+    portENTER_CRITICAL(&sock->hs_mux);
+    udp_hs_slot_t *slot = NULL;
+    udp_hs_slot_t *oldest = &sock->hs_slots[0];
+    for (int i = 0; i < UDP_HS_SLOTS; i++) {
+        if (sock->hs_slots[i].ip == dest_ip) {
+            slot = &sock->hs_slots[i];
+            break;
+        }
+        if (sock->hs_slots[i].last_ms < oldest->last_ms) {
+            oldest = &sock->hs_slots[i];
+        }
+    }
+    if (!slot) {
+        slot = oldest;
+        slot->ip = dest_ip;
+        slot->last_ms = 0;
+    }
+    if (slot->last_ms == 0 || now - slot->last_ms > UDP_HS_RETRIGGER_MS) {
+        slot->last_ms = now ? now : 1;
+        due = true;
+    }
+    portEXIT_CRITICAL(&sock->hs_mux);
+    return due;
 }
 
 /* ============================================================================
@@ -162,61 +344,56 @@ microlink_udp_socket_t *microlink_udp_create(microlink_t *ml, uint16_t local_por
     if (!sock) return NULL;
 
     sock->ml = ml;
-    sock->rx_sem = xSemaphoreCreateCounting(UDP_RX_QUEUE_SIZE, 0);
-    if (!sock->rx_sem) {
-        free(sock);
+    sock->owner = UDP_OWNER_SHARED;
+    portMUX_INITIALIZE(&sock->hs_mux);
+    sock->free_q = xQueueCreate(UDP_RX_QUEUE_SIZE, sizeof(udp_rx_pkt_t *));
+    sock->rx_q = xQueueCreate(UDP_RX_QUEUE_SIZE, sizeof(udp_rx_pkt_t *));
+    sock->cb_lock = xSemaphoreCreateRecursiveMutex();
+    sock->rx_exited = xSemaphoreCreateBinary();
+    if (!sock->free_q || !sock->rx_q || !sock->cb_lock || !sock->rx_exited) {
+        udp_sock_free(sock);
+        return NULL;
+    }
+    for (int i = 0; i < UDP_RX_QUEUE_SIZE; i++) {
+        udp_rx_pkt_t *slot = &sock->rx_slots[i];
+        xQueueSend(sock->free_q, &slot, 0);
+    }
+
+    /* Start the RX task before the PCB exists, so udp_recv_cb always has a
+     * task to notify. It idles until the first notification.
+     * Runs on Core 1 (Core 0 on single-core chips) at ML_TASK_UDP_RX_PRIO
+     * (Kconfig ML_UDP_RX_TASK_PRIO) - see microlink_internal.h. */
+    if (xTaskCreatePinnedToCore(udp_rx_task, "ml_udp_rx", UDP_RX_TASK_STACK, sock,
+                                ML_TASK_UDP_RX_PRIO, &sock->rx_task,
+                                ML_TASK_APP_CORE) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create RX task");
+        udp_sock_free(sock);
         return NULL;
     }
 
-    sock->pcb = udp_new();
-    if (!sock->pcb) {
-        vSemaphoreDelete(sock->rx_sem);
-        free(sock);
-        return NULL;
-    }
-
-    /* Bind to WG netif */
-    if (ml->wg_netif) {
-        udp_bind_netif(sock->pcb, (struct netif *)ml->wg_netif);
-    }
-
-    /* Bind to VPN IP + port */
-    ip_addr_t local_ip;
-    ip_to_lwip(ml->vpn_ip, &local_ip);
-
-    err_t err = udp_bind(sock->pcb, &local_ip, local_port);
+    /* Create, bind and register the PCB on tcpip_thread */
+    udp_open_args_t open_args = { .sock = sock, .local_port = local_port };
+    err_t err = udp_tcpip_call(udp_open_in_tcpip, &open_args);
     if (err != ERR_OK) {
-        ESP_LOGE(TAG, "udp_bind failed: %d", err);
-        udp_remove(sock->pcb);
-        vSemaphoreDelete(sock->rx_sem);
-        free(sock);
+        ESP_LOGE(TAG, "UDP socket open failed: %d", err);
+        /* No PCB, so no producer: stop the RX task through the same
+         * handshake close() uses. */
+        sock->closing = true;
+        sock->rx_stop = true;
+        xTaskNotifyGive(sock->rx_task);
+        xSemaphoreTake(sock->rx_exited, portMAX_DELAY);
+        udp_sock_free(sock);
         return NULL;
-    }
-
-    sock->local_port = sock->pcb->local_port;
-    udp_recv(sock->pcb, udp_recv_cb, sock);
-
-    /* Start RX task on Core 1 (Core 0 on single-core chips).
-     * Priority was configMAX_PRIORITIES - 2, numerically identical to
-     * ESP-IDF's reserved ESP_TASK_BT_CONTROLLER_PRIO tier - see
-     * ML_TASK_UDP_RX_PRIO's own comment in microlink_internal.h. */
-    sock->rx_running = true;
-    if (xTaskCreatePinnedToCore(udp_rx_task, "ml_udp_rx", 4096, sock,
-                                 ML_TASK_UDP_RX_PRIO, &sock->rx_task, ML_TASK_APP_CORE) != pdPASS) {
-        sock->rx_running = false;
-        sock->rx_task = NULL;
     }
 
     char ip_buf[16];
     microlink_ip_to_str(ml->vpn_ip, ip_buf);
     ESP_LOGI(TAG, "UDP socket: %s:%u", ip_buf, sock->local_port);
 
-    /* Trigger CallMeMaybe to all peers for WG handshake establishment */
-    for (int i = 0; i < ml->peer_count; i++) {
-        if (ml->peers[i].active) {
-            ml_wg_mgr_send_cmm(ml, ml->peers[i].vpn_ip);
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
+    /* Trigger CallMeMaybe to all peers for WG handshake establishment.
+     * Runs (paced) on the wg_mgr task, which owns the peer table. */
+    if (ml_wg_mgr_post_request(ml, ML_PEER_REQ_CMM_ALL, 0) != ESP_OK) {
+        ESP_LOGW(TAG, "Could not queue CallMeMaybe sweep");
     }
 
     return sock;
@@ -224,56 +401,75 @@ microlink_udp_socket_t *microlink_udp_create(microlink_t *ml, uint16_t local_por
 
 void microlink_udp_close(microlink_udp_socket_t *sock) {
     if (!sock) return;
+    if (__atomic_exchange_n(&sock->closing, true, __ATOMIC_ACQ_REL)) {
+        ESP_LOGW(TAG, "UDP socket already closing");
+        return;
+    }
 
-    /* Unregister lwIP callback FIRST to prevent use-after-free.
-     * The callback runs from tcpip thread and accesses sock->rx_sem,
-     * so it must be unregistered before we touch any sock fields. */
+    /* Remove the PCB first: once this returns, udp_recv_cb cannot run for
+     * this socket again (it only runs on tcpip_thread, which has now
+     * unlinked the PCB). */
     if (sock->pcb) {
-        udp_recv(sock->pcb, NULL, NULL);
+        udp_tcpip_call(udp_remove_in_tcpip, sock->pcb);
+        sock->pcb = NULL;
+    }
+    /* Only now may the RX task exit: udp_recv_cb notifies it by handle. */
+    sock->rx_stop = true;
+
+    if (xTaskGetCurrentTaskHandle() == sock->rx_task) {
+        /* Called from the RX callback: we are inside udp_rx_task's loop,
+         * which still uses sock after the callback returns. Let the task
+         * free it on exit. */
+        __atomic_store_n(&sock->owner, UDP_OWNER_RX_TASK, __ATOMIC_RELEASE);
+        ESP_LOGI(TAG, "UDP socket closed (from RX callback)");
+        return;
     }
 
-    if (sock->rx_running) {
-        sock->rx_running = false;
-        if (sock->rx_sem) xSemaphoreGive(sock->rx_sem);
-        vTaskDelay(pdMS_TO_TICKS(150));
+    /* Wake the RX task and join it */
+    xTaskNotifyGive(sock->rx_task);
+    if (xSemaphoreTake(sock->rx_exited, pdMS_TO_TICKS(UDP_CLOSE_JOIN_MS)) == pdTRUE) {
+        udp_sock_free(sock);
+        ESP_LOGI(TAG, "UDP socket closed");
+        return;
     }
 
-    if (sock->pcb) {
-        udp_remove(sock->pcb);
+    int expected = UDP_OWNER_SHARED;
+    if (__atomic_compare_exchange_n(&sock->owner, &expected, UDP_OWNER_RX_TASK,
+                                    false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        /* The callback is still running. It will not be called again; the
+         * RX task frees the socket when the callback returns. */
+        ESP_LOGW(TAG, "UDP RX callback still running after %d ms; "
+                 "socket will be freed when it returns", UDP_CLOSE_JOIN_MS);
+        return;
     }
 
-    if (sock->rx_sem) vSemaphoreDelete(sock->rx_sem);
-    free(sock);
+    /* The RX task exited between the timeout and the handover */
+    xSemaphoreTake(sock->rx_exited, portMAX_DELAY);
+    udp_sock_free(sock);
     ESP_LOGI(TAG, "UDP socket closed");
 }
 
 esp_err_t microlink_udp_send(microlink_udp_socket_t *sock, uint32_t dest_ip,
                               uint16_t dest_port, const void *data, size_t len) {
-    if (!sock || !sock->pcb || !data || len == 0) return ESP_ERR_INVALID_ARG;
+    if (!sock || !data || len == 0) return ESP_ERR_INVALID_ARG;
     if (len > UDP_MAX_PKT_SIZE) return ESP_ERR_INVALID_SIZE;
+    if (sock->closing || !sock->pcb) return ESP_ERR_INVALID_STATE;
 
-    ip_addr_t dest;
-    ip_to_lwip(dest_ip, &dest);
+    udp_send_args_t send_args = {
+        .pcb = sock->pcb, .dest_port = dest_port, .data = data, .len = len,
+    };
+    ip_to_lwip(dest_ip, &send_args.dest);
 
-    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
-    if (!p) return ESP_ERR_NO_MEM;
-
-    memcpy(p->payload, data, len);
-    err_t err = udp_sendto(sock->pcb, p, &dest, dest_port);
-    pbuf_free(p);
+    err_t err = udp_tcpip_call(udp_send_in_tcpip, &send_args);
+    if (err == ERR_MEM) return ESP_ERR_NO_MEM;
 
     if (err != ERR_OK) {
-        if (sock->ml) {
-            /* Rate-limit handshake retrigger: max once per 10 seconds per socket.
-             * Without this, high-frequency heartbeats each trigger a full WG handshake
-             * initiation + CallMeMaybe, flooding the DERP TX queue. */
-            static uint64_t last_trigger_ms = 0;
-            uint64_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (now_ms - last_trigger_ms > 10000) {
-                last_trigger_ms = now_ms;
-                ml_wg_mgr_trigger_handshake(sock->ml, dest_ip);
-                ml_wg_mgr_send_cmm(sock->ml, dest_ip);
-            }
+        /* Typically no WG session to this peer yet. Rate-limited per socket
+         * and destination: without this, high-frequency heartbeats each
+         * trigger a full WG handshake initiation + CallMeMaybe, flooding the
+         * DERP TX queue. The work runs on the wg_mgr task. */
+        if (sock->ml && udp_hs_retrigger_due(sock, dest_ip)) {
+            ml_wg_mgr_post_request(sock->ml, ML_PEER_REQ_HANDSHAKE, dest_ip);
         }
         return ESP_FAIL;
     }
@@ -285,37 +481,37 @@ esp_err_t microlink_udp_recv(microlink_udp_socket_t *sock, uint32_t *src_ip,
                               uint16_t *src_port, void *buffer, size_t *len,
                               uint32_t timeout_ms) {
     if (!sock || !buffer || !len || *len == 0) return ESP_ERR_INVALID_ARG;
+    if (sock->closing) return ESP_ERR_INVALID_STATE;
 
-    uint32_t start = xTaskGetTickCount() * portTICK_PERIOD_MS;
-
-    while (1) {
-        if (sock->rx_tail != sock->rx_head) {
-            udp_rx_pkt_t *pkt = &sock->rx_queue[sock->rx_tail];
-            if (pkt->valid) {
-                size_t copy = (pkt->len < *len) ? pkt->len : *len;
-                memcpy(buffer, pkt->data, copy);
-                *len = copy;
-                if (src_ip) *src_ip = pkt->src_ip;
-                if (src_port) *src_port = pkt->src_port;
-                pkt->valid = false;
-                sock->rx_tail = (sock->rx_tail + 1) % UDP_RX_QUEUE_SIZE;
-                return ESP_OK;
-            }
-        }
-
-        uint32_t elapsed = (xTaskGetTickCount() * portTICK_PERIOD_MS) - start;
-        if (timeout_ms > 0 && elapsed >= timeout_ms) return ESP_ERR_TIMEOUT;
-        if (timeout_ms == 0) return ESP_ERR_TIMEOUT;
-
-        vTaskDelay(pdMS_TO_TICKS(10));
+    udp_rx_pkt_t *pkt;
+    TickType_t ticks = (timeout_ms == 0) ? 0 : pdMS_TO_TICKS(timeout_ms);
+    if (timeout_ms > 0 && ticks == 0) ticks = 1;
+    if (xQueueReceive(sock->rx_q, &pkt, ticks) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
     }
+
+    size_t copy = (pkt->len < *len) ? pkt->len : *len;
+    memcpy(buffer, pkt->data, copy);
+    *len = copy;
+    if (src_ip) *src_ip = pkt->src_ip;
+    if (src_port) *src_port = pkt->src_port;
+    xQueueSend(sock->free_q, &pkt, 0);
+    return ESP_OK;
 }
 
 esp_err_t microlink_udp_set_rx_callback(microlink_udp_socket_t *sock,
                                          microlink_udp_rx_cb_t cb, void *user_data) {
     if (!sock) return ESP_ERR_INVALID_ARG;
+    if (sock->closing) return ESP_ERR_INVALID_STATE;
+
+    /* Blocks while the previous callback is running (unless called from it) */
+    xSemaphoreTakeRecursive(sock->cb_lock, portMAX_DELAY);
     sock->rx_cb = cb;
     sock->rx_cb_data = user_data;
+    xSemaphoreGiveRecursive(sock->cb_lock);
+
+    /* Deliver anything that queued up while there was no callback */
+    if (cb) xTaskNotifyGive(sock->rx_task);
     return ESP_OK;
 }
 
