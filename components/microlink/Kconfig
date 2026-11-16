@@ -429,12 +429,23 @@ menu "MicroLink V2 Configuration"
                 posing as the HTTPS endpoint. Turn off only for a self-hosted
                 server with a private/self-signed certificate.
 
+        config ML_CTRL_STREAMING_MAP_FETCH
+            bool "Fetch the initial netmap over the streaming map request"
+            default n
+            help
+                Use a single Stream=true map request for the initial netmap
+                (like the official client) instead of a Stream=false request
+                followed by a long-poll. Needed for Headscale, which does not
+                answer Stream=false; MicroLink also switches automatically if
+                the server sends an empty response. Leave off for Tailscale
+                and Ionscale.
+
         config ML_CTRL_NOISE_PUBKEY_HEX
             string "Control plane Noise public key (hex)"
             default ""
             help
                 64-char hex of the control plane's Noise (machine) public key,
-                from https://<control-host>/key?v=88 → "publicKey":"mkey:<hex>".
+                from https://<control-host>/key?v=131 → "publicKey":"mkey:<hex>".
                 Empty = use the built-in Tailscale key.
 
     endmenu

@@ -264,7 +264,7 @@ MicroLink talks to `controlplane.tailscale.com` by default. For Headscale-style 
 
 ```
 CONFIG_ML_CTRL_HOST="headscale.example.com"
-CONFIG_ML_CTRL_NOISE_PUBKEY_HEX="<64 hex chars from https://<host>/key?v=88, without the mkey: prefix>"
+CONFIG_ML_CTRL_NOISE_PUBKEY_HEX="<64 hex chars from https://<host>/key?v=131, without the mkey: prefix>"
 CONFIG_ML_CTRL_TLS=y          # if the server only listens on HTTPS (443)
 ```
 

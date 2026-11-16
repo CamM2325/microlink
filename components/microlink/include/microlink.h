@@ -52,7 +52,7 @@ typedef struct {
      * present, still wins over both. */
     const char *ctrl_host;          /* Coordination server hostname */
     const uint8_t *ctrl_noise_pubkey; /* Server Noise public key (32 bytes),
-                                        e.g. fetched from https://<host>/key?v=88
+                                        e.g. fetched from https://<host>/key?v=131
                                         at provisioning time */
 
     /* Some headscale-based controllers never respond to the initial

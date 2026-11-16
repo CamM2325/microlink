@@ -426,6 +426,9 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     if (ml->config.max_peers == 0) ml->config.max_peers = ML_MAX_PEERS;
     if (ml->config.max_peers > ML_MAX_PEERS) ml->config.max_peers = ML_MAX_PEERS;
     ml->config.enable_derp = true;  /* Always need DERP for relay */
+#ifdef CONFIG_ML_CTRL_STREAMING_MAP_FETCH
+    ml->config.streaming_map_fetch = true;
+#endif
 
     /* Custom control plane from config struct (NVS override below still wins).
      * It is used as a DNS name (an AT command over the cellular bridge), in

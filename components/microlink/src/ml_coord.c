@@ -335,7 +335,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
 
     /* Initialize Noise state with our machine key and the control plane's
      * server key. Priority: config-struct key (runtime, e.g. fetched from
-     * https://<control-host>/key?v=88 at provisioning time) >
+     * https://<control-host>/key?v=131 at provisioning time) >
      * CONFIG_ML_CTRL_NOISE_PUBKEY_HEX (build-time) > built-in Tailscale key. */
     const uint8_t *server_key = NULL;
     if (ml->ctrl_noise_pubkey_set) {
@@ -1795,8 +1795,11 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
 
             if (scan_pos + 9 + f_len > h2_total) break;  /* Incomplete frame */
 
-            if (f_type == 0x00 && (f_flags & 0x01)) {
-                /* DATA frame with END_STREAM — response is complete */
+            if ((f_type == 0x00 || f_type == 0x01) && (f_flags & 0x01)) {
+                /* DATA or HEADERS frame with END_STREAM: response complete.
+                 * (Headscale answers a Stream=false request with headers
+                 * only - an empty 200 - which used to wait out the 60 s
+                 * timeout and then loop forever.) */
                 got_end_stream = true;
             }
             scan_pos += 9 + f_len;
@@ -1887,7 +1890,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     if (json_total == 0) {
         ESP_LOGW(TAG, "Empty MapResponse");
         free(resp_buf);
-        return -1;
+        return -2;   /* server ignores Stream=false: caller switches to streaming */
     }
 
     ESP_LOGI(TAG, "MapResponse JSON: %d bytes", (int)json_total);
@@ -2821,7 +2824,20 @@ void ml_coord_task(void *arg) {
                     break;
                 }
             } else {
-                if (do_fetch_peers(ml, &noise) < 0) {
+                int fr = do_fetch_peers(ml, &noise);
+                if (fr == -2) {
+                    /* Headscale-style servers send no netmap for Stream=false.
+                     * Switch to the streaming initial fetch (as the official
+                     * client always does) and reconnect right away. */
+                    ESP_LOGW(TAG, "Control server sent no netmap for Stream=false; "
+                                  "switching to streaming map fetch");
+                    ml->config.streaming_map_fetch = true;
+                    coord_close_conn(ml);
+                    reconnect_attempts = 0;
+                    state = COORD_RECONNECTING;
+                    break;
+                }
+                if (fr < 0) {
                     ESP_LOGW(TAG, "MapRequest failed, will retry");
                     coord_close_conn(ml);
                     state = COORD_RECONNECTING;
