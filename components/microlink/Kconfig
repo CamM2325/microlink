@@ -206,6 +206,17 @@ menu "MicroLink V2 Configuration"
                 Waveshare SIM7600X: GPIO43 (XIAO D6).
                 LILYGO T-SIM7670G-S3: GPIO11.
 
+        config ML_CELLULAR_REG_TIMEOUT_S
+            int "Network registration timeout (seconds)"
+            depends on ML_ENABLE_CELLULAR
+            default 180
+            range 30 900
+            help
+                How long to wait for the modem to register on the network.
+                A cold LTE attach (new SIM, new location, after a power cycle)
+                often takes 1-2 minutes. While waiting, signal and
+                registration status are logged every ~10 s.
+
         config ML_CELLULAR_FAST_BAUD
             int "Switch modem UART to this baud after init (0 = keep initial baud)"
             depends on ML_ENABLE_CELLULAR && !ML_BOARD_LILYGO_T_SIM7670G

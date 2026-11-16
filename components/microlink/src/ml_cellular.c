@@ -452,16 +452,25 @@ static esp_err_t network_register(void)
      * Check both AT+CREG (CS/GSM) and AT+CEREG (EPS/LTE).
      * SIM7600 supports 2G/3G/4G so AT+CREG works, but LTE-only modems
      * like SIM7670G have no CS domain — only AT+CEREG returns registration. */
-    for (int i = 0; i < 30; i++) {
+    int last_creg = -1, last_cereg = -1, last_rssi = 99;
+#ifdef CONFIG_ML_CELLULAR_REG_TIMEOUT_S
+    const int64_t reg_timeout_s = CONFIG_ML_CELLULAR_REG_TIMEOUT_S;
+#else
+    const int64_t reg_timeout_s = 180;
+#endif
+    const int64_t reg_deadline_us = esp_timer_get_time() + reg_timeout_s * 1000000LL;
+    for (int i = 0; esp_timer_get_time() < reg_deadline_us; i++) {
         bool registered = false;
 
         at_send_cmd("AT+CREG?", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
+        { char *c = strstr(resp, "+CREG:"); int n, st; if (c && sscanf(c, "+CREG: %d,%d", &n, &st) == 2) last_creg = st; }
         if (check_registration(resp)) {
             registered = true;
             ESP_LOGI(TAG, "CS network registered");
         }
 
         at_send_cmd("AT+CEREG?", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
+        { char *c = strstr(resp, "+CEREG:"); int n, st; if (c && sscanf(c, "+CEREG: %d,%d", &n, &st) == 2) last_cereg = st; }
         if (check_registration(resp)) {
             registered = true;
             ESP_LOGI(TAG, "EPS/LTE network registered");
@@ -470,6 +479,18 @@ static esp_err_t network_register(void)
              * Known SIM7670G issue with certain SIMs/carriers/firmware. */
             ESP_LOGW(TAG, "EPS registered for SMS only (stat=6) — no data service. "
                      "Check SIM/carrier/APN or update modem firmware.");
+        }
+
+        if (!registered && (i % 5) == 4) {
+            /* Periodic diagnostics so a stuck registration is explainable. */
+            char diag[160];
+            at_send_cmd("AT+CSQ", diag, sizeof(diag), AT_SHORT_TIMEOUT_MS);
+            { char *c = strstr(diag, "+CSQ:"); int r, b; if (c && sscanf(c, "+CSQ: %d,%d", &r, &b) == 2) last_rssi = r; }
+            at_send_cmd("AT+CPSI?", diag, sizeof(diag), AT_SHORT_TIMEOUT_MS);
+            char *cpsi = strstr(diag, "+CPSI:");
+            if (cpsi) { char *e = strpbrk(cpsi, "\r\n"); if (e) *e = '\0'; }
+            ESP_LOGW(TAG, "Still registering: CSQ=%d CREG=%d CEREG=%d %s",
+                     last_rssi, last_creg, last_cereg, cpsi ? cpsi : "");
         }
 
         if (registered) {
@@ -510,7 +531,14 @@ static esp_err_t network_register(void)
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 
-    ESP_LOGE(TAG, "Network registration timeout (60s)");
+    ESP_LOGE(TAG, "Network registration timeout (%llds)", (long long)reg_timeout_s);
+    if (last_rssi == 99 || last_rssi == 0) {
+        ESP_LOGE(TAG, "  No signal (CSQ=%d): check the LTE antenna (MAIN port) and that the modem has a >=2 A supply", last_rssi);
+    } else if (last_creg == 3 || last_cereg == 3) {
+        ESP_LOGE(TAG, "  Registration DENIED by the network: SIM not activated, plan expired, or roaming not allowed");
+    } else {
+        ESP_LOGE(TAG, "  Signal CSQ=%d but not registered (CREG=%d CEREG=%d): check SIM plan/coverage/band", last_rssi, last_creg, last_cereg);
+    }
     s_cell.state = ML_CELL_STATE_ERROR;
     return ESP_ERR_TIMEOUT;
 }
