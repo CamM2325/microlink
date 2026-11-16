@@ -199,6 +199,28 @@ static void wg_udp_sendto_in_tcpip(void *arg) {
     xSemaphoreGive(sctx->done);
 }
 
+/* [triage fixup] Shared by the byte-buffer (#28) and zero-copy pbuf (#33)
+ * output callbacks: send directly when already on tcpip_thread, otherwise
+ * dispatch and wait. Does not consume p. */
+static err_t wg_udp_sendto_any_ctx(struct pbuf *p, const ip_addr_t *dst, u16_t port) {
+    if (sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER)) {
+        return udp_sendto(s_wg_output_pcb, p, dst, port);
+    }
+    wg_udp_send_ctx_t sctx = {
+        .pcb = s_wg_output_pcb, .p = p, .dst = *dst, .port = port,
+        .done = xSemaphoreCreateBinary(),
+    };
+    if (!sctx.done) return ERR_MEM;
+    err_t cb_err = tcpip_callback(wg_udp_sendto_in_tcpip, &sctx);
+    if (cb_err != ERR_OK) {
+        vSemaphoreDelete(sctx.done);
+        return cb_err;
+    }
+    xSemaphoreTake(sctx.done, portMAX_DELAY);
+    vSemaphoreDelete(sctx.done);
+    return sctx.result;
+}
+
 /* Zero-copy WireGuard output. The encrypted pbuf is already PBUF_TRANSPORT
  * with header room, so it goes straight to udp_sendto - no mem_malloc, no
  * linearise, no second pbuf, no second copy. Ownership stays with
@@ -213,7 +235,11 @@ static err_t wg_udp_output_pbuf_cb(uint32_t dest_ip, uint16_t dest_port,
     IP_SET_TYPE_VAL(dst, IPADDR_TYPE_V4);
     ip4_addr_set_u32(ip_2_ip4(&dst), dest_ip);  /* already network byte order */
 
-    return udp_sendto(s_wg_output_pcb, q, &dst, dest_port);
+    /* [triage fixup] #33 called udp_sendto() unconditionally, which bypasses
+     * #28's thread-safety dispatch (this callback takes precedence over the
+     * byte-buffer one, and also runs on the wg_mgr task for handshakes and
+     * keepalives). */
+    return wg_udp_sendto_any_ctx(q, &dst, dest_port);
 }
 
 static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
@@ -252,28 +278,7 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
      * callback while blocked waiting on it) - hence the explicit check
      * rather than always dispatching. pbuf_alloc()/pbuf_free() aren't core
      * state and don't need this - only the actual PCB send does. */
-    err_t err;
-    if (sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER)) {
-        err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
-    } else {
-        wg_udp_send_ctx_t sctx = {
-            .pcb = s_wg_output_pcb, .p = p, .dst = dst, .port = dest_port,
-            .done = xSemaphoreCreateBinary(),
-        };
-        if (!sctx.done) {
-            pbuf_free(p);
-            return ERR_MEM;
-        }
-        err_t cb_err = tcpip_callback(wg_udp_sendto_in_tcpip, &sctx);
-        if (cb_err != ERR_OK) {
-            vSemaphoreDelete(sctx.done);
-            pbuf_free(p);
-            return cb_err;
-        }
-        xSemaphoreTake(sctx.done, portMAX_DELAY);
-        vSemaphoreDelete(sctx.done);
-        err = sctx.result;
-    }
+    err_t err = wg_udp_sendto_any_ctx(p, &dst, dest_port);
     pbuf_free(p);
     return err;
 }
@@ -397,23 +402,22 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
     /* Create raw UDP PCB for WG output (avoids BSD sendto deadlock on TCPIP
      * thread).  Bind to port 51820 to match the DISCO socket source port. */
     if (!s_wg_output_pcb) {
+        /* [triage fixup] netif is already linked into netif_list at this
+         * point, so it must not be freed on failure; fall through with
+         * s_wg_output_pcb == NULL (output cb returns ERR_CONN, DERP still
+         * works) - same degraded behaviour as main when udp_new() failed. */
         s_wg_output_pcb_done = xSemaphoreCreateBinary();
         if (!s_wg_output_pcb_done) {
             ESP_LOGE(TAG, "Failed to allocate WG output PCB semaphore");
-            free(netif);
-            return ESP_FAIL;
-        }
-        err_t cb_err = tcpip_callback(wg_output_pcb_create_in_tcpip, NULL);
-        if (cb_err != ERR_OK) {
-            ESP_LOGE(TAG, "tcpip_callback failed to queue WG output PCB creation: %d", cb_err);
+        } else if (tcpip_callback(wg_output_pcb_create_in_tcpip, NULL) != ERR_OK) {
+            ESP_LOGE(TAG, "tcpip_callback failed to queue WG output PCB creation");
             vSemaphoreDelete(s_wg_output_pcb_done);
             s_wg_output_pcb_done = NULL;
-            free(netif);
-            return ESP_FAIL;
+        } else {
+            xSemaphoreTake(s_wg_output_pcb_done, portMAX_DELAY);
+            vSemaphoreDelete(s_wg_output_pcb_done);
+            s_wg_output_pcb_done = NULL;
         }
-        xSemaphoreTake(s_wg_output_pcb_done, portMAX_DELAY);
-        vSemaphoreDelete(s_wg_output_pcb_done);
-        s_wg_output_pcb_done = NULL;
     }
 
     /* Register output callbacks for magicsock mode */
