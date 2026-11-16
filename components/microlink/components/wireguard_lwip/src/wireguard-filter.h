@@ -32,6 +32,16 @@ struct wireguard_peer *wg_peer_lookup_by_allowed_ip(struct wireguard_device *dev
 /* Inbound: true iff inner source `src` routes back to `peer` (no more-specific owner). */
 bool wg_peer_allowed_source(struct wireguard_device *device, const struct wireguard_peer *peer, const ip_addr_t *src);
 
+/*
+ * A peer endpoint must be a real underlay address. Tunnel-internal (tailnet
+ * 100.64.0.0/10, fd7a:115c:a1e0::/48), loopback, unspecified, link-local,
+ * multicast and broadcast addresses are rejected: an endpoint inside the
+ * tunnel makes every encrypted packet loop back into the WireGuard netif
+ * (unbounded recursion -> stack overflow, triggerable by any tailnet peer).
+ */
+bool wg_endpoint_is_valid_underlay(const ip_addr_t *addr);
+bool wg_endpoint_ip4_is_valid_underlay(uint32_t ip_host_order);
+
 /* wireguard_check_replay() is declared in wireguard.h and implemented in wireguard-filter.c */
 
 #ifdef __cplusplus

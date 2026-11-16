@@ -28,6 +28,7 @@
 #include "nacl_box.h"
 #include "wireguardif.h"
 #include "wireguard.h"
+#include "wireguard-filter.h"
 #include "mbedtls/base64.h"
 #include <string.h>
 #include <errno.h>
@@ -1371,6 +1372,13 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
                          entry[12], entry[13], entry[14], entry[15]);
 
                 if (!is_v4_mapped || port == 0) continue;
+                {
+                    uint32_t cand = ((uint32_t)entry[12] << 24) | ((uint32_t)entry[13] << 16) |
+                                    ((uint32_t)entry[14] << 8) | entry[15];
+                    /* Never probe/install tunnel-internal, loopback, multicast or
+                     * broadcast addresses offered in a CallMeMaybe. */
+                    if (!wg_endpoint_ip4_is_valid_underlay(cand)) continue;
+                }
 
                 uint32_t ip = ((uint32_t)entry[12] << 24) |
                               ((uint32_t)entry[13] << 16) |

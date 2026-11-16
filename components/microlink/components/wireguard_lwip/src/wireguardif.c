@@ -140,6 +140,10 @@ static void update_peer_addr(struct wireguard_peer *peer, const ip_addr_t *addr,
 		WG_DEBUG("[WG] update_peer_addr: skipping DERP (0.0.0.0)\n");
 		return;  // Skip updating endpoint for DERP packets
 	}
+	if (!wg_endpoint_is_valid_underlay(addr)) {
+		WG_DEBUG("[WG] update_peer_addr: refusing non-underlay endpoint %s\n", ipaddr_ntoa(addr));
+		return;
+	}
 	WG_DEBUG("[WG] update_peer_addr: %s:%u\n", ipaddr_ntoa(addr), port);
 	peer->ip = *addr;
 	peer->port = port;
@@ -1022,6 +1026,9 @@ void wireguardif_shutdown(struct netif *netif) {
 err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port) {
 	struct wireguard_peer *peer;
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
+	if (result == ERR_OK && !ip_addr_isany(ip) && !wg_endpoint_is_valid_underlay(ip)) {
+		result = ERR_ARG;
+	}
 	if (result == ERR_OK) {
 		peer->connect_ip = *ip;
 		peer->connect_port = port;

@@ -121,10 +121,27 @@ static void test_replay_window(void) {
 	CHECK(!wireguard_check_replay(&kp, UINT64_MAX));  /* wraps to 0 -> invalid */
 }
 
+static void test_underlay_endpoints(void) {
+	ip_addr_t a;
+	v4(&a, 203, 0, 113, 5);    CHECK(wg_endpoint_is_valid_underlay(&a));
+	v4(&a, 192, 168, 1, 20);   CHECK(wg_endpoint_is_valid_underlay(&a));
+	v4(&a, 100, 64, 0, 1);     CHECK(!wg_endpoint_is_valid_underlay(&a));   /* tailnet: tunnel loop */
+	v4(&a, 100, 127, 255, 1);  CHECK(!wg_endpoint_is_valid_underlay(&a));
+	v4(&a, 100, 128, 0, 1);    CHECK(wg_endpoint_is_valid_underlay(&a));    /* outside /10 */
+	v4(&a, 127, 0, 0, 1);      CHECK(!wg_endpoint_is_valid_underlay(&a));
+	v4(&a, 255, 255, 255, 255);CHECK(!wg_endpoint_is_valid_underlay(&a));
+	v4(&a, 224, 0, 0, 1);      CHECK(!wg_endpoint_is_valid_underlay(&a));
+	v4(&a, 169, 254, 1, 1);    CHECK(!wg_endpoint_is_valid_underlay(&a));
+	v6(&a, 0xfd7a115c, 0xa1e00000, 0, 1);  CHECK(!wg_endpoint_is_valid_underlay(&a));
+	v6(&a, 0x20010db8, 0, 0, 1);           CHECK(wg_endpoint_is_valid_underlay(&a));
+	v6(&a, 0, 0, 0, 1);                    CHECK(!wg_endpoint_is_valid_underlay(&a));   /* ::1 */
+}
+
 int main(void) {
 	test_tx_longest_prefix();
 	test_rx_source_validation();
 	test_replay_window();
+	test_underlay_endpoints();
 	if (failures) {
 		fprintf(stderr, "%d check(s) failed\n", failures);
 		return 1;

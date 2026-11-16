@@ -158,3 +158,30 @@ bool wireguard_check_replay(struct wireguard_keypair *keypair, uint64_t seq) {
 	return result;
 }
 
+bool wg_endpoint_ip4_is_valid_underlay(uint32_t ip_host_order) {
+	const uint32_t a = ip_host_order;
+	if ((a >> 24) == 0 || (a >> 24) == 127) return false;          /* 0/8, loopback */
+	if ((a & 0xFFC00000u) == 0x64400000u) return false;            /* 100.64/10 tailnet (CGNAT) */
+	if ((a & 0xFFFF0000u) == 0xA9FE0000u) return false;            /* 169.254/16 link-local */
+	if ((a >> 28) >= 0xE) return false;                             /* multicast, reserved, broadcast */
+	return true;
+}
+
+bool wg_endpoint_is_valid_underlay(const ip_addr_t *addr) {
+#if LWIP_IPV4
+	if (IP_IS_V4(addr)) {
+		return wg_endpoint_ip4_is_valid_underlay(PP_NTOHL(ip4_addr_get_u32(ip_2_ip4(addr))));
+	}
+#endif
+#if LWIP_IPV6
+	if (IP_IS_V6(addr)) {
+		const uint32_t w0 = PP_NTOHL(ip_2_ip6(addr)->addr[0]);
+		const uint32_t w1 = PP_NTOHL(ip_2_ip6(addr)->addr[1]);
+		if (w0 == 0xfd7a115cu && (w1 >> 16) == 0xa1e0u) return false;  /* fd7a:115c:a1e0::/48 tailnet */
+		if ((w0 >> 24) == 0xff) return false;                          /* multicast */
+		if (ip6_addr_isany(ip_2_ip6(addr)) || ip6_addr_isloopback(ip_2_ip6(addr))) return false;
+		return true;
+	}
+#endif
+	return false;
+}
