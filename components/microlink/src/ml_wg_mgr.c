@@ -24,12 +24,14 @@
 #include "lwip/ip_addr.h"
 #include "lwip/ip.h"
 #include "lwip/tcpip.h"
+#include "lwip/mem.h"
 #include "arch/sys_arch.h" /* sys_thread_tcpip() - detects whether we're already on tcpip_thread */
 #include "nacl_box.h"
 #include "wireguardif.h"
 #include "wireguard.h"
 #include "wireguard-filter.h"
 #include "mbedtls/base64.h"
+#include "mbedtls/platform_util.h"
 #include <string.h>
 #include <errno.h>
 
@@ -331,6 +333,85 @@ static void wg_output_pcb_create_in_tcpip(void *arg) {
     xSemaphoreGive(s_wg_output_pcb_done);
 }
 
+/* Takes the WG netif out of lwIP and frees its WireGuard device, on
+ * tcpip_thread like the bring-up above. Posted through the mailbox (not run
+ * under the core lock), so every message queued before it has already run:
+ * packet input for the netif (tcpip_inpkt from wireguardif) and loopback
+ * polls (netif_poll), which reference the netif and, through replies sent
+ * back out of it, the device. Nothing queues new ones afterwards: wg_mgr has
+ * stopped and the zero-copy PCB is gone. Approach from antmanler 8de2c80 and
+ * ad7cf1c; device free from Csontikka 70cfeba / antmanler 480d905. */
+typedef struct {
+    struct netif *netif;
+    SemaphoreHandle_t done;
+} wg_netif_down_ctx_t;
+
+static void wg_netif_remove_in_tcpip(void *arg) {
+    wg_netif_down_ctx_t *ctx = (wg_netif_down_ctx_t *)arg;
+    struct netif *netif = ctx->netif;
+    netif_set_link_down(netif);
+    netif_set_down(netif);
+    netif_remove(netif);
+#if LWIP_NETIF_LOOPBACK
+    /* netif_remove leaves looped-back packets queued on the netif. */
+    struct pbuf *loop = netif->loop_first;
+    netif->loop_first = netif->loop_last = NULL;
+    if (loop) pbuf_free(loop);
+#endif
+    /* Cancels the device timer (sys_untimeout is tcpip_thread-only), then
+     * zeroes and frees the ~15 KB device: private key, peers, session keys.
+     * It used to be leaked on every stop. */
+    wireguardif_free(netif);
+    xSemaphoreGive(ctx->done);
+}
+
+static void wg_teardown_interface(microlink_t *ml) {
+    struct netif *netif = (struct netif *)ml->wg_netif;
+    if (!netif) return;
+
+#ifdef CONFIG_ML_ZERO_COPY_WG
+    /* The zero-copy receive callback (tcpip_thread) reads ml->wg_netif and
+     * feeds its device; remove the PCB first. wg_mgr is its only sender. */
+    ml_zerocopy_deinit(ml);
+#endif
+    /* Unpublish before teardown, not after the free. */
+    ml->wg_netif = NULL;
+
+    StaticSemaphore_t done_buf;
+    wg_netif_down_ctx_t ctx = {
+        .netif = netif,
+        .done = xSemaphoreCreateBinaryStatic(&done_buf),
+    };
+    err_t err = ERR_MEM;
+    for (int i = 0; i < 20; i++) {
+        err = tcpip_callback(wg_netif_remove_in_tcpip, &ctx);
+        if (err == ERR_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (err != ERR_OK) {
+        /* Freeing a netif lwIP may still route through would crash the
+         * tcpip_thread; leaking it is the lesser evil. */
+        ESP_LOGE(TAG, "Could not reach tcpip_thread to remove the WG netif (%d); leaking it", err);
+        vSemaphoreDelete(ctx.done);
+        return;
+    }
+    xSemaphoreTake(ctx.done, portMAX_DELAY);
+    vSemaphoreDelete(ctx.done);
+    free(netif);
+    ESP_LOGI(TAG, "WireGuard interface removed and device freed");
+}
+
+/* Frees the device of a netif that never reached lwIP (bring-up failed).
+ * Magicsock mode never arms the device timer and has no device PCB, so no
+ * tcpip_thread work is needed. */
+static void wg_free_unlinked_device(struct netif *netif) {
+    struct wireguard_device *device = (struct wireguard_device *)netif->state;
+    if (!device) return;
+    netif->state = NULL;
+    mbedtls_platform_zeroize(device, sizeof(*device));
+    mem_free(device);
+}
+
 static esp_err_t wg_init_interface(microlink_t *ml) {
     /* Convert our WG private key to base64 */
     char privkey_b64[64];
@@ -386,6 +467,7 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
         wg_netif_up_ctx_t ctx = { .netif = netif, .done = xSemaphoreCreateBinary() };
         if (!ctx.done) {
             ESP_LOGE(TAG, "Failed to allocate netif-up semaphore");
+            wg_free_unlinked_device(netif);
             free(netif);
             return ESP_FAIL;
         }
@@ -393,6 +475,7 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
         if (cb_err != ERR_OK) {
             ESP_LOGE(TAG, "tcpip_callback failed to queue netif bring-up: %d", cb_err);
             vSemaphoreDelete(ctx.done);
+            wg_free_unlinked_device(netif);
             free(netif);
             return ESP_FAIL;
         }
@@ -1932,16 +2015,7 @@ void ml_wg_mgr_task(void *arg) {
     }
 
     /* Shutdown WireGuard interface */
-    if (ml->wg_netif) {
-        struct netif *netif = (struct netif *)ml->wg_netif;
-        wireguardif_shutdown(netif);
-        netif_set_link_down(netif);
-        netif_set_down(netif);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        netif_remove(netif);
-        free(netif);
-        ml->wg_netif = NULL;
-    }
+    wg_teardown_interface(ml);
 
     ESP_LOGI(TAG, "WG Manager task exiting");
     ml_task_exit(ml, ML_TASK_BIT_WG_MGR);

@@ -232,13 +232,28 @@ void ml_zerocopy_deinit(microlink_t *ml) {
 
     ESP_LOGI(TAG, "Shutting down zero-copy WG path");
 
+    /* Posted through the tcpip mailbox (not run under the core lock) so any
+     * zc_send_in_tcpip() already queued with this PCB runs before it is
+     * removed. The semaphore is static, so it cannot fail to allocate (the
+     * old code then returned with the PCB still live, its receive callback
+     * reading a netif about to be freed), and a failed post is retried
+     * rather than waited on forever. Approach from antmanler 446c58f. */
+    StaticSemaphore_t done_buf;
     zc_setup_ctx_t ctx = {
         .ml = ml,
-        .done = xSemaphoreCreateBinary(),
+        .done = xSemaphoreCreateBinaryStatic(&done_buf),
     };
-    if (!ctx.done) return;
-
-    tcpip_callback(zc_pcb_remove_in_tcpip, &ctx);
+    err_t err = ERR_MEM;
+    for (int i = 0; i < 20; i++) {
+        err = tcpip_callback(zc_pcb_remove_in_tcpip, &ctx);
+        if (err == ERR_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (err != ERR_OK) {
+        ESP_LOGE(TAG, "Could not reach tcpip_thread to remove the zero-copy PCB (%d)", err);
+        vSemaphoreDelete(ctx.done);
+        return;
+    }
     xSemaphoreTake(ctx.done, portMAX_DELAY);
     vSemaphoreDelete(ctx.done);
 }
