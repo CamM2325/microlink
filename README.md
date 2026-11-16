@@ -49,7 +49,7 @@ Production-ready Tailscale VPN client for the ESP32 platform with WiFi and 4G ce
 
 ## Requirements
 
-- ESP-IDF v5.0 or later (tested with v5.3)
+- ESP-IDF v5.3 or later, including v6.x (CI builds v5.3, v5.5 and v6.1). On ESP-IDF 6, cJSON is fetched from the component registry (`espressif/cjson`) automatically.
 - ESP32 with WiFi (ESP32-S3 with PSRAM recommended)
 - Tailscale account with auth key (generate at https://login.tailscale.com/admin/settings/keys)
 - For cellular: ESP32-compatible 4G cellular module (e.g., SIM7600, SIM7670) + active SIM card
