@@ -210,12 +210,11 @@ int microlink_get_peer_count(const microlink_t *ml);
 esp_err_t microlink_get_peer_info(const microlink_t *ml, int index, microlink_peer_info_t *info);
 
 /**
- * @brief Send UDP data to a peer by VPN IP
- * @param ml Handle
- * @param dest_vpn_ip Destination VPN IP (host byte order)
- * @param data Payload
- * @param len Payload length (max 1400 bytes)
- * @return ESP_OK on success, ESP_ERR_TIMEOUT if send queue full
+ * @brief Deprecated: always returns ESP_ERR_NOT_SUPPORTED.
+ *
+ * Earlier versions sent the payload unencrypted over DERP. Use
+ * microlink_udp_create()/microlink_udp_send() or microlink_tcp_connect(),
+ * which go through the WireGuard tunnel.
  */
 esp_err_t microlink_send(microlink_t *ml, uint32_t dest_vpn_ip,
                           const uint8_t *data, size_t len);

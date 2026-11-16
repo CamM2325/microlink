@@ -935,18 +935,12 @@ esp_err_t microlink_get_peer_info(const microlink_t *ml, int index, microlink_pe
 
 esp_err_t microlink_send(microlink_t *ml, uint32_t dest_vpn_ip,
                           const uint8_t *data, size_t len) {
-    if (!ml || !data || len == 0 || len > 1400) return ESP_ERR_INVALID_ARG;
-    if (ml->state != ML_STATE_CONNECTED) return ESP_ERR_INVALID_STATE;
-
-    /* Find peer by VPN IP */
-    for (int i = 0; i < ml->peer_count; i++) {
-        if (ml->peers[i].vpn_ip == dest_vpn_ip && ml->peers[i].active) {
-            /* TODO: Route through WireGuard tunnel */
-            /* For now, queue via DERP as fallback */
-            return ml_derp_queue_send(ml, ml->peers[i].public_key, data, len);
-        }
-    }
-    return ESP_ERR_NOT_FOUND;
+    /* This used to put the raw payload into a DERP SendPacket - NOT through
+     * WireGuard - so the relay operator could read it and the peer discarded
+     * it. Refuse instead of silently leaking data; use microlink_udp_* or
+     * microlink_tcp_*, which go through the encrypted tunnel. */
+    (void)ml; (void)dest_vpn_ip; (void)data; (void)len;
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 /* ============================================================================

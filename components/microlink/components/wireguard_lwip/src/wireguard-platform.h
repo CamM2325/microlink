@@ -39,7 +39,14 @@
 
 // Peers are allocated statically inside the device structure to avoid malloc
 // Increased from 1 to support multiple Tailscale peers (10 peers for larger networks)
+/* Follow MicroLink's peer-table size so every tracked peer can get a tunnel
+ * (it used to be fixed at 16 while CONFIG_ML_MAX_PEERS allowed up to 64). */
+#include "sdkconfig.h"
+#if defined(CONFIG_ML_MAX_PEERS) && CONFIG_ML_MAX_PEERS > 16
+#define WIREGUARD_MAX_PEERS CONFIG_ML_MAX_PEERS
+#else
 #define WIREGUARD_MAX_PEERS 16
+#endif
 #define WIREGUARD_MAX_SRC_IPS 2
 
 // Per device limit on accepting (valid) initiation requests - per peer
