@@ -651,7 +651,7 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
      * beyond the 65535 default. SETTINGS INITIAL_WINDOW_SIZE only sets per-stream
      * window; the connection-level window starts at 65535 and must be explicitly
      * expanded with WINDOW_UPDATE on stream 0. */
-    uint32_t conn_window_delta = ML_H2_BUFFER_SIZE - 65535;
+    uint32_t conn_window_delta = (ML_H2_BUFFER_SIZE > 65535) ? (ML_H2_BUFFER_SIZE - 65535) : 0;
     if (conn_window_delta > 0) {
         int wu_len = ml_h2_build_window_update(h2_init + pos, sizeof(h2_init) - pos,
                                                 0, conn_window_delta);
@@ -1462,10 +1462,15 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
             last_progress_ms = now;
         }
 
-        /* Proactive WINDOW_UPDATE every 32KB to keep server sending.
-         * Must update BOTH connection-level (stream 0) AND stream-level (stream 3)
-         * windows, otherwise the server stalls when either window exhausts. */
-        if (window_consumed >= 32768) {
+        /* Proactive WINDOW_UPDATE at half our declared stream window to keep
+         * the server sending. Must update BOTH connection-level (stream 0) AND
+         * stream-level (stream 3) windows, otherwise the server stalls when
+         * either window exhausts. Scaled to ML_H2_BUFFER_SIZE (our declared
+         * INITIAL_WINDOW_SIZE) instead of a fixed 32KB — a hardcoded 32KB
+         * threshold silently truncates responses on configs with a smaller
+         * buffer (e.g. 16-32KB on boards without PSRAM): the server exhausts
+         * our declared window before this ever fires. */
+        if (window_consumed >= ML_H2_BUFFER_SIZE / 2) {
             uint8_t wu_buf[26];  /* 2 WINDOW_UPDATE frames: 13 bytes each */
             int wu_len = ml_h2_build_window_update(wu_buf, 13, 0, (uint32_t)window_consumed);
             wu_len += ml_h2_build_window_update(wu_buf + wu_len, 13, 3, (uint32_t)window_consumed);
