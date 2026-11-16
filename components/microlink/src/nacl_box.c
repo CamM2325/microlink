@@ -10,6 +10,7 @@
 #include "x25519.h"
 #include <string.h>
 #include <stdbool.h>
+#include "freertos/FreeRTOS.h"
 
 /* Debug logging - set to 1 to enable */
 #define NACL_BOX_DEBUG 0
@@ -561,6 +562,10 @@ static struct {
 static int s_shared_cache_next;
 
 static uint8_t s_shared_cache_owner_sk[32];
+/* [triage fixup] disco_send_call_me_maybe() is reachable from app tasks via
+ * ml_wg_mgr_send_cmm() (ml_tcp.c / ml_udp.c), not only from ml_wg_mgr, so the
+ * cache needs a lock. The X25519 itself runs outside the critical section. */
+static portMUX_TYPE s_shared_cache_lock = portMUX_INITIALIZER_UNLOCKED;
 
 int nacl_box_shared_get(uint8_t *shared_key,
                         const uint8_t *peer_pk,
@@ -570,6 +575,8 @@ int nacl_box_shared_get(uint8_t *shared_key,
      * failure -> ephemeral keys, or multiple instances) every hit would return
      * a shared secret derived from the OLD key and DISCO would silently stop
      * working. Flush when the owning secret key changes. */
+    bool hit = false;
+    taskENTER_CRITICAL(&s_shared_cache_lock);
     if (memcmp(s_shared_cache_owner_sk, our_sk, 32) != 0) {
         memset(s_shared_cache, 0, sizeof(s_shared_cache));
         s_shared_cache_next = 0;
@@ -579,18 +586,25 @@ int nacl_box_shared_get(uint8_t *shared_key,
         if (s_shared_cache[i].valid &&
             memcmp(s_shared_cache[i].peer_pk, peer_pk, 32) == 0) {
             memcpy(shared_key, s_shared_cache[i].shared_key, 32);
-            return 0;
+            hit = true;
+            break;
         }
     }
+    taskEXIT_CRITICAL(&s_shared_cache_lock);
+    if (hit) return 0;
 
     int ret = nacl_box_beforenm(shared_key, peer_pk, our_sk);
     if (ret != 0) return ret;
 
-    int slot = s_shared_cache_next;
-    s_shared_cache_next = (s_shared_cache_next + 1) % NACL_SHARED_CACHE_SLOTS;
-    memcpy(s_shared_cache[slot].peer_pk, peer_pk, 32);
-    memcpy(s_shared_cache[slot].shared_key, shared_key, 32);
-    s_shared_cache[slot].valid = true;
+    taskENTER_CRITICAL(&s_shared_cache_lock);
+    if (memcmp(s_shared_cache_owner_sk, our_sk, 32) == 0) {
+        int slot = s_shared_cache_next;
+        s_shared_cache_next = (s_shared_cache_next + 1) % NACL_SHARED_CACHE_SLOTS;
+        memcpy(s_shared_cache[slot].peer_pk, peer_pk, 32);
+        memcpy(s_shared_cache[slot].shared_key, shared_key, 32);
+        s_shared_cache[slot].valid = true;
+    }
+    taskEXIT_CRITICAL(&s_shared_cache_lock);
     return 0;
 }
 
