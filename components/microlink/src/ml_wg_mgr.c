@@ -70,7 +70,7 @@ typedef struct {
     bool active;
 } disco_probe_t;
 
-#define MAX_PENDING_PROBES 32
+#define MAX_PENDING_PROBES 64  /* one probe per destination (see disco_ping_round) */
 static disco_probe_t pending_probes[MAX_PENDING_PROBES];
 
 /* ============================================================================
@@ -816,7 +816,12 @@ static void process_peer_updates(microlink_t *ml) {
  * DISCO Protocol
  * ========================================================================== */
 
+/* dest_ip/dest_port: the single address this ping is sent to (host byte
+ * order), or 0/0 when sent via DERP. Recorded in the probe so that a PONG only
+ * proves a direct path to the exact address we pinged (Tailscale: one txid per
+ * endpoint, handlePongConnLocked uses the ping's destination sp.to). */
 static void disco_build_ping(microlink_t *ml, int peer_idx,
+                               uint32_t dest_ip, uint16_t dest_port,
                                uint8_t *out, size_t *out_len) {
     ml_peer_t *p = &ml->peers[peer_idx];
 
@@ -856,6 +861,8 @@ static void disco_build_ping(microlink_t *ml, int peer_idx,
         if (!pending_probes[i].active) {
             memcpy(pending_probes[i].txid, txid, DISCO_TXID_LEN);
             pending_probes[i].peer_index = peer_idx;
+            pending_probes[i].dest_ip = dest_ip;
+            pending_probes[i].dest_port = dest_port;
             pending_probes[i].sent_ms = ml_get_time_ms();
             pending_probes[i].active = true;
             registered = true;
@@ -926,13 +933,12 @@ static void disco_build_pong(microlink_t *ml, int peer_idx,
  * to back - the actual bug (multiple independent probe-table registrations
  * per address per incoming CallMeMaybe) this replaces.
  *
- * Still shares one txid/ciphertext across every destination sent to this
- * round (one probe-table registration, not one per address) - the plaintext
- * doesn't depend on the destination, and this project's own PONG matching
- * already disambiguates which address actually answered via the reply's
- * source IP (process_disco_pong()), not via a per-address txid the way real
- * Tailscale's does. That part is an intentional simplification, not
- * something this change needed to touch. */
+ * SECURITY: every destination gets its own ping (own txid), like Tailscale.
+ * A PONG's outer UDP source is not authenticated, so process_disco_pong()
+ * only accepts a direct path if the PONG returns from the exact address that
+ * txid was sent to. Sharing one txid across destinations let an on-path
+ * attacker re-send a captured PONG from its own address and become the
+ * peer's "direct path". */
 static void disco_ping_round(microlink_t *ml, int peer_idx, bool force) {
     ml_peer_t *p = &ml->peers[peer_idx];
     uint64_t now = ml_get_time_ms();
@@ -969,19 +975,19 @@ static void disco_ping_round(microlink_t *ml, int peer_idx, bool force) {
 
     uint8_t pkt[256];
     size_t pkt_len = 0;
-    disco_build_ping(ml, peer_idx, pkt, &pkt_len);
-    if (pkt_len == 0) return;
 
     bool direct_sent = false;
     bool has_udp = disco_has_udp_path(ml);
 
     if (has_udp) {
         if (best_eligible) {
+            disco_build_ping(ml, peer_idx, p->best_ip, p->best_port, pkt, &pkt_len);
             disco_udp_sendto(ml, pkt, pkt_len, p->best_ip, p->best_port);
             direct_sent = true;
         }
         for (int i = 0; i < p->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
             if (p->endpoints[i].is_ipv6 || p->endpoints[i].ip == 0 || !eligible[i]) continue;
+            disco_build_ping(ml, peer_idx, p->endpoints[i].ip, p->endpoints[i].port, pkt, &pkt_len);
             int ret = disco_udp_sendto(ml, pkt, pkt_len, p->endpoints[i].ip, p->endpoints[i].port);
             p->endpoints[i].last_ping_ms = now;
             if (!direct_sent) {  /* Log only first direct send per peer */
@@ -1003,6 +1009,7 @@ static void disco_ping_round(microlink_t *ml, int peer_idx, bool force) {
      * Skip DERP for heartbeat pings when direct path is active to avoid
      * DERP pong stealing the probe match from the direct pong. */
     if (!p->has_direct_path || !direct_sent) {
+        disco_build_ping(ml, peer_idx, 0, 0, pkt, &pkt_len);
         ml_derp_queue_send(ml, p->public_key, pkt, pkt_len);
         ESP_LOGD(TAG, "DISCO PING -> %s via DERP", p->hostname);
     } else {
@@ -1113,14 +1120,31 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
         ml_peer_t *p = &ml->peers[peer_idx];
         uint64_t rtt_ms = now - pending_probes[i].sent_ms;
 
+        /* The PONG must be boxed by the disco key of the peer we pinged. */
+        if (memcmp(sender_disco_key, p->disco_key, 32) != 0) {
+            ESP_LOGW(TAG, "DISCO PONG txid match but wrong disco key for %s, ignoring", p->hostname);
+            continue;
+        }
+
+        /* The outer UDP source of a PONG is NOT authenticated: only treat it as
+         * proof of a direct path if it came back from exactly the address this
+         * txid was sent to. */
+        bool path_ok = !pkt->via_derp && pending_probes[i].dest_ip != 0 &&
+                       pkt->src_ip == pending_probes[i].dest_ip &&
+                       pkt->src_port == pending_probes[i].dest_port;
+        if (!pkt->via_derp && !path_ok) {
+            ESP_LOGW(TAG, "DISCO PONG for %s from an address we did not ping, ignoring", p->hostname);
+            continue;
+        }
+
         ESP_LOGD(TAG, "DISCO PONG from %s: RTT=%llu ms (via %s)",
                  p->hostname, (unsigned long long)rtt_ms,
                  pkt->via_derp ? "DERP" : "direct");
 
         p->last_pong_recv_ms = now;
 
-        /* If direct reply, update best path */
-        if (!pkt->via_derp && pkt->src_ip != 0) {
+        /* Direct reply from the pinged address: update best path */
+        if (path_ok) {
             p->best_ip = pkt->src_ip;
             p->best_port = pkt->src_port;
             p->has_direct_path = true;
