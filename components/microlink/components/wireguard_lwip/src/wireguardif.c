@@ -31,12 +31,21 @@
  */
 
 #include "wireguardif.h"
+#include "wireguard-filter.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+/* Serializes transport-data encryption (send counter = nonce), see wireguardif_output_to_peer(). */
+static SemaphoreHandle_t s_wg_tx_lock;
+static StaticSemaphore_t s_wg_tx_lock_buf;
 
 #include <string.h>
 #include <stdlib.h>
 
 #include "lwip/netif.h"
 #include "lwip/ip.h"
+#include "lwip/prot/ip4.h"
+#include "lwip/prot/ip6.h"
 #include "lwip/udp.h"
 #include "lwip/mem.h"
 #include "lwip/sys.h"
@@ -134,35 +143,6 @@ static void update_peer_addr(struct wireguard_peer *peer, const ip_addr_t *addr,
 	WG_DEBUG("[WG] update_peer_addr: %s:%u\n", ipaddr_ntoa(addr), port);
 	peer->ip = *addr;
 	peer->port = port;
-}
-
-static struct wireguard_peer *peer_lookup_by_allowed_ip(struct wireguard_device *device, const ip_addr_t *ipaddr) {
-	struct wireguard_peer *result = NULL;
-	struct wireguard_peer *fallback = NULL;
-	struct wireguard_peer *tmp;
-	int x;
-	int y;
-	for (x=0; x < WIREGUARD_MAX_PEERS; x++) {
-		tmp = &device->peers[x];
-		if (tmp->valid) {
-			for (y=0; y < WIREGUARD_MAX_SRC_IPS; y++) {
-				if ((tmp->allowed_source_ips[y].valid) && IP_ADDR_NETCMP_COMPAT(ipaddr, &tmp->allowed_source_ips[y].ip, &tmp->allowed_source_ips[y].mask)) {
-					// Prefer peers with valid keypairs (can actually send encrypted data)
-					// This optimization is from GrieferPig's fork
-					if (tmp->curr_keypair.valid || tmp->prev_keypair.valid) {
-						result = tmp;
-						break;
-					} else if (!fallback) {
-						// Remember first match without valid keypair as fallback
-						fallback = tmp;
-					}
-					break;
-				}
-			}
-			if (result) break;
-		}
-	}
-	return result ? result : fallback;
 }
 
 static bool wireguardif_can_send_initiation(struct wireguard_peer *peer) {
@@ -325,8 +305,8 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 
 				hdr->type = MESSAGE_TRANSPORT_DATA;
 				hdr->receiver = keypair->remote_index;
-				// Alignment required... pbuf_alloc has probably aligned data, but want to be sure
-				U64TO8_LITTLE(hdr->counter, keypair->sending_counter);
+				// Copy the plaintext first (outside the lock), then reserve the
+				// counter + encrypt under the TX lock below.
 
 				// Copy the encrypted (padded) data to the output packet - chacha20poly1305_encrypt() can encrypt data in-place which avoids call to mem_malloc
 				dst = &hdr->enc_packet[0];
@@ -339,8 +319,15 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 					pbuf_copy_partial(q, dst, unpadded_len, 0);
 				}
 
-				// Then encrypt
+				// SECURITY: the send counter is the AEAD nonce. Packets are encrypted
+				// from more than one task (tcpip_thread netif output and the wg_mgr
+				// task: keepalives, handshake-completion flushes), so "read counter,
+				// write header, encrypt, increment" must be atomic or two packets can
+				// be sealed under the same nonce, which breaks ChaCha20-Poly1305.
+				xSemaphoreTake(s_wg_tx_lock, portMAX_DELAY);
+				U64TO8_LITTLE(hdr->counter, keypair->sending_counter);
 				wireguard_encrypt_packet(dst, dst, padded_len, keypair);
+				xSemaphoreGive(s_wg_tx_lock);
 
 				WG_DEBUG("[WG_TX] Sending encrypted DATA packet: %u bytes, remote_idx=%lu\n",
 				       (unsigned)pbuf->tot_len, (unsigned long)hdr->receiver);
@@ -392,7 +379,7 @@ static err_t wireguardif_output(struct netif *netif, struct pbuf *q, const ip4_a
 	WG_DEBUG("[WG_OUTPUT] Looking up peer for dest %s\n", ipaddr_ntoa(&addr));
 
 
-	struct wireguard_peer *peer = peer_lookup_by_allowed_ip(device, &addr);
+	struct wireguard_peer *peer = wg_peer_lookup_by_allowed_ip(device, &addr);
 	if (peer) {
 		WG_DEBUG("[WG_OUTPUT] Found peer, peer_index=%d, valid=%d\n",
 		       (int)(peer - device->peers), peer->valid);
@@ -491,10 +478,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 	uint8_t *src;
 	size_t src_len;
 	struct pbuf *pbuf;
-	struct ip_hdr *iphdr;
-	ip_addr_t dest;
 	bool dest_ok = false;
-	int x;
 	uint32_t now;
 	uint16_t header_len = 0xFFFF;
 	uint32_t idx = data_hdr->receiver;
@@ -502,139 +486,103 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 	keypair = get_peer_keypair_for_idx(peer, idx);
 
 	if (keypair) {
-		if (
-				(keypair->receiving_valid) &&
-				!wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME) &&
-				(keypair->sending_counter < REJECT_AFTER_MESSAGES)
-
-		) {
+		if ((keypair->receiving_valid) && !wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME)) {
 
 			nonce = U8TO64_LITTLE(data_hdr->counter);
 			src = &data_hdr->enc_packet[0];
 			src_len = data_len;
 
-			// We don't know the unpadded size until we have decrypted the packet and validated/inspected the IP header
-			pbuf = pbuf_alloc(PBUF_TRANSPORT, src_len - WIREGUARD_AUTHTAG_LEN, PBUF_RAM);
+			// Reject-After-Messages applies to the RECEIVED counter. The counter is
+			// not authenticated yet, so only drop this packet - never destroy the
+			// keypair on the strength of it.
+			pbuf = NULL;
+			if (nonce < REJECT_AFTER_MESSAGES) {
+				// We don't know the unpadded size until we have decrypted the packet and validated/inspected the IP header
+				pbuf = pbuf_alloc(PBUF_TRANSPORT, src_len - WIREGUARD_AUTHTAG_LEN, PBUF_RAM);
+			}
 			if (pbuf) {
 				// Decrypt the packet
 				memset(pbuf->payload, 0, pbuf->tot_len);
 				bool decrypt_ok = wireguard_decrypt_packet(pbuf->payload, src, src_len, nonce, keypair);
 				WG_DEBUG("[WG_DECRYPT] result=%d, src_len=%u, nonce=%llu\n",
 				       decrypt_ok, (unsigned)src_len, (unsigned long long)nonce);
-				if (decrypt_ok) {
 
-					// 3. Since the packet has authenticated correctly, the source IP of the outer UDP/IP packet is used to update the endpoint for peer TrMv...WXX0.
-					// Update the peer location
+				// SECURITY: the anti-replay check runs immediately after authentication
+				// and BEFORE any peer/keypair state is touched - for every packet,
+				// keep-alives included. Otherwise a captured packet re-sent from another
+				// address moves the peer endpoint (endpoint hijack), refreshes last_rx,
+				// rotates keypairs, or brings the link up.
+				if (decrypt_ok && wireguard_check_replay(keypair, nonce)) {
+
+					// 3. Authentic and fresh: the outer source address may now update the
+					// peer endpoint (roaming). DERP-delivered packets (0.0.0.0) are ignored.
 					update_peer_addr(peer, addr, port);
 
 					now = wireguard_sys_now();
 					keypair->last_rx = now;
 					peer->last_rx = now;
 
-					// Might need to shuffle next key --> current keypair
-					keypair_update(peer, keypair);
-
 					// Check to see if we should rekey
 					if (keypair->initiator && wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME - peer->keepalive_interval - REKEY_TIMEOUT)) {
 						peer->send_handshake = true;
 					}
 
+					// Might need to shuffle next key --> current keypair. If 'keypair' was
+					// next_keypair it has been copied to curr_keypair and its slot zeroed,
+					// so it must not be used after this point.
+					keypair_update(peer, keypair);
+					keypair = NULL;
+
 					// Make sure that link is reported as up
 					wireguardif_mark_link_up(device->netif);
 
 					if (pbuf->tot_len > 0) {
-						//4a. Once the packet payload is decrypted, the interface has a plaintext packet. If this is not an IP packet, it is dropped.
-						iphdr = (struct ip_hdr *)pbuf->payload;
-						// Check for packet replay / dupes
-						if (wireguard_check_replay(keypair, nonce)) {
-
-							// 4b. Otherwise, WireGuard checks to see if the source IP address of the plaintext inner-packet routes correspondingly in the cryptokey routing table
-							// Also check packet length!
+						// 4a. Plaintext must be a well-formed IP packet, otherwise drop.
+						// 4b. Its inner SOURCE address must route back to this same peer in
+						//     the cryptokey routing table (longest-prefix match over all peers).
+						ip_addr_t src_ip;
+						const struct ip_hdr *iphdr = (const struct ip_hdr *)pbuf->payload;
+						const u8_t ver = (pbuf->len >= 1) ? IPH_V(iphdr) : 0;
 #if LWIP_IPV4
-							if (IPH_V(iphdr) == 4) {
-								// Check SOURCE IP (where packet came from) against peer's allowed IPs
-								// This is cryptokey routing: verify the inner packet source matches
-								// what this peer is allowed to send as.
-								ip_addr_t src_ip;
-								ip_addr_copy_from_ip4(src_ip, iphdr->src);
-								ip_addr_copy_from_ip4(dest, iphdr->dest);
-								WG_DEBUG("[WG_RX_IP] IPv4 src=%d.%d.%d.%d dest=%d.%d.%d.%d, tot_len=%u\n",
-								       ip4_addr1_16(ip_2_ip4(&src_ip)),
-								       ip4_addr2_16(ip_2_ip4(&src_ip)),
-								       ip4_addr3_16(ip_2_ip4(&src_ip)),
-								       ip4_addr4_16(ip_2_ip4(&src_ip)),
-								       ip4_addr1_16(ip_2_ip4(&dest)),
-								       ip4_addr2_16(ip_2_ip4(&dest)),
-								       ip4_addr3_16(ip_2_ip4(&dest)),
-								       ip4_addr4_16(ip_2_ip4(&dest)),
-								       (unsigned)pbuf->tot_len);
-								// Check if SOURCE IP matches this peer's allowed IPs
-								for (x=0; x < WIREGUARD_MAX_SRC_IPS; x++) {
-									if (peer->allowed_source_ips[x].valid) {
-										if (IP_ADDR_NETCMP_COMPAT(&src_ip, &peer->allowed_source_ips[x].ip, &peer->allowed_source_ips[x].mask)) {
-											dest_ok = true;
-											header_len = PP_NTOHS(IPH_LEN(iphdr));
-											WG_DEBUG("[WG_RX_IP] Allowed by rule %d (src matches), header_len=%u\n", x, (unsigned)header_len);
-											break;
-										}
-									}
-								}
-								if (!dest_ok) {
-									WG_DEBUG("[WG_RX_IP] DROPPED: src IP not in peer's allowed_source_ips\n");
-								}
-							}
+						if (ver == 4 && pbuf->len >= IP_HLEN) {
+							ip_addr_copy_from_ip4(src_ip, iphdr->src);
+							header_len = PP_NTOHS(IPH_LEN(iphdr));
+							dest_ok = (header_len >= IP_HLEN) && wg_peer_allowed_source(device, peer, &src_ip);
+						}
 #endif /* LWIP_IPV4 */
 #if LWIP_IPV6
-							if (IPH_V(iphdr) == 6) {
-								// TODO: IPV6 support for route filtering
-								header_len = PP_NTOHS(IPH_LEN(iphdr));
-								dest_ok = true;
-							}
+						if (ver == 6 && pbuf->len >= IP6_HLEN) {
+							const struct ip6_hdr *ip6hdr = (const struct ip6_hdr *)pbuf->payload;
+							ip_addr_copy_from_ip6_packed(src_ip, ip6hdr->src);
+							header_len = (uint16_t)(IP6_HLEN + IP6H_PLEN(ip6hdr));
+							dest_ok = wg_peer_allowed_source(device, peer, &src_ip);
+						}
 #endif /* LWIP_IPV6 */
-							if (header_len <= pbuf->tot_len) {
-
-								// 5. If the plaintext packet has not been dropped, it is inserted into the receive queue of the wg0 interface.
-								if (dest_ok) {
-									// Send packet to be processed by LWIP via netif->input(),
-									// NOT a hardcoded ip_input(): this whole function runs on
-									// the caller's own task (ml_wg_mgr, not lwIP's tcpip_thread),
-									// and ip_input()/ip4_input() is not thread-safe - it must
-									// only run on tcpip_thread. wg_init_interface() already sets
-									// netif->input = tcpip_input specifically so RX code would
-									// dispatch there instead of entering the IP stack directly -
-									// calling the netif's own configured input function (rather
-									// than hardcoding tcpip_input() here too) actually honors
-									// that existing setup, instead of just swapping one hardcoded
-									// function for another that happens to currently match it.
-									// Root-caused on real hardware (2026-08-20) - matches
-									// CamM2325/microlink#17 exactly; a stale comment here used to
-									// (incorrectly) claim ip_input()
-									// already dispatches to tcpip_thread internally, which it
-									// does not.
-									WG_DEBUG("[WG_RX_IP] Passing %u bytes to IP layer\n", (unsigned)pbuf->tot_len);
-									err_t input_err = device->netif->input(pbuf, device->netif);
-									if (input_err == ERR_OK) {
-										// pbuf ownership transferred to netif->input()
-										pbuf = NULL;
-									} else {
-										WG_DEBUG("[WG_RX_IP] netif->input() failed: %d, dropping\n", input_err);
-										// pbuf stays non-NULL - freed by this function's
-										// normal cleanup path below
-									}
-								} else {
-									WG_DEBUG("[WG_RX_IP] DROPPED: dest_ok=false\n");
-								}
-							} else {
-								// IP header is corrupt or lied about packet size
-								WG_DEBUG("[WG_RX_IP] DROPPED: header_len=%u > tot_len=%u\n",
-								       (unsigned)header_len, (unsigned)pbuf->tot_len);
-							}
+						if (!dest_ok) {
+							WG_DEBUG("[WG_RX_IP] DROPPED: v%u inner source not routed to this peer (or malformed)\n", (unsigned)ver);
+						} else if (header_len > pbuf->tot_len) {
+							// IP header is corrupt or lied about packet size
+							WG_DEBUG("[WG_RX_IP] DROPPED: header_len=%u > tot_len=%u\n",
+							       (unsigned)header_len, (unsigned)pbuf->tot_len);
 						} else {
-							// This is a duplicate packet / replayed / too far out of order
+							// 5. Deliver via netif->input (= tcpip_input), never ip_input():
+							// this runs on the wg_mgr task, and lwIP's IP/TCP input must run
+							// on tcpip_thread (issue #17).
+							WG_DEBUG("[WG_RX_IP] Passing %u bytes to IP layer\n", (unsigned)pbuf->tot_len);
+							err_t input_err = device->netif->input(pbuf, device->netif);
+							if (input_err == ERR_OK) {
+								// pbuf ownership transferred to netif->input()
+								pbuf = NULL;
+							} else {
+								WG_DEBUG("[WG_RX_IP] netif->input() failed: %d, dropping\n", input_err);
+							}
 						}
 					} else {
 						// This was a keep-alive packet
 					}
+				} else if (decrypt_ok) {
+					// Authenticated but duplicate / replayed / too old: change nothing
+					WG_DEBUG("[WG_RX] DROPPED: replayed or too old, nonce=%llu\n", (unsigned long long)nonce);
 				}
 
 				if (pbuf) {
@@ -642,11 +590,11 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 				}
 			}
 
-
 		} else {
-			//After Reject-After-Messages transport data messages or after the current secure session is Reject- After-Time seconds old,
-			// whichever comes first, WireGuard will refuse to send or receive any more transport data messages using the current secure session,
-			// until a new secure session is created through the 1-RTT handshake
+			// After the current secure session is Reject-After-Time seconds old WireGuard will refuse
+			// to send or receive any more transport data messages using it, until a new secure session
+			// is created through the 1-RTT handshake. (Reject-After-Messages is checked above against
+			// the received counter and only drops that packet.)
 			keypair_destroy(keypair);
 		}
 
@@ -915,9 +863,8 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 			peer = peer_lookup_by_handshake(device, msg_cookie->receiver);
 			if (peer) {
 				if (wireguard_process_cookie_message(device, peer, msg_cookie)) {
-					// Update the peer location
-					update_peer_addr(peer, addr, port);
-
+					// Do NOT update the peer endpoint here: a cookie reply is not proof
+					// of a live session (wireguard-go doesn't roam on it either).
 					// Don't send anything out - we stay quiet until the next initiation message
 				}
 			}
@@ -1305,6 +1252,9 @@ void wireguardif_periodic(struct netif *netif) {
 
 err_t wireguardif_init(struct netif *netif) {
 	err_t result;
+	if (!s_wg_tx_lock) {
+		s_wg_tx_lock = xSemaphoreCreateMutexStatic(&s_wg_tx_lock_buf);
+	}
 	struct wireguardif_init_data *init_data;
 	struct wireguard_device *device;
 	struct udp_pcb *udp;

@@ -121,7 +121,7 @@ struct wireguard_keypair {
 	uint32_t last_tx;
 	uint32_t last_rx;
 
-	uint32_t replay_bitmap;
+	uint64_t replay_bitmap;
 	uint64_t replay_counter;
 
 	uint32_t local_index; // This is the index we generated for our end

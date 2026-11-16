@@ -317,52 +317,7 @@ static void wireguard_kdf3(uint8_t *tau1, uint8_t *tau2, uint8_t *tau3, const ui
 	crypto_zero(output, sizeof(output));
 }
 
-bool wireguard_check_replay(struct wireguard_keypair *keypair, uint64_t seq) {
-	// Implementation of packet replay window - as per RFC2401
-	// Adapted from code in Appendix C at https://tools.ietf.org/html/rfc2401
-	uint32_t diff;
-	bool result = false;
-	size_t ReplayWindowSize = sizeof(keypair->replay_bitmap) * CHAR_BIT; // 32 bits
-
-	// WireGuard data packet counter starts from 0 but algorithm expects packet numbers to start from 1
-	seq++;
-
-	if (seq != 0) {
-		if (seq > keypair->replay_counter) {
-			// new larger sequence number
-			diff = seq - keypair->replay_counter;
-			if (diff < ReplayWindowSize) {
-				// In window
-				keypair->replay_bitmap <<= diff;
-				// set bit for this packet
-				keypair->replay_bitmap |= 1;
-			} else {
-				// This packet has a "way larger"
-				keypair->replay_bitmap = 1;
-			}
-			keypair->replay_counter = seq;
-			// larger is good
-			result = true;
-		} else {
-			diff = keypair->replay_counter - seq;
-			if (diff < ReplayWindowSize) {
-				if (keypair->replay_bitmap & ((uint32_t)1 << diff)) {
-					// already seen
-				} else {
-					// mark as seen
-					keypair->replay_bitmap |= ((uint32_t)1 << diff);
-					// out of order but good
-					result = true;
-				}
-			} else {
-				// too old or wrapped
-			}
-		}
-	} else {
-		// first == 0 or wrapped
-	}
-	return result;
-}
+/* wireguard_check_replay() lives in wireguard-filter.c (host-testable). */
 
 struct wireguard_keypair *get_peer_keypair_for_idx(struct wireguard_peer *peer, uint32_t idx) {
 	if (peer->curr_keypair.valid && peer->curr_keypair.local_index == idx) {
@@ -395,7 +350,11 @@ static uint32_t wireguard_generate_unique_index(struct wireguard_device *device)
 					(result == peer->prev_keypair.local_index) ||
 					(result == peer->next_keypair.local_index) ||
 					(result == peer->handshake.local_index);
-
+			if (existing) {
+				// Index already in use - regenerate (previously only the LAST
+				// peer slot was effectively checked).
+				break;
+			}
 		}
 	} while (existing);
 
@@ -611,7 +570,9 @@ struct wireguard_peer *wireguard_process_initiation_message(struct wireguard_dev
 
 					// Check that timestamp is increasing and we haven't had too many initiations (should only get one per peer every 5 seconds max?)
 					replay = (memcmp(t, peer->greatest_timestamp, WIREGUARD_TAI64N_LEN) <= 0); // tai64n is big endian so we can use memcmp to compare
-					rate_limit = (peer->last_initiation_rx - now) < (1000 / MAX_INITIATIONS_PER_SECOND);
+					// Elapsed time is (now - last); the old (last - now) wrapped, so the limit
+					// never applied. last_initiation_rx == 0 means none received yet.
+					rate_limit = (peer->last_initiation_rx != 0) && ((now - peer->last_initiation_rx) < (1000 / MAX_INITIATIONS_PER_SECOND));
 
 					if (!replay && !rate_limit) {
 						// Success! Copy everything to peer

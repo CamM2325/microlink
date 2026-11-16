@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "src/wireguard.c"
         "src/wireguardif.c"
+        "src/wireguard-filter.c"
         "src/crypto.c"
         "src/wireguard-platform-esp32.c"
         "src/crypto/refc/blake2s.c"
@@ -15,6 +16,7 @@ idf_component_register(
     REQUIRES
         lwip
         esp_timer
+        nvs_flash
 )
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
