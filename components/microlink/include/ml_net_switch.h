@@ -85,6 +85,8 @@ esp_err_t ml_net_switch_init(const ml_net_switch_config_t *config);
 
 /**
  * Deinitialize and free resources.
+ * Calls ml_net_switch_stop(); if the switch task has not exited, nothing is
+ * freed (an error is logged) and deinit can be retried later.
  */
 void ml_net_switch_deinit(void);
 
@@ -99,7 +101,13 @@ esp_err_t ml_net_switch_start(void);
 /**
  * Stop all connections and halt the state machine.
  *
- * @return ESP_OK on success
+ * Signals the switch task and waits for it to tear down MicroLink and the
+ * active transport and exit. Must not be called from an on_* callback.
+ *
+ * @return ESP_OK once the task has exited,
+ *         ESP_ERR_TIMEOUT if it was still busy (e.g. powering up the modem)
+ *         after 5 minutes; call again to keep waiting,
+ *         ESP_ERR_INVALID_STATE if called from the switch task itself.
  */
 esp_err_t ml_net_switch_stop(void);
 
@@ -118,6 +126,10 @@ ml_net_switch_state_t ml_net_switch_get_state(void);
 /**
  * Get the current microlink_t handle.
  * Returns NULL if not connected.
+ *
+ * The switcher destroys and recreates the handle when it restarts the VPN
+ * (connect timeout, failed rebind, retry after both transports failed), so
+ * do not cache it across switches; fetch it again after on_connected.
  */
 microlink_t *ml_net_switch_get_handle(void);
 

@@ -39,6 +39,20 @@ static const char *TAG = "ml_net_sw";
 #define NET_SW_STACK_SIZE   6144
 #define WIFI_DISCONNECT_DEBOUNCE_MS  5000  /* Wait 5s before declaring WiFi dead */
 
+/* Backoff between full attempts after WiFi and cellular both failed */
+#define NET_SW_RETRY_MIN_MS     30000
+#define NET_SW_RETRY_MAX_MS     300000
+
+/* How long ml_net_switch_stop() waits for the task to finish its teardown.
+ * The task may be inside a modem power-up/registration that cannot be cut
+ * short, followed by microlink_stop()'s own join. */
+#define NET_SW_STOP_TIMEOUT_MS  300000
+
+/* microlink_stop() attempts (each up to CONFIG_ML_STOP_TIMEOUT_MS) before the
+ * handle is destroyed (parked) anyway. The transport must not be torn down
+ * under live MicroLink tasks: the AT socket bridge deletes its mutex. */
+#define VPN_STOP_ATTEMPTS       6
+
 typedef struct {
     /* Config (copied) */
     char wifi_ssid[64];
@@ -64,12 +78,11 @@ typedef struct {
     /* State */
     ml_net_switch_state_t state;
     ml_net_type_t active_transport;
-    microlink_t *ml;
+    microlink_t *ml;            /* written only by net_sw task, under s_ml_lock */
     bool initialized;
-    bool running;
+    volatile bool running;
 
     /* WiFi */
-    esp_netif_t *wifi_netif;
     EventGroupHandle_t wifi_events;
     int wifi_retry_count;
 
@@ -89,6 +102,32 @@ typedef struct {
 } ml_net_switch_ctx_t;
 
 static ml_net_switch_ctx_t s_ctx = {0};
+
+/* Guards s_ctx.ml against the health timer reading it while the task
+ * destroys it. Static storage: no allocation, survives deinit/init. */
+static SemaphoreHandle_t s_ml_lock;
+static StaticSemaphore_t s_ml_lock_buf;
+
+/* Given by the task as the last thing it does; ml_net_switch_stop() waits
+ * on it before declaring the switcher stopped. */
+static SemaphoreHandle_t s_task_done;
+static StaticSemaphore_t s_task_done_buf;
+
+/* The default WiFi STA netif and the event handler registrations are
+ * process-wide and outlive a deinit; keep them so init after deinit works. */
+static esp_netif_t *s_wifi_netif;
+
+/* Sleep that returns early (false) once ml_net_switch_stop() was called.
+ * Does not consume task notifications. */
+static bool sw_sleep(uint32_t ms)
+{
+    while (ms > 0 && s_ctx.running) {
+        uint32_t slice = ms > 250 ? 250 : ms;
+        vTaskDelay(pdMS_TO_TICKS(slice));
+        ms -= slice;
+    }
+    return s_ctx.running;
+}
 
 /* ============================================================================
  * WiFi Management
@@ -160,8 +199,8 @@ static esp_err_t wifi_start(void)
     s_ctx.wifi_retry_count = 0;
     xEventGroupClearBits(s_ctx.wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
 
-    if (!s_ctx.wifi_netif) {
-        s_ctx.wifi_netif = esp_netif_create_default_wifi_sta();
+    if (!s_wifi_netif) {
+        s_wifi_netif = esp_netif_create_default_wifi_sta();
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         ESP_ERROR_CHECK(esp_wifi_init(&cfg));
         ESP_ERROR_CHECK(esp_event_handler_instance_register(
@@ -180,11 +219,14 @@ static esp_err_t wifi_start(void)
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
-    /* Wait for connection */
-    EventBits_t bits = xEventGroupWaitBits(s_ctx.wifi_events,
-                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                            pdFALSE, pdFALSE,
-                                            pdMS_TO_TICKS(s_ctx.wifi_timeout_ms));
+    /* Wait for connection (in slices, so a stop request is noticed) */
+    EventBits_t bits = 0;
+    for (uint32_t waited = 0; waited < s_ctx.wifi_timeout_ms && s_ctx.running; waited += 250) {
+        bits = xEventGroupWaitBits(s_ctx.wifi_events,
+                                   WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                   pdFALSE, pdFALSE, pdMS_TO_TICKS(250));
+        if (bits & (WIFI_CONNECTED_BIT | WIFI_FAIL_BIT)) break;
+    }
 
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "WiFi connected");
@@ -267,6 +309,27 @@ static void cellular_stop(void)
  * MicroLink VPN Management
  * ========================================================================== */
 
+/* Unpublish the handle, then stop and destroy it. Only the net_sw task
+ * calls this, so the handle cannot be destroyed twice. */
+static void vpn_stop(void)
+{
+    xSemaphoreTake(s_ml_lock, portMAX_DELAY);
+    microlink_t *ml = s_ctx.ml;
+    s_ctx.ml = NULL;
+    xSemaphoreGive(s_ml_lock);
+    if (!ml) return;
+
+    /* microlink_stop() returns ESP_ERR_TIMEOUT while a task is still stuck
+     * in a network call; keep waiting so the caller does not tear down the
+     * transport under it. */
+    for (int i = 0; i < VPN_STOP_ATTEMPTS; i++) {
+        if (microlink_stop(ml) != ESP_ERR_TIMEOUT) break;
+        ESP_LOGW(TAG, "MicroLink tasks still exiting (attempt %d/%d)", i + 1, VPN_STOP_ATTEMPTS);
+    }
+    /* Frees the handle, or parks it if a task is still running. */
+    microlink_destroy(ml);
+}
+
 static esp_err_t vpn_start(void)
 {
     const char *name = s_ctx.device_name[0] ? s_ctx.device_name : NULL;
@@ -288,17 +351,19 @@ static esp_err_t vpn_start(void)
         .max_peers = CONFIG_ML_MAX_PEERS,
     };
 
-    s_ctx.ml = microlink_init(&ml_config);
-    if (!s_ctx.ml) {
+    microlink_t *ml = microlink_init(&ml_config);
+    if (!ml) {
         ESP_LOGE(TAG, "microlink_init failed");
         return ESP_FAIL;
     }
+    xSemaphoreTake(s_ml_lock, portMAX_DELAY);
+    s_ctx.ml = ml;
+    xSemaphoreGive(s_ml_lock);
 
-    esp_err_t err = microlink_start(s_ctx.ml);
+    esp_err_t err = microlink_start(ml);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "microlink_start failed: %s", esp_err_to_name(err));
-        microlink_destroy(s_ctx.ml);
-        s_ctx.ml = NULL;
+        vpn_stop();
         return err;
     }
 
@@ -308,8 +373,13 @@ static esp_err_t vpn_start(void)
     int timeout_ticks = (s_ctx.active_transport == ML_NET_WIFI) ? 120 : 360;
     int timeout_secs = timeout_ticks / 2;
     for (int i = 0; i < timeout_ticks; i++) {
-        if (microlink_is_connected(s_ctx.ml)) {
-            uint32_t ip = microlink_get_vpn_ip(s_ctx.ml);
+        if (!s_ctx.running) {
+            ESP_LOGI(TAG, "Stop requested while waiting for the VPN");
+            vpn_stop();
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (microlink_is_connected(ml)) {
+            uint32_t ip = microlink_get_vpn_ip(ml);
             char ip_str[16];
             microlink_ip_to_str(ip, ip_str);
             ESP_LOGI(TAG, "VPN connected via %s (IP: %s)",
@@ -320,20 +390,11 @@ static esp_err_t vpn_start(void)
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
+    /* Typically coord is still mid-MapResponse here; vpn_stop() joins it
+     * (microlink_stop() unblocks its socket) before destroying the handle. */
     ESP_LOGW(TAG, "VPN connection timeout (%ds)", timeout_secs);
-    microlink_stop(s_ctx.ml);
-    microlink_destroy(s_ctx.ml);
-    s_ctx.ml = NULL;
+    vpn_stop();
     return ESP_ERR_TIMEOUT;
-}
-
-static void vpn_stop(void)
-{
-    if (s_ctx.ml) {
-        microlink_stop(s_ctx.ml);
-        microlink_destroy(s_ctx.ml);
-        s_ctx.ml = NULL;
-    }
 }
 
 /* ============================================================================
@@ -342,9 +403,17 @@ static void vpn_stop(void)
 
 static void health_timer_cb(TimerHandle_t timer)
 {
-    if (!s_ctx.running || !s_ctx.ml) return;
+    if (!s_ctx.running) return;
 
-    if (!microlink_is_connected(s_ctx.ml)) {
+    /* Timer task: never block. If the switch task holds the lock it is
+     * replacing the handle; skip this round. */
+    if (xSemaphoreTake(s_ml_lock, 0) != pdTRUE) return;
+    bool have_ml = (s_ctx.ml != NULL);
+    bool connected = have_ml && microlink_is_connected(s_ctx.ml);
+    xSemaphoreGive(s_ml_lock);
+    if (!have_ml) return;
+
+    if (!connected) {
         s_ctx.health_fail_counter++;
         ESP_LOGW(TAG, "Health check failed (%lu/%lu)",
                  (unsigned long)s_ctx.health_fail_counter,
@@ -394,42 +463,37 @@ static void failback_timer_cb(TimerHandle_t timer)
  * Main State Machine Task
  * ========================================================================== */
 
-static void net_switch_task(void *arg)
+/* Bring the VPN up over WiFi. On failure WiFi is stopped again. */
+static bool try_wifi(void)
 {
-    ESP_LOGI(TAG, "Network switch task started");
-
-    /* Step 1: Try WiFi (skip if no SSID configured) */
-    bool has_wifi = (s_ctx.wifi_ssid[0] != '\0');
-
-    if (!has_wifi) {
-        ESP_LOGI(TAG, "No WiFi SSID configured, going straight to cellular");
-        goto try_cellular;
-    }
-
     s_ctx.state = ML_NET_SW_WIFI_CONNECTING;
     s_ctx.active_transport = ML_NET_WIFI;
 
-    esp_err_t err = wifi_start();
-    if (err == ESP_OK) {
-        /* WiFi connected, start VPN */
-        err = vpn_start();
-        if (err == ESP_OK) {
-            s_ctx.state = ML_NET_SW_WIFI_VPN_UP;
-            if (s_ctx.on_connected) {
-                s_ctx.on_connected(ML_NET_WIFI, s_ctx.user_data);
-            }
-            /* Start health check timer */
-            xTimerStart(s_ctx.health_timer, 0);
-            goto state_loop;
+    if (wifi_start() == ESP_OK && vpn_start() == ESP_OK) {
+        s_ctx.state = ML_NET_SW_WIFI_VPN_UP;
+        if (s_ctx.on_connected) {
+            s_ctx.on_connected(ML_NET_WIFI, s_ctx.user_data);
         }
+        xTimerStart(s_ctx.health_timer, 0);
+        return true;
     }
 
-    /* WiFi failed — try cellular */
-    ESP_LOGW(TAG, "WiFi path failed, falling back to cellular");
+    if (s_ctx.running) {
+        ESP_LOGW(TAG, "WiFi path failed, falling back to cellular");
+    }
     wifi_stop();
-    goto try_cellular;
+    return false;
+}
 
-try_cellular:
+/* Bring the VPN up over cellular. Cellular is left as is on failure; the
+ * caller stops it before the next attempt. */
+static bool try_cellular(void)
+{
+    /* The failback timer would flip the state to SWITCHING_TO_WIFI while
+     * this attempt is still running. */
+    xTimerStop(s_ctx.health_timer, 0);
+    if (s_ctx.failback_timer) xTimerStop(s_ctx.failback_timer, 0);
+
     s_ctx.state = ML_NET_SW_CELL_CONNECTING;
     s_ctx.active_transport = ML_NET_CELLULAR;
 
@@ -437,40 +501,29 @@ try_cellular:
         s_ctx.on_switching(ML_NET_WIFI, ML_NET_CELLULAR, s_ctx.user_data);
     }
 
-    err = cellular_start();
-    if (err == ESP_OK) {
-        err = vpn_start();
-        if (err == ESP_OK) {
-            s_ctx.state = ML_NET_SW_CELL_VPN_UP;
-            if (s_ctx.on_connected) {
-                s_ctx.on_connected(ML_NET_CELLULAR, s_ctx.user_data);
-            }
-            /* Start health check + failback timers */
-            xTimerStart(s_ctx.health_timer, 0);
-            if (s_ctx.failback_check_ms > 0 && s_ctx.failback_timer) {
-                xTimerStart(s_ctx.failback_timer, 0);
-            }
-            goto state_loop;
+    if (cellular_start() == ESP_OK && s_ctx.running && vpn_start() == ESP_OK) {
+        s_ctx.state = ML_NET_SW_CELL_VPN_UP;
+        if (s_ctx.on_connected) {
+            s_ctx.on_connected(ML_NET_CELLULAR, s_ctx.user_data);
         }
+        /* Start health check + failback timers */
+        xTimerStart(s_ctx.health_timer, 0);
+        if (s_ctx.failback_check_ms > 0 && s_ctx.failback_timer) {
+            xTimerStart(s_ctx.failback_timer, 0);
+        }
+        return true;
     }
+    return false;
+}
 
-    /* Both failed */
-    ESP_LOGE(TAG, "Both WiFi and cellular failed!");
-    s_ctx.state = ML_NET_SW_ERROR;
-    if (s_ctx.on_disconnected) {
-        s_ctx.on_disconnected(s_ctx.user_data);
-    }
+typedef enum {
+    SW_LOOP_STOPPED,        /* ml_net_switch_stop() was called */
+    SW_LOOP_RETRY_CELL,     /* VPN lost and could not be moved; restart on cellular */
+} sw_loop_result_t;
 
-    /* Retry after 30s */
-    vTaskDelay(pdMS_TO_TICKS(30000));
-    if (s_ctx.running) {
-        cellular_stop();
-        s_ctx.state = ML_NET_SW_WIFI_CONNECTING;
-        s_ctx.active_transport = ML_NET_WIFI;
-        /* Fall through to state_loop which will handle reconnection */
-    }
-
-state_loop:
+/* Runs while the VPN is up: reacts to the health/failback/debounce timers. */
+static sw_loop_result_t state_loop(void)
+{
     while (s_ctx.running) {
         /* Wait for notification from health/failback timer */
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));
@@ -509,7 +562,9 @@ state_loop:
                                  esp_err_to_name(rb_err));
                         vpn_stop();
                         wifi_stop();
-                        goto try_cellular;
+                        /* try_cellular() initializes the modem itself */
+                        cellular_stop();
+                        return SW_LOOP_RETRY_CELL;
                     }
                 } else {
                     /* Cellular failed — full restart path */
@@ -519,7 +574,7 @@ state_loop:
                     }
                     vpn_stop();
                     wifi_stop();
-                    goto try_cellular;
+                    return SW_LOOP_RETRY_CELL;
                 }
                 break;
             }
@@ -535,6 +590,7 @@ state_loop:
                 s_ctx.state = ML_NET_SW_WIFI_CONNECTING;
 
                 esp_err_t wifi_err = wifi_start();
+                if (!s_ctx.running) break;
                 if (wifi_err == ESP_OK) {
                     /* WiFi is back — rebind sockets to WiFi interface */
                     ESP_LOGI(TAG, "WiFi recovered! Rebinding to WiFi");
@@ -562,7 +618,7 @@ state_loop:
                                  esp_err_to_name(rb_err));
                         wifi_stop();
                         vpn_stop();
-                        goto try_cellular;
+                        return SW_LOOP_RETRY_CELL;
                     }
                 } else {
                     /* WiFi still down, stay on cellular */
@@ -581,9 +637,69 @@ state_loop:
                 break;
         }
     }
+    return SW_LOOP_STOPPED;
+}
+
+static void net_switch_task(void *arg)
+{
+    ESP_LOGI(TAG, "Network switch task started");
+
+    bool has_wifi = (s_ctx.wifi_ssid[0] != '\0');
+    bool cellular_only_next = false;
+    uint32_t retry_ms = NET_SW_RETRY_MIN_MS;
+
+    /* Every failure path comes back here, so a transient double failure is
+     * retried (with backoff) instead of leaving the device offline until a
+     * reboot. */
+    while (s_ctx.running) {
+        bool up = false;
+
+        if (!has_wifi) {
+            ESP_LOGI(TAG, "No WiFi SSID configured, going straight to cellular");
+        } else if (!cellular_only_next) {
+            up = try_wifi();
+        }
+        cellular_only_next = false;
+
+        if (!up && s_ctx.running) {
+            up = try_cellular();
+        }
+
+        if (up) {
+            retry_ms = NET_SW_RETRY_MIN_MS;
+            if (state_loop() == SW_LOOP_RETRY_CELL) {
+                cellular_only_next = true;
+            }
+            continue;
+        }
+
+        if (!s_ctx.running) break;
+
+        ESP_LOGE(TAG, "Both WiFi and cellular failed! Retrying in %lus",
+                 (unsigned long)(retry_ms / 1000));
+        s_ctx.state = ML_NET_SW_ERROR;
+        if (s_ctx.on_disconnected) {
+            s_ctx.on_disconnected(s_ctx.user_data);
+        }
+
+        sw_sleep(retry_ms);
+        retry_ms = (retry_ms * 2 > NET_SW_RETRY_MAX_MS) ? NET_SW_RETRY_MAX_MS : retry_ms * 2;
+        cellular_stop();
+    }
+
+    /* Teardown, in this task, which owns the handle and the transports.
+     * MicroLink first: it must be joined before its transport goes away. */
+    ESP_LOGI(TAG, "Network switch task stopping");
+    xTimerStop(s_ctx.health_timer, 0);
+    if (s_ctx.failback_timer) xTimerStop(s_ctx.failback_timer, 0);
+    vpn_stop();
+    if (has_wifi) wifi_stop();
+    cellular_stop();
+    s_ctx.state = ML_NET_SW_IDLE;
 
     ESP_LOGI(TAG, "Network switch task exiting");
     s_ctx.task_handle = NULL;
+    xSemaphoreGive(s_task_done);
     vTaskDelete(NULL);
 }
 
@@ -597,6 +713,9 @@ esp_err_t ml_net_switch_init(const ml_net_switch_config_t *config)
     if (!config || !config->tailscale_auth_key) return ESP_ERR_INVALID_ARG;
 
     memset(&s_ctx, 0, sizeof(s_ctx));
+
+    if (!s_ml_lock) s_ml_lock = xSemaphoreCreateMutexStatic(&s_ml_lock_buf);
+    if (!s_task_done) s_task_done = xSemaphoreCreateBinaryStatic(&s_task_done_buf);
 
     /* Copy strings */
     if (config->wifi_ssid) strncpy(s_ctx.wifi_ssid, config->wifi_ssid, sizeof(s_ctx.wifi_ssid) - 1);
@@ -655,7 +774,12 @@ void ml_net_switch_deinit(void)
 {
     if (!s_ctx.initialized) return;
 
-    ml_net_switch_stop();
+    if (ml_net_switch_stop() != ESP_OK) {
+        /* The task is still running and uses the timers, the event group
+         * and s_ctx; freeing them now would be a use-after-free. */
+        ESP_LOGE(TAG, "Deinit skipped: network switch task has not exited");
+        return;
+    }
 
     if (s_ctx.health_timer) {
         xTimerDelete(s_ctx.health_timer, portMAX_DELAY);
@@ -676,8 +800,9 @@ void ml_net_switch_deinit(void)
 esp_err_t ml_net_switch_start(void)
 {
     if (!s_ctx.initialized) return ESP_ERR_INVALID_STATE;
-    if (s_ctx.running) return ESP_ERR_INVALID_STATE;
+    if (s_ctx.running || s_ctx.task_handle) return ESP_ERR_INVALID_STATE;
 
+    xSemaphoreTake(s_task_done, 0);  /* clear a stale completion */
     s_ctx.running = true;
 
     BaseType_t ret = xTaskCreate(net_switch_task, "net_sw",
@@ -692,7 +817,13 @@ esp_err_t ml_net_switch_start(void)
 
 esp_err_t ml_net_switch_stop(void)
 {
-    if (!s_ctx.running) return ESP_OK;
+    if (!s_ctx.running && !s_ctx.task_handle) return ESP_OK;
+
+    if (s_ctx.task_handle && xTaskGetCurrentTaskHandle() == s_ctx.task_handle) {
+        /* From an on_* callback: the task cannot wait for itself. */
+        ESP_LOGE(TAG, "ml_net_switch_stop() called from the switch task (callback?)");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     s_ctx.running = false;
 
@@ -702,20 +833,17 @@ esp_err_t ml_net_switch_stop(void)
     if (s_ctx.wifi_debounce_timer) xTimerStop(s_ctx.wifi_debounce_timer, portMAX_DELAY);
     s_ctx.wifi_disconnect_pending = false;
 
-    /* Wake task so it exits */
-    if (s_ctx.task_handle) {
-        xTaskNotifyGive(s_ctx.task_handle);
-        /* Wait for task to exit */
-        vTaskDelay(pdMS_TO_TICKS(500));
+    /* The task owns the MicroLink handle and the transports and tears them
+     * down itself on the way out. Tearing them down here as well raced with
+     * it (double microlink_destroy, use of a freed handle). Wait for it. */
+    TaskHandle_t task = s_ctx.task_handle;
+    if (task) {
+        xTaskNotifyGive(task);
     }
-
-    /* Tear down connections */
-    vpn_stop();
-
-    if (s_ctx.active_transport == ML_NET_WIFI) {
-        wifi_stop();
-    } else {
-        cellular_stop();
+    if (xSemaphoreTake(s_task_done, pdMS_TO_TICKS(NET_SW_STOP_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGE(TAG, "Network switch task did not exit within %ds",
+                 NET_SW_STOP_TIMEOUT_MS / 1000);
+        return ESP_ERR_TIMEOUT;
     }
 
     s_ctx.state = ML_NET_SW_IDLE;
