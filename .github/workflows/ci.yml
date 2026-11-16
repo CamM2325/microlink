@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    name: Host unit tests (ASan/UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fetch lwIP headers
+        run: git clone --depth 1 --branch STABLE-2_2_0_RELEASE https://github.com/lwip-tcpip/lwip.git "$RUNNER_TEMP/lwip"
+      - name: Configure
+        run: cmake -S test/host -B build-host -DLWIP_INCLUDE_DIR="$RUNNER_TEMP/lwip/src/include"
+      - name: Build
+        run: cmake --build build-host -j
+      - name: Test
+        run: ctest --test-dir build-host --output-on-failure
+
+  firmware:
+    name: ${{ matrix.example }} / ${{ matrix.target }} / IDF ${{ matrix.idf }}
+    runs-on: ubuntu-latest
+    container: espressif/idf:${{ matrix.idf }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        idf: [v5.3.6, v5.5.6]
+        example: [basic_connect, cellular_connect, cellular_heartbeat, failover_connect, rebind_test]
+        target: [esp32s3]
+        experimental: [false]
+        include:
+          # ESP-IDF 6 / mbedTLS 4 (issue #42) — tracked, not yet required
+          - { idf: v6.1.1, example: basic_connect, target: esp32s3, experimental: true }
+          # No-PSRAM / single-core targets (PR #43) — tracked, not yet required
+          - { idf: v5.5.6, example: basic_connect, target: esp32c3, experimental: true }
+          - { idf: v5.5.6, example: basic_connect, target: esp32,   experimental: true }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        shell: bash
+        working-directory: examples/${{ matrix.example }}
+        run: |
+          . "$IDF_PATH/export.sh" >/dev/null
+          idf.py set-target ${{ matrix.target }}
+          idf.py build
+      - name: Size report
+        if: success()
+        shell: bash
+        working-directory: examples/${{ matrix.example }}
+        run: |
+          . "$IDF_PATH/export.sh" >/dev/null
+          {
+            echo "### ${{ matrix.example }} / ${{ matrix.target }} / IDF ${{ matrix.idf }}"
+            echo '```'
+            idf.py size | tail -n 25
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload firmware
+        if: success() && matrix.idf == 'v5.5.6' && matrix.target == 'esp32s3'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fw-${{ matrix.example }}-${{ matrix.target }}
+          path: |
+            examples/${{ matrix.example }}/build/*.bin
+            examples/${{ matrix.example }}/build/bootloader/bootloader.bin
+            examples/${{ matrix.example }}/build/partition_table/partition-table.bin
+            examples/${{ matrix.example }}/build/flash_args
+          retention-days: 14
+
+  static-analysis:
+    name: cppcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq cppcheck
+      - name: cppcheck (report only for now)
+        run: |
+          cppcheck --enable=warning,portability --inline-suppr --std=c11 \
+            --suppress=missingIncludeSystem --error-exitcode=0 \
+            -I components/microlink/include -I components/microlink/src \
+            -I components/microlink/components/wireguard_lwip/src \
+            components/microlink/src components/microlink/components/wireguard_lwip/src \
+            2> cppcheck.txt || true
+          echo "### cppcheck findings: $(grep -c ': \(error\|warning\)' cppcheck.txt || true)" >> "$GITHUB_STEP_SUMMARY"
+          head -n 200 cppcheck.txt

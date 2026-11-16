@@ -21,8 +21,9 @@ backups/
 *.swo
 *~
 
-# Test/simulation code (not for production)
-test/
+# Test/simulation code (not for production) — host unit tests ARE tracked
+test/*
+!test/host/
 examples/esp_modem_test/
 
 # Internal development docs (contain test data, SIM details, peer names)

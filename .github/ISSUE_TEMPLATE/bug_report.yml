@@ -1,0 +1,48 @@
+name: Bug report
+description: Something isn't working
+labels: [bug, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Please **remove auth keys, Wi-Fi passwords, SIM PINs and node keys** from logs before posting.
+  - type: input
+    id: version
+    attributes:
+      label: MicroLink version / commit
+      placeholder: v2.1.0 or commit SHA
+    validations: { required: true }
+  - type: input
+    id: idf
+    attributes:
+      label: ESP-IDF version
+      placeholder: v5.3.6
+    validations: { required: true }
+  - type: input
+    id: board
+    attributes:
+      label: Board / chip / PSRAM
+      placeholder: ESP32-S3 N16R8, 8MB PSRAM
+    validations: { required: true }
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Network transport
+      options: [Wi-Fi, Cellular PPP, Cellular AT-socket, Ethernet, Other]
+    validations: { required: true }
+  - type: dropdown
+    id: control
+    attributes:
+      label: Control server
+      options: [Tailscale (controlplane.tailscale.com), Headscale, Other]
+    validations: { required: true }
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations: { required: true }
+  - type: textarea
+    id: logs
+    attributes:
+      label: Serial log (idf.py monitor)
+      render: text

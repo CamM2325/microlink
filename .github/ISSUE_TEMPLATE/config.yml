@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability (private)
+    url: https://github.com/CamM2325/microlink/security/advisories/new
+    about: Please report security issues privately — never in a public issue.
+  - name: Questions & ideas
+    url: https://github.com/CamM2325/microlink/discussions
+    about: Setup help, "is X possible?", and show-and-tell.
