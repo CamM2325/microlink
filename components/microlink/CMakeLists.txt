@@ -12,7 +12,6 @@ set(SRCS
     "src/ml_tcp.c"
     "src/ml_peer_nvs.c"
     "src/nacl_box.c"
-    "src/x25519.c"
     "src/ml_zerocopy.c"
     "src/ml_cellular.c"
     "src/ml_at_socket.c"
@@ -50,6 +49,8 @@ idf_component_register(
         "include"
         "src"
     REQUIRES ${REQUIRES}
+    # wireguard_lwip also provides the X25519 (crypto/refc/x25519.h) used by
+    # microlink.c, ml_noise.c and nacl_box.c
     PRIV_REQUIRES
         wireguard_lwip
 )
