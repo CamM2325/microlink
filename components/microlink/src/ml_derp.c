@@ -123,8 +123,10 @@ static int ml_derp_bio_send(void *ctx, const unsigned char *buf, size_t len) {
 static void derp_tls_abort(microlink_t *ml, int sock) {
     mbedtls_ssl_free(&ml->derp.ssl);
     mbedtls_ssl_config_free(&ml->derp.ssl_conf);
+#if ML_TLS_LEGACY_RNG
     mbedtls_ctr_drbg_free(&ml->derp.ctr_drbg);
     mbedtls_entropy_free(&ml->derp.entropy);
+#endif
     if (sock >= 0) {
         ml_close_sock(sock);
     }
@@ -779,8 +781,10 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     /* TLS setup */
     mbedtls_ssl_init(&ml->derp.ssl);
     mbedtls_ssl_config_init(&ml->derp.ssl_conf);
+#if ML_TLS_LEGACY_RNG
     mbedtls_entropy_init(&ml->derp.entropy);
     mbedtls_ctr_drbg_init(&ml->derp.ctr_drbg);
+#endif
 
     /* Always check the return values of the mbedTLS setup functions and
      * abort immediately on failure instead of proceeding to the handshake.
@@ -790,6 +794,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
      * MBEDTLS_ERR_SSL_BAD_INPUT_DATA — misreported as "Bad input
      * parameters" when the real cause is out-of-memory. */
     int cfg_ret;
+#if ML_TLS_LEGACY_RNG
     cfg_ret = mbedtls_ctr_drbg_seed(&ml->derp.ctr_drbg, mbedtls_entropy_func,
                            &ml->derp.entropy, NULL, 0);
     if (cfg_ret != 0) {
@@ -797,6 +802,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         derp_tls_abort(ml, sock);
         return ESP_FAIL;
     }
+#endif
 
     cfg_ret = mbedtls_ssl_config_defaults(&ml->derp.ssl_conf,
                                  MBEDTLS_SSL_IS_CLIENT,
@@ -819,7 +825,9 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
 #else
     mbedtls_ssl_conf_authmode(&ml->derp.ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
 #endif
+#if ML_TLS_LEGACY_RNG
     mbedtls_ssl_conf_rng(&ml->derp.ssl_conf, mbedtls_ctr_drbg_random, &ml->derp.ctr_drbg);
+#endif
     /* Pin the DERP connection to TLS 1.2. When the DERP relay uses a
      * Let's Encrypt ECDSA certificate, the ESP-IDF mbedTLS TLS 1.3 path
      * cannot interpret the certificate's signature algorithm OID and fails
@@ -1149,8 +1157,10 @@ void ml_derp_disconnect(microlink_t *ml) {
         mbedtls_ssl_close_notify(&ml->derp.ssl);
         mbedtls_ssl_free(&ml->derp.ssl);
         mbedtls_ssl_config_free(&ml->derp.ssl_conf);
+#if ML_TLS_LEGACY_RNG
         mbedtls_ctr_drbg_free(&ml->derp.ctr_drbg);
         mbedtls_entropy_free(&ml->derp.entropy);
+#endif
         ml_close_sock(ml->derp.sockfd);
         ml->derp.sockfd = -1;
     }
