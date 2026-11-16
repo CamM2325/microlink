@@ -375,7 +375,11 @@ bool ml_stun_parse_response(const uint8_t *data, size_t len,
     }
 
     /* Check txid against IPv4 txid (IPv6 responses use separate parser) */
-    if (txid_v4_valid && memcmp(data + 8, txid_v4, 12) != 0) {
+    /* Only accept a response to a request we actually have outstanding.
+     * (Previously, once a probe succeeded and cleared txid_v4_valid, any
+     * Binding Response from anyone was accepted and could rewrite our
+     * advertised public endpoint.) */
+    if (!txid_v4_valid || memcmp(data + 8, txid_v4, 12) != 0) {
         /* Could be an IPv6 response arriving on IPv4 queue — don't warn */
         ESP_LOGD(TAG, "STUN IPv4 txid mismatch (may be IPv6 response)");
         return false;
@@ -554,7 +558,7 @@ bool ml_stun_parse_response_ipv6(const uint8_t *data, size_t len,
 
         if (offset + attr_len > len) break;
 
-        if (attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS) {
+        if (attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS && attr_len >= 4) {
             uint8_t family = data[offset + 1];
 
             if (family == 0x02 && attr_len >= 20) {

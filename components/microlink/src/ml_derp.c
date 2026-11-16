@@ -443,7 +443,13 @@ static int poll_derp_read(microlink_t *ml) {
     }
 
     /* For RecvPacket (0x05): first 32 bytes are sender's public key */
-    if (frame_type == DERP_FRAME_RECV_PACKET && len > 32) {
+    if (frame_type == DERP_FRAME_RECV_PACKET && len <= 32) {
+        /* Too short to carry a source key + payload: drop rather than route
+         * it with an all-zero source key. */
+        free(buf);
+        return 1;
+    }
+    if (frame_type == DERP_FRAME_RECV_PACKET) {
         memcpy(src_key, buf, 32);
         payload = malloc(len - 32);
         if (payload) {
@@ -939,7 +945,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
 
         resp_buf[resp_len] = '\0';
 
-        if (!found_end || strstr((char *)resp_buf, "101") == NULL) {
+        if (!found_end || strncmp((char *)resp_buf, "HTTP/1.1 101", 12) != 0) {
             ESP_LOGE(TAG, "DERP upgrade rejected: %.100s", resp_buf);
             derp_tls_abort(ml, sock);
             return ESP_FAIL;

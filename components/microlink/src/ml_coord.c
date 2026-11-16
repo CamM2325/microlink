@@ -1477,7 +1477,9 @@ static void parse_self_node_from_map(microlink_t *ml, cJSON *map_json) {
     if (key_expiry && key_expiry->valuestring) {
         int yr, mo, dy, hr, mn, sc;
         if (sscanf(key_expiry->valuestring, "%d-%d-%dT%d:%d:%d",
-                   &yr, &mo, &dy, &hr, &mn, &sc) >= 6) {
+                   &yr, &mo, &dy, &hr, &mn, &sc) >= 6 &&
+            yr >= 1970 && yr <= 2200 && mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31 &&
+            hr >= 0 && hr <= 23 && mn >= 0 && mn <= 59 && sc >= 0 && sc <= 60) {
             /* Simple epoch calculation (approximate, no leap second) */
             /* Days from year 1970 */
             int64_t days = 0;

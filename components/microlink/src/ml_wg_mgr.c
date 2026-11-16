@@ -1260,6 +1260,15 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
 
     if (ciphertext_len < NACL_BOX_MACBYTES) return;
 
+    /* Drop DISCO from disco keys that aren't in our netmap BEFORE any X25519:
+     * otherwise random sender keys force a full scalar multiplication per
+     * packet (unauthenticated CPU DoS, reachable via DERP). Tailscale's
+     * magicsock likewise ignores disco messages from unknown keys. */
+    if (find_peer_by_disco_key(ml, sender_disco_key) < 0) {
+        ESP_LOGD(TAG, "DISCO from unknown disco key, ignoring");
+        return;
+    }
+
     size_t plaintext_len = ciphertext_len - NACL_BOX_MACBYTES;
     uint8_t *plaintext = malloc(plaintext_len);
     if (!plaintext) return;
