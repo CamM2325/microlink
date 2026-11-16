@@ -605,6 +605,14 @@ struct microlink_s {
 /** ML_TASK_BIT_* mask of worker tasks still running (0 = all exited). */
 uint32_t ml_tasks_alive(const microlink_t *ml);
 
+/** Debug trace of free internal RAM at a teardown step (ESP_LOGD under the
+ *  "ml_heap" tag; enable with esp_log_level_set("ml_heap", ESP_LOG_DEBUG) on
+ *  a build with CONFIG_LOG_MAXIMUM_LEVEL >= DEBUG). */
+#define ML_HEAP_TRACE(step) \
+    ESP_LOGD("ml_heap", "%-28s internal=%u psram=%u", (step), \
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), \
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM))
+
 /** True once microlink_stop() has requested shutdown. Long-running loops and
  *  retry/backoff paths check this so stop does not have to wait out a full
  *  network timeout. */

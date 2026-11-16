@@ -673,7 +673,9 @@ void ml_derp_tx_task(void *arg) {
 
     /* Release the TLS session, the socket and any packets still queued for
      * TX. Nobody else may: the connection is owned by this task. */
+    ML_HEAP_TRACE("derp_tx: exit begin");
     ml_derp_disconnect(ml);
+    ML_HEAP_TRACE("derp_tx: TLS + socket freed");
 
     ESP_LOGI(TAG, "DERP I/O task exiting");
     ml_task_exit(ml, ML_TASK_BIT_DERP_TX);

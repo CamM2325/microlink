@@ -814,8 +814,10 @@ esp_err_t microlink_stop(microlink_t *ml) {
     xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
 
     /* The config UI's handlers call into ml; stop serving them first. */
+    ML_HEAP_TRACE("stop: begin");
     if (ml->config_httpd) {
         ml_config_httpd_stop(ml->config_httpd);
+        ML_HEAP_TRACE("stop: config UI detached");
     }
 
     /* coord's reconnect backoff blocks on its command queue for up to 30 s;
@@ -851,6 +853,7 @@ esp_err_t microlink_stop(microlink_t *ml) {
     }
 
     int join_ms = (int)((esp_timer_get_time() - t_start) / 1000);
+    ML_HEAP_TRACE("stop: tasks joined");
     ml->state = ML_STATE_IDLE;
 
     if (alive) {
@@ -864,6 +867,7 @@ esp_err_t microlink_stop(microlink_t *ml) {
     }
 
     ml_release_run_resources(ml);
+    ML_HEAP_TRACE("stop: run resources freed");
     ml->started = false;
     ml->state = ML_STATE_IDLE;
     ESP_LOGI(TAG, "Stopped (all tasks exited in %d ms)", join_ms);

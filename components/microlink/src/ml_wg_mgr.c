@@ -377,6 +377,7 @@ static void wg_teardown_interface(microlink_t *ml) {
     /* Unpublish before teardown, not after the free. */
     ml->wg_netif = NULL;
 
+    ML_HEAP_TRACE("wg_mgr: netif teardown begin");
     StaticSemaphore_t done_buf;
     wg_netif_down_ctx_t ctx = {
         .netif = netif,
@@ -399,6 +400,7 @@ static void wg_teardown_interface(microlink_t *ml) {
     vSemaphoreDelete(ctx.done);
     free(netif);
     ESP_LOGI(TAG, "WireGuard interface removed and device freed");
+    ML_HEAP_TRACE("wg_mgr: netif + device freed");
 }
 
 /* Frees the device of a netif that never reached lwIP (bring-up failed).
