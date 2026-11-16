@@ -1347,53 +1347,123 @@ ml_config_ctx_t *ml_config_httpd_init(void) {
     return ctx;
 }
 
-esp_err_t ml_config_httpd_start(ml_config_ctx_t *ctx, microlink_t *ml) {
-    if (!ctx) return ESP_ERR_INVALID_ARG;
-    ctx->ml = ml;
+/* The HTTP server is started once and then kept for the life of the process;
+ * microlink_stop()/microlink_destroy() only detach it from the context.
+ *
+ * Why: on ESP-IDF 5.3 esp_http_server's task ends with
+ * vTaskDeleteWithCaps(xTaskGetCurrentTaskHandle()). vTaskDelete() of the
+ * calling task never returns, so the stack and TCB that call was meant to
+ * free afterwards are leaked: 6144 + sizeof(StaticTask_t) bytes of internal
+ * RAM (6492 on the S3) on every httpd_stop(). Stopping and restarting the
+ * server with every microlink_stop()/microlink_start() leaked that much per
+ * cycle.
+ *
+ * While no context is attached every URI answers 503. Handlers run with
+ * s_attach_lock held, so detaching waits for an in-flight request and the
+ * context cannot be freed under it. */
+static httpd_handle_t s_httpd;
+static ml_config_ctx_t *s_attached;
+static SemaphoreHandle_t s_attach_lock;
+static StaticSemaphore_t s_attach_lock_buf;
 
-    http_pw_init();
+/* Every URI is registered with this handler; user_ctx is the real one. */
+static esp_err_t handler_dispatch(httpd_req_t *req) {
+    esp_err_t (*real)(httpd_req_t *) = (esp_err_t (*)(httpd_req_t *))req->user_ctx;
+    xSemaphoreTake(s_attach_lock, portMAX_DELAY);
+    ml_config_ctx_t *ctx = s_attached;
+    if (!ctx || !ctx->ml) {
+        xSemaphoreGive(s_attach_lock);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, "MicroLink is not running");
+        return ESP_OK;
+    }
+    req->user_ctx = ctx;  /* per-request field; the handlers read the context from it */
+    esp_err_t ret = real(req);
+    xSemaphoreGive(s_attach_lock);
+    return ret;
+}
+
+static esp_err_t config_server_start_once(void) {
+    if (s_httpd) return ESP_OK;
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 6144;
     config.max_uri_handlers = 14;
     config.uri_match_fn = httpd_uri_match_wildcard;
 
-    esp_err_t err = httpd_start(&ctx->httpd, &config);
+    httpd_handle_t h = NULL;
+    esp_err_t err = httpd_start(&h, &config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start HTTP server: %s", esp_err_to_name(err));
         return err;
     }
 
-    /* Register URI handlers */
-    const httpd_uri_t uris[] = {
-        { .uri = "/",                .method = HTTP_GET,    .handler = handler_root,          .user_ctx = ctx },
-        { .uri = "/api/status",      .method = HTTP_GET,    .handler = handler_status,        .user_ctx = ctx },
-        { .uri = "/api/settings",    .method = HTTP_GET,    .handler = handler_get_settings,  .user_ctx = ctx },
-        { .uri = "/api/settings",    .method = HTTP_POST,   .handler = handler_post_settings, .user_ctx = ctx },
-        { .uri = "/api/monitor",     .method = HTTP_GET,    .handler = handler_monitor,       .user_ctx = ctx },
-        { .uri = "/api/peers",       .method = HTTP_GET,    .handler = handler_get_peers,     .user_ctx = ctx },
-        { .uri = "/api/peers/allowed", .method = HTTP_GET,  .handler = handler_get_allowed,   .user_ctx = ctx },
-        { .uri = "/api/peers/allowed", .method = HTTP_POST, .handler = handler_post_allowed,  .user_ctx = ctx },
-        { .uri = "/api/peers/allowed", .method = HTTP_DELETE, .handler = handler_delete_allowed, .user_ctx = ctx },
-        { .uri = "/api/restart",     .method = HTTP_POST,   .handler = handler_restart,       .user_ctx = ctx },
-        { .uri = "/api/wifi",        .method = HTTP_GET,    .handler = handler_get_wifi,      .user_ctx = ctx },
-        { .uri = "/api/wifi",        .method = HTTP_POST,   .handler = handler_post_wifi,     .user_ctx = ctx },
+    /* Register URI handlers (user_ctx = the real handler, see handler_dispatch) */
+    static const struct {
+        const char *uri;
+        httpd_method_t method;
+        esp_err_t (*fn)(httpd_req_t *);
+    } routes[] = {
+        { "/",                  HTTP_GET,    handler_root },
+        { "/api/status",        HTTP_GET,    handler_status },
+        { "/api/settings",      HTTP_GET,    handler_get_settings },
+        { "/api/settings",      HTTP_POST,   handler_post_settings },
+        { "/api/monitor",       HTTP_GET,    handler_monitor },
+        { "/api/peers",         HTTP_GET,    handler_get_peers },
+        { "/api/peers/allowed", HTTP_GET,    handler_get_allowed },
+        { "/api/peers/allowed", HTTP_POST,   handler_post_allowed },
+        { "/api/peers/allowed", HTTP_DELETE, handler_delete_allowed },
+        { "/api/restart",       HTTP_POST,   handler_restart },
+        { "/api/wifi",          HTTP_GET,    handler_get_wifi },
+        { "/api/wifi",          HTTP_POST,   handler_post_wifi },
     };
 
-    for (int i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
-        httpd_register_uri_handler(ctx->httpd, &uris[i]);
+    for (int i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
+        httpd_uri_t u = {
+            .uri = routes[i].uri,
+            .method = routes[i].method,
+            .handler = handler_dispatch,
+            .user_ctx = (void *)routes[i].fn,
+        };
+        httpd_register_uri_handler(h, &u);
     }
 
+    s_httpd = h;
     ESP_LOGI(TAG, "HTTP config server started on port %d", config.server_port);
     return ESP_OK;
 }
 
+esp_err_t ml_config_httpd_start(ml_config_ctx_t *ctx, microlink_t *ml) {
+    if (!ctx) return ESP_ERR_INVALID_ARG;
+    if (!s_attach_lock) {
+        s_attach_lock = xSemaphoreCreateMutexStatic(&s_attach_lock_buf);
+    }
+
+    http_pw_init();
+
+    esp_err_t err = config_server_start_once();
+    if (err != ESP_OK) return err;
+
+    xSemaphoreTake(s_attach_lock, portMAX_DELAY);
+    ctx->ml = ml;
+    ctx->httpd = s_httpd;
+    s_attached = ctx;
+    xSemaphoreGive(s_attach_lock);
+    return ESP_OK;
+}
+
 void ml_config_httpd_stop(ml_config_ctx_t *ctx) {
-    if (!ctx) return;
-    if (ctx->httpd) {
-        httpd_stop(ctx->httpd);
-        ctx->httpd = NULL;
-        ESP_LOGI(TAG, "HTTP config server stopped");
+    if (!ctx || !s_attach_lock) return;
+    /* Waits for a request being handled for this context to finish. */
+    xSemaphoreTake(s_attach_lock, portMAX_DELAY);
+    bool was_attached = (s_attached == ctx);
+    if (was_attached) s_attached = NULL;
+    ctx->ml = NULL;
+    ctx->httpd = NULL;
+    xSemaphoreGive(s_attach_lock);
+    if (was_attached) {
+        ESP_LOGI(TAG, "HTTP config server detached (server kept running)");
     }
 }
 
