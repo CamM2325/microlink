@@ -32,6 +32,19 @@ menu "MicroLink V2 Configuration"
             communicate with). For large tailnets, set this to the actual
             peer count needed, not the total tailnet size.
 
+    config ML_DERP_VERIFY_CERT
+        bool "Verify DERP relay TLS certificates"
+        depends on MBEDTLS_CERTIFICATE_BUNDLE
+        default y
+        help
+            Check each DERP relay's TLS certificate against ESP-IDF's CA
+            bundle and the relay's host name. Tailscale's relays use Let's
+            Encrypt certificates, which the bundle covers. WireGuard already
+            encrypts relayed traffic; this stops a network in the middle from
+            posing as the relay and silently dropping or delaying it.
+            Turn off only for a self-hosted DERP server with a private
+            certificate.
+
     config ML_DERP_REGION
         int "Preferred DERP region ID"
         default 9
@@ -344,9 +357,19 @@ menu "MicroLink V2 Configuration"
                 Wrap the ts2021 Noise handshake in TLS on port 443 instead
                 of plain TCP on port 80. Required for control planes that
                 only expose an HTTPS listener (e.g. Headscale behind an LB).
-                The server certificate is NOT verified; the control plane is
-                authenticated by the pinned Noise public key instead, same
-                trust model as Tailscale's plain port-80 transport.
+                The control plane itself is authenticated by the pinned Noise
+                public key; see ML_CTRL_TLS_VERIFY_CERT for the TLS layer.
+
+        config ML_CTRL_TLS_VERIFY_CERT
+            bool "Verify the control plane's TLS certificate"
+            depends on ML_CTRL_TLS && MBEDTLS_CERTIFICATE_BUNDLE
+            default y
+            help
+                Check the control plane's TLS certificate against ESP-IDF's
+                CA bundle and its host name. Noise already authenticates the
+                server; this additionally stops a network in the middle from
+                posing as the HTTPS endpoint. Turn off only for a self-hosted
+                server with a private/self-signed certificate.
 
         config ML_CTRL_NOISE_PUBKEY_HEX
             string "Control plane Noise public key (hex)"

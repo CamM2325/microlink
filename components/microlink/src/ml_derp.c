@@ -27,6 +27,9 @@
 #include "lwip/netdb.h"
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/error.h"
+#if CONFIG_ML_DERP_VERIFY_CERT
+#include "esp_crt_bundle.h"
+#endif
 #include "nacl_box.h"
 #include <string.h>
 #include <errno.h>
@@ -798,7 +801,18 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         derp_tls_abort(ml, sock);
         return ESP_FAIL;
     }
+#if CONFIG_ML_DERP_VERIFY_CERT
+    /* Verify the relay certificate against ESP-IDF's CA bundle; the host name
+     * is checked via mbedtls_ssl_set_hostname() below. */
+    mbedtls_ssl_conf_authmode(&ml->derp.ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    if (esp_crt_bundle_attach(&ml->derp.ssl_conf) != ESP_OK) {
+        ESP_LOGE(TAG, "TLS setup failed: could not attach the CA bundle");
+        derp_tls_abort(ml, sock);
+        return ESP_FAIL;
+    }
+#else
     mbedtls_ssl_conf_authmode(&ml->derp.ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
+#endif
     mbedtls_ssl_conf_rng(&ml->derp.ssl_conf, mbedtls_ctr_drbg_random, &ml->derp.ctr_drbg);
     /* Pin the DERP connection to TLS 1.2. When the DERP relay uses a
      * Let's Encrypt ECDSA certificate, the ESP-IDF mbedTLS TLS 1.3 path
@@ -835,15 +849,27 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     mbedtls_ssl_set_bio(&ml->derp.ssl, &ml->derp.sockfd,
                          ml_derp_bio_send, ml_derp_bio_recv, NULL);
 
-    /* TLS handshake - socket has 10s SO_RCVTIMEO from connect phase. */
+    /* TLS handshake - socket has 10s SO_RCVTIMEO from connect phase; the
+     * overall deadline stops a relay that accepts TCP and then stalls from
+     * hanging this task forever. */
     int ret;
+    const int64_t hs_deadline_us = esp_timer_get_time() + 20LL * 1000 * 1000;
     while ((ret = mbedtls_ssl_handshake(&ml->derp.ssl)) != 0) {
-        if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+        if ((ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) &&
+            esp_timer_get_time() < hs_deadline_us) {
             continue;
         }
         char err_buf[128];
         mbedtls_strerror(ret, err_buf, sizeof(err_buf));
         ESP_LOGE(TAG, "TLS handshake failed: %s", err_buf);
+#if CONFIG_ML_DERP_VERIFY_CERT
+        uint32_t vflags = mbedtls_ssl_get_verify_result(&ml->derp.ssl);
+        if (vflags != 0 && vflags != (uint32_t)-1) {
+            char why[160];
+            mbedtls_x509_crt_verify_info(why, sizeof(why), "", vflags);
+            ESP_LOGE(TAG, "DERP certificate for %s not accepted: %s", derp_host, why);
+        }
+#endif
         derp_tls_abort(ml, sock);
         return ESP_FAIL;
     }

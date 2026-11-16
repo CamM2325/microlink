@@ -4,10 +4,10 @@
  *
  * Wraps the ts2021 Noise handshake in TLS on port 443 for control planes
  * that only expose an HTTPS listener (e.g. Headscale behind a load
- * balancer, such as Lolipop Zero Trust Link). The server certificate is
- * not verified: the control plane is authenticated by the pinned Noise
- * public key, the same trust model as Tailscale's plain port-80 transport
- * (and the same choice ml_derp.c makes for DERP).
+ * balancer, such as Lolipop Zero Trust Link). The control plane is
+ * authenticated by the pinned Noise public key; the TLS certificate is
+ * additionally verified against ESP-IDF's CA bundle unless
+ * CONFIG_ML_CTRL_TLS_VERIFY_CERT is disabled (self-signed servers).
  *
  * All functions run on the coord task only — no locking needed.
  */
@@ -20,6 +20,10 @@
 #include "esp_log.h"
 #include "mbedtls/error.h"
 #include "mbedtls/net_sockets.h"
+#include "esp_timer.h"
+#if CONFIG_ML_CTRL_TLS_VERIFY_CERT
+#include "esp_crt_bundle.h"
+#endif
 #include <errno.h>
 #include <string.h>
 
@@ -68,7 +72,13 @@ int ml_coord_tls_handshake(microlink_t *ml, const char *hostname) {
                                        MBEDTLS_SSL_PRESET_DEFAULT);
     if (ret != 0) goto fail;
 
+#if CONFIG_ML_CTRL_TLS_VERIFY_CERT
+    mbedtls_ssl_conf_authmode(&t->ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    ret = esp_crt_bundle_attach(&t->ssl_conf);
+    if (ret != 0) goto fail;
+#else
     mbedtls_ssl_conf_authmode(&t->ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
+#endif
     mbedtls_ssl_conf_rng(&t->ssl_conf, mbedtls_ctr_drbg_random, &t->ctr_drbg);
 
     ret = mbedtls_ssl_setup(&t->ssl, &t->ssl_conf);
@@ -79,9 +89,11 @@ int ml_coord_tls_handshake(microlink_t *ml, const char *hostname) {
     t->sockfd = ml->coord_sock;
     mbedtls_ssl_set_bio(&t->ssl, &t->sockfd, coord_bio_send, coord_bio_recv, NULL);
 
+    const int64_t hs_deadline_us = esp_timer_get_time() + 20LL * 1000 * 1000;
     while ((ret = mbedtls_ssl_handshake(&t->ssl)) != 0) {
-        if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
-            continue;  /* Socket timeouts (10s) bound the total wait */
+        if ((ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) &&
+            esp_timer_get_time() < hs_deadline_us) {
+            continue;  /* each socket timeout is 10s; the deadline bounds the total */
         }
         goto fail;
     }
