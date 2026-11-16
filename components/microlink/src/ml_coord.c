@@ -792,7 +792,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON *hostinfo = cJSON_CreateObject();
     const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
     cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-    cJSON_AddStringToObject(hostinfo, "OS", "esp32");
+    cJSON_AddStringToObject(hostinfo, "OS", ML_HOSTINFO_OS);
     cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
     cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
 
@@ -1685,7 +1685,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON *hostinfo = cJSON_CreateObject();
     const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
     cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-    cJSON_AddStringToObject(hostinfo, "OS", "esp32");
+    cJSON_AddStringToObject(hostinfo, "OS", ML_HOSTINFO_OS);
     cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
     cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
     cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
@@ -2023,7 +2023,7 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise, bool omi
     if (hostinfo) {
         const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
         cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-        cJSON_AddStringToObject(hostinfo, "OS", "esp32");
+        cJSON_AddStringToObject(hostinfo, "OS", ML_HOSTINFO_OS);
         cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
         cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
         cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
@@ -2343,7 +2343,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     if (hostinfo) {
         const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
         cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-        cJSON_AddStringToObject(hostinfo, "OS", "esp32");
+        cJSON_AddStringToObject(hostinfo, "OS", ML_HOSTINFO_OS);
         cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
         cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
         cJSON_AddItemToObject(root, "Hostinfo", hostinfo);

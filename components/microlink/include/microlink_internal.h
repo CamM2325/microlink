@@ -157,6 +157,12 @@ extern "C" {
 #define ML_CTRL_KEEPALIVE_MS            60000
 
 /* Large tailnet buffer sizes (PSRAM-allocated, configurable via menuconfig) */
+/* Hostinfo.OS reported to the control plane. Kept as "linux": changing it
+ * makes Tailscale flag every upgraded device with "node OS changed since last
+ * connection, was node state copied between devices?", and unknown OS values
+ * may be treated differently by the control plane. OSVersion says ESP-IDF. */
+#define ML_HOSTINFO_OS          "linux"
+
 #define ML_H2_BUFFER_SIZE       (CONFIG_ML_H2_BUFFER_SIZE_KB * 1024)
 #define ML_JSON_BUFFER_SIZE     (CONFIG_ML_JSON_BUFFER_SIZE_KB * 1024)
 
