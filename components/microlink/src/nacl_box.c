@@ -560,9 +560,21 @@ static struct {
 
 static int s_shared_cache_next;
 
+static uint8_t s_shared_cache_owner_sk[32];
+
 int nacl_box_shared_get(uint8_t *shared_key,
                         const uint8_t *peer_pk,
                         const uint8_t *our_sk) {
+    /* [triage fixup] The cache was keyed on peer_pk only. If our disco key
+     * changes in the same boot (microlink_factory_reset() + re-init, NVS
+     * failure -> ephemeral keys, or multiple instances) every hit would return
+     * a shared secret derived from the OLD key and DISCO would silently stop
+     * working. Flush when the owning secret key changes. */
+    if (memcmp(s_shared_cache_owner_sk, our_sk, 32) != 0) {
+        memset(s_shared_cache, 0, sizeof(s_shared_cache));
+        s_shared_cache_next = 0;
+        memcpy(s_shared_cache_owner_sk, our_sk, 32);
+    }
     for (int i = 0; i < NACL_SHARED_CACHE_SLOTS; i++) {
         if (s_shared_cache[i].valid &&
             memcmp(s_shared_cache[i].peer_pk, peer_pk, 32) == 0) {
