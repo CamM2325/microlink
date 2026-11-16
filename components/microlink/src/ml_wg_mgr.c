@@ -199,7 +199,7 @@ static void wg_udp_sendto_in_tcpip(void *arg) {
     xSemaphoreGive(sctx->done);
 }
 
-/* [triage fixup] Shared by the byte-buffer (#28) and zero-copy pbuf (#33)
+/* Shared by the byte-buffer (#28) and zero-copy pbuf (#33)
  * output callbacks: send directly when already on tcpip_thread, otherwise
  * dispatch and wait. Does not consume p. */
 static err_t wg_udp_sendto_any_ctx(struct pbuf *p, const ip_addr_t *dst, u16_t port) {
@@ -235,7 +235,7 @@ static err_t wg_udp_output_pbuf_cb(uint32_t dest_ip, uint16_t dest_port,
     IP_SET_TYPE_VAL(dst, IPADDR_TYPE_V4);
     ip4_addr_set_u32(ip_2_ip4(&dst), dest_ip);  /* already network byte order */
 
-    /* [triage fixup] #33 called udp_sendto() unconditionally, which bypasses
+    /* #33 called udp_sendto() unconditionally, which bypasses
      * #28's thread-safety dispatch (this callback takes precedence over the
      * byte-buffer one, and also runs on the wg_mgr task for handshakes and
      * keepalives). */
@@ -402,7 +402,7 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
     /* Create raw UDP PCB for WG output (avoids BSD sendto deadlock on TCPIP
      * thread).  Bind to port 51820 to match the DISCO socket source port. */
     if (!s_wg_output_pcb) {
-        /* [triage fixup] netif is already linked into netif_list at this
+        /* netif is already linked into netif_list at this
          * point, so it must not be freed on failure; fall through with
          * s_wg_output_pcb == NULL (output cb returns ERR_CONN, DERP still
          * works) - same degraded behaviour as main when udp_new() failed. */
@@ -1171,7 +1171,7 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                      * seconds, see wireguard.h), a plain wireguardif_connect()
                      * gets real, bounded retries instead of exactly one
                      * unretried shot. */
-                    /* [triage fixup] Without a gate this runs on EVERY direct
+                    /* Without a gate this runs on EVERY direct
                      * pong (heartbeat = 3 s) while there is no session, and
                      * wireguardif_connect() resets handshake_attempts, so the
                      * new MAX_TIMER_HANDSHAKES cap never fires: a peer that

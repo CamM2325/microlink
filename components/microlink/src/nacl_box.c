@@ -562,7 +562,7 @@ static struct {
 static int s_shared_cache_next;
 
 static uint8_t s_shared_cache_owner_sk[32];
-/* [triage fixup] disco_send_call_me_maybe() is reachable from app tasks via
+/* disco_send_call_me_maybe() is reachable from app tasks via
  * ml_wg_mgr_send_cmm() (ml_tcp.c / ml_udp.c), not only from ml_wg_mgr, so the
  * cache needs a lock. The X25519 itself runs outside the critical section. */
 static portMUX_TYPE s_shared_cache_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -570,7 +570,7 @@ static portMUX_TYPE s_shared_cache_lock = portMUX_INITIALIZER_UNLOCKED;
 int nacl_box_shared_get(uint8_t *shared_key,
                         const uint8_t *peer_pk,
                         const uint8_t *our_sk) {
-    /* [triage fixup] The cache was keyed on peer_pk only. If our disco key
+    /* The cache was keyed on peer_pk only. If our disco key
      * changes in the same boot (microlink_factory_reset() + re-init, NVS
      * failure -> ephemeral keys, or multiple instances) every hit would return
      * a shared secret derived from the OLD key and DISCO would silently stop
