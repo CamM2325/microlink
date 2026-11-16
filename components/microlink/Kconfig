@@ -391,9 +391,35 @@ menu "MicroLink V2 Configuration"
                 (e.g., http://100.x.x.x/) for runtime configuration of
                 WiFi credentials, Tailscale auth key, peer allowlist, etc.
 
+                Every request requires HTTP Basic auth (user "admin") and is
+                only served on the tailnet address unless
+                ML_CONFIG_HTTPD_ALLOW_LAN is set. Anyone with the password
+                can change the auth key and network settings.
+
                 Settings persist in NVS across reboots. The peer allowlist
                 controls which peers receive outbound DISCO probes — on large
                 tailnets this prevents wg_mgr flooding and reduces latency.
+
+        config ML_CONFIG_HTTPD_PASSWORD
+            string "Admin password (empty = generate on first boot)"
+            depends on ML_ENABLE_CONFIG_HTTPD
+            default ""
+            help
+                Password for the config UI (HTTP Basic auth, user "admin").
+                Leave empty to generate a random password on first start; it
+                is stored in NVS and printed once on the serial console.
+                Note: a password set here is compiled into the firmware.
+
+        config ML_CONFIG_HTTPD_ALLOW_LAN
+            bool "Also serve the config UI on the local (WiFi/Ethernet) network"
+            depends on ML_ENABLE_CONFIG_HTTPD
+            default n
+            help
+                By default the config UI only answers on the tailnet address
+                (100.64.0.0/10), where traffic is WireGuard-encrypted. Enable
+                to also answer on private LAN addresses; Basic auth is then
+                sent in cleartext on that LAN. Never served on the cellular
+                carrier address.
 
         config ML_CONFIG_MAX_ALLOWED_PEERS
             int "Maximum peers in allowlist"

@@ -138,6 +138,17 @@ esp_err_t microlink_factory_reset(void) {
         ESP_LOGI(TAG, "Factory reset: keys erased");
     }
 
+    /* Erase runtime settings set via the config UI (auth key, WiFi list,
+     * APN/PPP credentials, control host, UI password). These override
+     * Kconfig, so leaving them would let planted values survive a reset. */
+    err = nvs_open("ml_config", NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_erase_all(nvs);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Factory reset: runtime settings erased");
+    }
+
     /* Erase cached peers */
     ml_peer_nvs_init();
     ml_peer_nvs_clear();

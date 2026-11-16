@@ -62,7 +62,7 @@ CONFIG_ML_ENABLE_CELLULAR=y
 CONFIG_ML_CELLULAR_APN=""
 
 # HTTP Config Server (runtime WiFi/auth/peer config via web UI)
-CONFIG_ML_ENABLE_CONFIG_HTTPD=y
+# CONFIG_ML_ENABLE_CONFIG_HTTPD is not set
 CONFIG_ML_CONFIG_MAX_ALLOWED_PEERS=512
 
 # Priority peer (guaranteed WG slot even when peer table is full)

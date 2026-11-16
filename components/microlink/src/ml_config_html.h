@@ -232,6 +232,8 @@ static const char CONFIG_PAGE_HTML[] =
 
 /* ---- JavaScript ---- */
 "<script>"
+/* HTML-escape anything that came from the device/user before using innerHTML */
+"function esc(v){return String(v==null?'':v).replace(/[&<>\"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c];});}"
 "let allowedPeers=[];"
 "let wifiNetworks=[];"
 
@@ -292,8 +294,8 @@ static const char CONFIG_PAGE_HTML[] =
 "var te=document.getElementById('mTasks');"
 "if(d.tasks){"
 "te.innerHTML=Object.entries(d.tasks).map(([n,t])=>"
-"'<div class=\"task-row\"><span class=\"tn\">'+n+'</span>"
-"<span class=\"ts\">'+t.state+' | '+t.stack_free+' B free</span></div>'"
+"'<div class=\"task-row\"><span class=\"tn\">'+esc(n)+'</span>"
+"<span class=\"ts\">'+esc(t.state)+' | '+esc(t.stack_free)+' B free</span></div>'"
 ").join('');"
 "}else{te.innerHTML='';}"
 "}catch(e){}"
@@ -370,8 +372,8 @@ static const char CONFIG_PAGE_HTML[] =
 "el.innerHTML=wifiNetworks.map(function(w,i){"
 "var h='<div class=\"wifi-item\">';"
 "h+='<span class=\"num\">#'+(i+1)+'</span>';"
-"h+='<span class=\"ssid\">'+w.ssid+'</span>';"
-"h+='<span class=\"wpw\">'+w.pass+'</span>';"
+"h+='<span class=\"ssid\">'+esc(w.ssid)+'</span>';"
+"h+='<span class=\"wpw\">'+esc(w.pass)+'</span>';"
 "h+='<div class=\"wifi-btns\">';"
 "if(i>0)h+='<button class=\"btn-outline btn-sm\" onclick=\"moveWifi('+i+',-1)\">\\u2191</button>';"
 "if(i<wifiNetworks.length-1)h+='<button class=\"btn-outline btn-sm\" onclick=\"moveWifi('+i+',1)\">\\u2193</button>';"
@@ -438,8 +440,8 @@ static const char CONFIG_PAGE_HTML[] =
 "}"
 "el.innerHTML=allowedPeers.map((p,i)=>"
 "'<div class=\"peer-item\">"
-"<span class=\"ip\">'+p.ip+'</span>"
-"<span class=\"name\">'+p.label+'</span>"
+"<span class=\"ip\">'+esc(p.ip)+'</span>"
+"<span class=\"name\">'+esc(p.label)+'</span>"
 "<button class=\"btn-danger btn-sm\" onclick=\"removeAllowed('+i+')\">Remove</button>"
 "</div>'"
 ").join('');"
@@ -477,7 +479,7 @@ static const char CONFIG_PAGE_HTML[] =
 /* ---- Restart ---- */
 "async function doRestart(){"
 "if(!confirm('Restart the device?'))return;"
-"try{await fetch('/api/restart',{method:'POST'});}catch(e){}"
+"try{await fetch('/api/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){}"
 "document.getElementById('vpnIp').textContent='Restarting...';"
 "}"
 

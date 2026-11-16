@@ -339,6 +339,153 @@ const char *ml_config_get_device_name_full(const ml_config_ctx_t *ctx) {
 }
 
 /* ============================================================================
+ * Access control
+ *
+ * The config server can change the auth key, WiFi list, APN credentials and
+ * control host, so every endpoint requires:
+ *   1. the request arrived on an allowed interface: tailnet (100.64.0.0/10)
+ *      only, unless CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN. Never the cellular
+ *      carrier-facing address.
+ *   2. HTTP Basic auth with the admin password (CONFIG_ML_CONFIG_HTTPD_PASSWORD,
+ *      or a random one generated on first start, stored in NVS and printed
+ *      once on the serial console).
+ *   3. a Host header that is an IP literal (blocks DNS rebinding).
+ *   4. for state-changing requests, Content-Type: application/json
+ *      (cross-site pages can't send it without a CORS preflight, which this
+ *      server never approves -> blocks CSRF).
+ * ========================================================================== */
+#include "mbedtls/base64.h"
+#include "lwip/sockets.h"
+#include "esp_random.h"
+
+#define HTTP_PW_KEY      "http_pw"
+#define HTTP_PW_MAXLEN   64
+
+static char s_http_pw[HTTP_PW_MAXLEN + 1];
+
+static void http_pw_init(void) {
+#ifdef CONFIG_ML_CONFIG_HTTPD_PASSWORD
+    const char *cfg = CONFIG_ML_CONFIG_HTTPD_PASSWORD;
+#else
+    const char *cfg = "";
+#endif
+    if (cfg[0] != '\0') {
+        strlcpy(s_http_pw, cfg, sizeof(s_http_pw));
+        return;
+    }
+    nvs_handle_t h;
+    size_t len = sizeof(s_http_pw);
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        if (nvs_get_str(h, HTTP_PW_KEY, s_http_pw, &len) != ESP_OK || s_http_pw[0] == '\0') {
+            static const char alphabet[] = "abcdefghjkmnpqrstuvwxyzACDEFGHJKLMNPQRTUVWXY34679";
+            for (int i = 0; i < 16; i++) {
+                s_http_pw[i] = alphabet[esp_random() % (sizeof(alphabet) - 1)];
+            }
+            s_http_pw[16] = '\0';
+            nvs_set_str(h, HTTP_PW_KEY, s_http_pw);
+            nvs_commit(h);
+            ESP_LOGW(TAG, "Config UI password generated (user 'admin'): %s", s_http_pw);
+        }
+        nvs_close(h);
+    }
+    if (s_http_pw[0] == '\0') {
+        /* NVS unavailable: fail closed with an unguessable password. */
+        for (int i = 0; i < 32; i++) s_http_pw[i] = 'a' + (esp_random() % 26);
+        s_http_pw[32] = '\0';
+        ESP_LOGE(TAG, "Config UI: could not store a password; UI is locked");
+    }
+}
+
+static bool ct_equal(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    unsigned char diff = (unsigned char)(la != lb);
+    for (size_t i = 0; i < la; i++) {
+        diff |= (unsigned char)(a[i] ^ b[i % (lb ? lb : 1)]);
+    }
+    return diff == 0;
+}
+
+static bool local_addr_allowed(httpd_req_t *req) {
+    int fd = httpd_req_to_sockfd(req);
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    if (getsockname(fd, (struct sockaddr *)&ss, &sl) != 0 || ss.ss_family != AF_INET) {
+        return false;
+    }
+    uint32_t ip = ntohl(((struct sockaddr_in *)&ss)->sin_addr.s_addr);
+    bool tailnet = (ip & 0xFFC00000u) == 0x64400000u;  /* 100.64.0.0/10 */
+#if CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN
+    bool lan = ((ip >> 24) == 10) || ((ip >> 16) == 0xC0A8) || (((ip >> 16) & 0xFFF0) == 0xAC10);
+    return tailnet || lan;
+#else
+    return tailnet;
+#endif
+}
+
+static bool host_is_ip_literal(httpd_req_t *req) {
+    char host[64];
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
+        return false;
+    }
+    for (const char *c = host; *c; c++) {
+        if (!((*c >= '0' && *c <= '9') || *c == '.' || *c == ':' || *c == '[' || *c == ']' ||
+              (*c >= 'a' && *c <= 'f') || (*c >= 'A' && *c <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool basic_auth_ok(httpd_req_t *req) {
+    char hdr[160];
+    if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr)) != ESP_OK ||
+        strncmp(hdr, "Basic ", 6) != 0) {
+        return false;
+    }
+    unsigned char dec[128];
+    size_t dlen = 0;
+    if (mbedtls_base64_decode(dec, sizeof(dec) - 1, &dlen,
+                              (const unsigned char *)hdr + 6, strlen(hdr + 6)) != 0) {
+        return false;
+    }
+    dec[dlen] = '\0';
+    char *colon = strchr((char *)dec, ':');
+    if (!colon) return false;
+    bool ok = ct_equal(colon + 1, s_http_pw);
+    memset(dec, 0, sizeof(dec));
+    return ok;
+}
+
+/* Returns true if the request may proceed; otherwise a response was sent. */
+static bool http_guard(httpd_req_t *req, bool mutating) {
+    if (!local_addr_allowed(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Not available on this interface");
+        return false;
+    }
+    if (!host_is_ip_literal(req)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Use the device IP address");
+        return false;
+    }
+    if (!basic_auth_ok(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"MicroLink\", charset=\"UTF-8\"");
+        httpd_resp_sendstr(req, "Authentication required");
+        return false;
+    }
+    if (mutating) {
+        char ct[48];
+        if (httpd_req_get_hdr_value_str(req, "Content-Type", ct, sizeof(ct)) != ESP_OK ||
+            strncmp(ct, "application/json", 16) != 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Content-Type must be application/json");
+            return false;
+        }
+    }
+    httpd_resp_set_hdr(req, "X-Frame-Options", "DENY");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return true;
+}
+
+/* ============================================================================
  * HTTP Handlers
  * ========================================================================== */
 
@@ -380,6 +527,7 @@ static char *read_post_body(httpd_req_t *req) {
 
 /* GET / — serve HTML config page */
 static esp_err_t handler_root(httpd_req_t *req) {
+    if (!http_guard(req, false)) return ESP_OK;
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req, CONFIG_PAGE_HTML);
     return ESP_OK;
@@ -387,6 +535,7 @@ static esp_err_t handler_root(httpd_req_t *req) {
 
 /* GET /api/status */
 static esp_err_t handler_status(httpd_req_t *req) {
+    if (!http_guard(req, false)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
     microlink_t *ml = ctx->ml;
 
@@ -423,6 +572,7 @@ static esp_err_t handler_status(httpd_req_t *req) {
 
 /* GET /api/settings */
 static esp_err_t handler_get_settings(httpd_req_t *req) {
+    if (!http_guard(req, false)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
 
     cJSON *json = cJSON_CreateObject();
@@ -459,6 +609,7 @@ static esp_err_t handler_get_settings(httpd_req_t *req) {
 
 /* POST /api/settings */
 static esp_err_t handler_post_settings(httpd_req_t *req) {
+    if (!http_guard(req, true)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
 
     char *body = read_post_body(req);
@@ -554,6 +705,7 @@ static esp_err_t handler_post_settings(httpd_req_t *req) {
 
 /* GET /api/peers — all known peers with status */
 static esp_err_t handler_get_peers(httpd_req_t *req) {
+    if (!http_guard(req, false)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
     microlink_t *ml = ctx->ml;
 
@@ -586,6 +738,7 @@ static esp_err_t handler_get_peers(httpd_req_t *req) {
 
 /* GET /api/peers/allowed — current allowlist */
 static esp_err_t handler_get_allowed(httpd_req_t *req) {
+    if (!http_guard(req, false)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
 
     cJSON *json = cJSON_CreateObject();
@@ -611,6 +764,7 @@ static esp_err_t handler_get_allowed(httpd_req_t *req) {
 
 /* POST /api/peers/allowed — replace allowlist */
 static esp_err_t handler_post_allowed(httpd_req_t *req) {
+    if (!http_guard(req, true)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
 
     char *body = read_post_body(req);
@@ -672,6 +826,7 @@ static esp_err_t handler_post_allowed(httpd_req_t *req) {
 
 /* DELETE /api/peers/allowed — clear allowlist */
 static esp_err_t handler_delete_allowed(httpd_req_t *req) {
+    if (!http_guard(req, true)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
 
     if (xSemaphoreTake(ctx->peer_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -691,6 +846,7 @@ static esp_err_t handler_delete_allowed(httpd_req_t *req) {
 
 /* GET /api/monitor — temperature, RSSI, uptime, task stack watermarks */
 static esp_err_t handler_monitor(httpd_req_t *req) {
+    if (!http_guard(req, false)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
     microlink_t *ml = ctx->ml;
 
@@ -775,6 +931,7 @@ static esp_err_t handler_monitor(httpd_req_t *req) {
 
 /* POST /api/restart */
 static esp_err_t handler_restart(httpd_req_t *req) {
+    if (!http_guard(req, true)) return ESP_OK;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true,\"restarting\":true}");
 
@@ -790,6 +947,7 @@ static esp_err_t handler_restart(httpd_req_t *req) {
 
 /* GET /api/wifi — return WiFi list with masked passwords */
 static esp_err_t handler_get_wifi(httpd_req_t *req) {
+    if (!http_guard(req, false)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
 
     cJSON *json = cJSON_CreateObject();
@@ -812,6 +970,7 @@ static esp_err_t handler_get_wifi(httpd_req_t *req) {
 
 /* POST /api/wifi — replace entire WiFi list */
 static esp_err_t handler_post_wifi(httpd_req_t *req) {
+    if (!http_guard(req, true)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
 
     char *body = read_post_body(req);
@@ -1101,6 +1260,8 @@ ml_config_ctx_t *ml_config_httpd_init(void) {
 esp_err_t ml_config_httpd_start(ml_config_ctx_t *ctx, microlink_t *ml) {
     if (!ctx) return ESP_ERR_INVALID_ARG;
     ctx->ml = ml;
+
+    http_pw_init();
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 6144;
