@@ -1,0 +1,45 @@
+menu "Example Ethernet"
+
+    choice EXAMPLE_ETH_TYPE
+        prompt "Ethernet hardware"
+        default EXAMPLE_ETH_WT32_ETH01 if IDF_TARGET_ESP32
+        default EXAMPLE_ETH_W5500
+
+        config EXAMPLE_ETH_WT32_ETH01
+            bool "WT32-ETH01 (ESP32 internal EMAC + LAN8720)"
+            depends on IDF_TARGET_ESP32
+            select ETH_USE_ESP32_EMAC
+        config EXAMPLE_ETH_W5500
+            bool "W5500 module over SPI (any ESP32 chip)"
+            select ETH_USE_SPI_ETHERNET
+            select ETH_SPI_ETHERNET_W5500
+        config EXAMPLE_ETH_OPENETH
+            bool "QEMU emulated Ethernet (OpenCores MAC)"
+            depends on IDF_TARGET_ESP32
+            select ETH_USE_OPENETH
+    endchoice
+
+    if EXAMPLE_ETH_W5500
+        config EXAMPLE_W5500_SCLK
+            int "SPI SCLK GPIO"
+            default 12
+        config EXAMPLE_W5500_MOSI
+            int "SPI MOSI GPIO"
+            default 11
+        config EXAMPLE_W5500_MISO
+            int "SPI MISO GPIO"
+            default 13
+        config EXAMPLE_W5500_CS
+            int "SPI CS GPIO"
+            default 10
+        config EXAMPLE_W5500_INT
+            int "Interrupt GPIO (-1 = poll)"
+            default 4
+            range -1 48
+        config EXAMPLE_W5500_SPI_MHZ
+            int "SPI clock (MHz)"
+            default 20
+            range 5 40
+    endif
+
+endmenu

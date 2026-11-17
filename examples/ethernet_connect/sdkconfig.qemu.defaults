@@ -1,0 +1,9 @@
+# Overlay: run in Espressif's QEMU with its emulated Ethernet (OpenCores
+# MAC, "-nic user,model=open_eth"). Used by the conformance CI job.
+#
+#   idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.qemu.defaults" build
+#   idf.py qemu monitor          # or see .github/workflows/conformance.yml
+CONFIG_EXAMPLE_ETH_OPENETH=y
+CONFIG_ETH_USE_OPENETH=y
+CONFIG_ETH_OPENETH_DMA_RX_BUFFER_NUM=4
+CONFIG_ETH_OPENETH_DMA_TX_BUFFER_NUM=1

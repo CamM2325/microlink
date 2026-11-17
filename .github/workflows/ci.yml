@@ -51,6 +51,10 @@ jobs:
           # No-PSRAM / single-core targets (PR #43) — tracked, not yet required
           - { idf: v5.5.6, example: basic_connect, target: esp32c3, experimental: true }
           - { idf: v5.5.6, example: basic_connect, target: esp32,   experimental: true }
+          # Ethernet (ESP-IDF 5.x): WT32-ETH01 on esp32, W5500 on esp32s3
+          - { idf: v5.3.6, example: ethernet_connect, target: esp32,   experimental: false }
+          - { idf: v5.5.6, example: ethernet_connect, target: esp32,   experimental: false }
+          - { idf: v5.5.6, example: ethernet_connect, target: esp32s3, experimental: false }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

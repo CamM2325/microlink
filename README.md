@@ -23,6 +23,8 @@ before you rely on it.
 - **NAT traversal**: DISCO ping/pong/CallMeMaybe, STUN (IPv4 and IPv6, symmetric-NAT detection),
   and DERP relay fallback. Traffic uses DERP until DISCO proves a direct path, as in Tailscale.
 - **Sockets over the tunnel**: a UDP API and an outbound TCP API that are bound to the VPN address.
+- **Ethernet** (internal EMAC or SPI modules such as the W5500) as well as WiFi; the LAN address of
+  whichever interface is up is advertised for direct paths.
 - **4G/LTE** through SIMCom modems: PPP (real lwIP sockets, direct UDP possible) or an AT-command
   socket bridge, with optional WiFi ⇄ cellular failover and fast network rebinding.
 - **Subnet router / exit node** (opt-in): advertise LAN routes or `0.0.0.0/0` and forward
@@ -44,7 +46,8 @@ WireGuard path, ICMP and UDP echo with a real Tailscale client against
 | Ionscale 0.18.0 (plain HTTP, Tailscale DERP map) | WiFi | direct path, 0% loss |
 
 Also tested: repeated stop/start (no memory growth), reconnect after reboot, and (Headscale, WiFi)
-the device as subnet router for its LAN and as exit node for a Tailscale client.
+the device as subnet router for its LAN and as exit node for a Tailscale client. Ethernet is tested
+in QEMU (ESP32, emulated MAC, Headscale, every CI run); WT32-ETH01 and W5500 hardware is not yet.
 
 **Tested by contributors:** ESP32-C3 without PSRAM (small tailnet, see PR #43); a Headscale-based
 control plane over TLS (PR #22).
@@ -116,6 +119,7 @@ echo "hi" | nc -u -w1 <device-vpn-ip> 9000     # basic_connect replies "ECHO: hi
 | Example | What it shows |
 |---|---|
 | `basic_connect` | WiFi, UDP echo on port 9000. Optional stop/start soak test (`ML_EXAMPLE_LIFECYCLE_CYCLES`). |
+| `ethernet_connect` | Ethernet: WT32-ETH01 (ESP32 + LAN8720), a W5500 SPI module, or QEMU's emulated MAC. ESP-IDF 5.x. |
 | `cellular_connect` | 4G only (PPP or AT bridge), UDP or TCP to a peer. |
 | `cellular_heartbeat` | 4G heartbeat / dead-man pattern between two peers. |
 | `failover_connect` | WiFi primary with cellular failover (`CONFIG_ML_ENABLE_NET_SWITCH`). |
@@ -457,7 +461,9 @@ cmake --build build-host && ctest --test-dir build-host --output-on-failure
 ```
 
 CI (GitHub Actions) runs the host tests with ASan/UBSan, builds the examples across ESP-IDF versions,
-and runs CodeQL and OpenSSF Scorecard. Contributions are welcome; please include how you tested
+and runs CodeQL and OpenSSF Scorecard. A conformance job boots `ethernet_connect` in Espressif's QEMU
+against a real Headscale and Tailscale client and pings it through the tunnel; run it locally with
+`tests/conformance/headscale_qemu.sh` (needs Docker and port 80). Contributions are welcome; please include how you tested
 (board, transport, control server).
 
 More: [TESTING_GUIDE.md](TESTING_GUIDE.md) · [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·

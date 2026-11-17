@@ -2063,11 +2063,9 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     plaintext[pt_len++] = 0;  /* version */
 
     /* 1. Local LAN IP endpoint (critical for same-network peers) */
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (netif) {
-        esp_netif_ip_info_t ip_info;
-        if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
-            uint32_t local_ip = ntohl(ip_info.ip.addr);
+    {
+        uint32_t local_ip;
+        if (ml_lan_ipv4(&local_ip)) {
             uint16_t local_port = ml->disco_local_port;
 
             if (local_port > 0) {

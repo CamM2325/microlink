@@ -672,6 +672,12 @@ void ml_task_exit(microlink_t *ml, uint32_t task_bit) __attribute__((noreturn));
 void ml_ota_check_pending(void);   /* at start: arm the rollback timer */
 void ml_ota_confirm(void);         /* on CONNECTED: keep the new firmware */
 
+/* IPv4 address (host byte order) of the LAN interface (WiFi station or
+ * Ethernet, never cellular PPP) that peers on the same network can reach
+ * directly: the default interface if it is one, else the first that is up.
+ * Advertised as the "Local" endpoint. False if there is none. */
+bool ml_lan_ipv4(uint32_t *ip_out);
+
 /* ml_net_io.c */
 void ml_net_io_task(void *arg);
 

@@ -1756,12 +1756,10 @@ static int add_endpoints_to_json(microlink_t *ml, cJSON *root) {
     cJSON *et_array = cJSON_AddArrayToObject(root, "EndpointTypes");
     if (!ep_array || !et_array) return 0;
 
-    /* LAN endpoint (WiFi STA) */
-    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (sta_netif) {
-        esp_netif_ip_info_t ip_info;
-        if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
-            uint32_t local_ip = ntohl(ip_info.ip.addr);
+    /* LAN endpoint (WiFi station or Ethernet) */
+    {
+        uint32_t local_ip;
+        if (ml_lan_ipv4(&local_ip)) {
             char ep_str[32];
             snprintf(ep_str, sizeof(ep_str), "%lu.%lu.%lu.%lu:%u",
                      (unsigned long)((local_ip >> 24) & 0xFF),
@@ -2968,7 +2966,7 @@ void ml_coord_task(void *arg) {
     ml_noise_state_t noise = {0};
 
     /* Wait for WiFi/cellular OR shutdown */
-    ESP_LOGI(TAG, "Waiting for WiFi...");
+    ESP_LOGI(TAG, "Waiting for the network...");
     {
         EventBits_t wb = xEventGroupWaitBits(ml->events,
                              ML_EVT_WIFI_CONNECTED | ML_EVT_SHUTDOWN_REQUEST,

@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "esp_mac.h"
 #include "esp_wifi.h"
+#include "esp_netif.h"
 #include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -958,6 +959,25 @@ microlink_state_t microlink_get_state(const microlink_t *ml) {
 
 bool microlink_is_connected(const microlink_t *ml) {
     return ml && ml->state == ML_STATE_CONNECTED;
+}
+
+static bool lan_netif_up(esp_netif_t *netif, void *arg) {
+    (void)arg;
+    if (esp_netif_get_flags(netif) & ESP_NETIF_FLAG_IS_PPP) return false;
+    const char *key = esp_netif_get_ifkey(netif);
+    if (!key || (strncmp(key, "WIFI_STA", 8) != 0 && strncmp(key, "ETH", 3) != 0)) return false;
+    esp_netif_ip_info_t info;
+    return esp_netif_is_netif_up(netif) &&
+           esp_netif_get_ip_info(netif, &info) == ESP_OK && info.ip.addr != 0;
+}
+
+bool ml_lan_ipv4(uint32_t *ip_out) {
+    esp_netif_t *netif = esp_netif_get_default_netif();
+    if (!netif || !lan_netif_up(netif, NULL)) netif = esp_netif_find_if(lan_netif_up, NULL);
+    esp_netif_ip_info_t info;
+    if (!netif || esp_netif_get_ip_info(netif, &info) != ESP_OK || info.ip.addr == 0) return false;
+    *ip_out = ntohl(info.ip.addr);
+    return true;
 }
 
 uint32_t microlink_get_vpn_ip(const microlink_t *ml) {

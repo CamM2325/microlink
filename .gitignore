@@ -37,3 +37,6 @@ docs/PPP_ANALYSIS.md
 # OS
 .DS_Store
 Thumbs.db
+
+# tests/conformance output
+build-conformance/

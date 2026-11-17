@@ -42,10 +42,17 @@ def update_one(host, image, args, auth):
         ip = socket.gethostbyname(host)
     except OSError as e:
         return host, False, "cannot resolve: %s" % e
-    try:
-        before = request(ip, args.port, "/api/status", auth)
-    except (OSError, urllib.error.URLError, ValueError) as e:
-        return host, False, "not reachable: %s" % e
+    before = None
+    for attempt in range(3):   # a device that is just (re)starting gets a moment
+        try:
+            before = request(ip, args.port, "/api/status", auth)
+            break
+        except urllib.error.HTTPError as e:
+            return host, False, "status refused (%d): wrong password?" % e.code
+        except (OSError, urllib.error.URLError, ValueError) as e:
+            if attempt == 2:
+                return host, False, "not reachable: %s" % e
+            time.sleep(10)
     old = "%s on %s" % (before.get("fw_version", "?"), before.get("fw_partition", "?"))
 
     t0 = time.time()
