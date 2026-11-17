@@ -1353,7 +1353,10 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
     cJSON_ArrayForEach(peer, peers) {
         /* Allocate peer update (freed by wg_mgr after processing) */
         ml_peer_update_t *update = ml_psram_calloc(1, sizeof(ml_peer_update_t));
-        if (!update) continue;
+        if (!update) {
+            dropped_any = true;   /* an unqueued peer must not be swept as stale */
+            continue;
+        }
 
         update->action = ML_PEER_ADD;
         update->netmap_gen = gen;
