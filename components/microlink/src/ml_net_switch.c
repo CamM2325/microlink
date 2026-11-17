@@ -912,7 +912,11 @@ ml_net_switch_state_t ml_net_switch_get_state(void)
 
 microlink_t *ml_net_switch_get_handle(void)
 {
-    return s_ctx.ml;
+    if (!s_ml_lock) return NULL;
+    xSemaphoreTake(s_ml_lock, portMAX_DELAY);
+    microlink_t *ml = s_ctx.ml;
+    xSemaphoreGive(s_ml_lock);
+    return ml;
 }
 
 const char *ml_net_switch_state_str(ml_net_switch_state_t state)
