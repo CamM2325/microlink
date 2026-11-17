@@ -278,6 +278,8 @@ static int noise_send(microlink_t *ml, ml_noise_state_t *noise,
  * next, or -1. On -1, errno is EAGAIN only when nothing was consumed (no
  * data yet); every protocol error sets a different errno, since the stream
  * is unusable then. */
+#define NOISE_MAX_CT_LEN  (16384 + 16)
+
 static int noise_recv_header(microlink_t *ml) {
     uint8_t hdr[3];
     if (coord_recv(ml, hdr, 3) < 0) return -1;
@@ -292,6 +294,14 @@ static int noise_recv_header(microlink_t *ml) {
     if (ct_len < 16) {
         ESP_LOGE(TAG, "Noise frame shorter than its MAC: %d", ct_len);
         errno = EBADMSG;
+        return -1;
+    }
+    /* The header is not authenticated, and its length decides how much we
+     * allocate before the MAC check. Go's controlbase never writes a frame
+     * over 4 KB, so anything past 16 KB is a broken or hostile stream. */
+    if (ct_len > NOISE_MAX_CT_LEN) {
+        ESP_LOGE(TAG, "Noise frame length %d over the %d limit", ct_len, NOISE_MAX_CT_LEN);
+        errno = EMSGSIZE;
         return -1;
     }
     return ct_len;
