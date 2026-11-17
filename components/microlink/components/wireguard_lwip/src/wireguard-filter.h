@@ -26,6 +26,14 @@ int wg_allowed_ip_match_len(const struct wireguard_allowed_ip *a, const ip_addr_
 /* Longest prefix among `peer`'s allowed IPs containing `addr`, else -1. */
 int wg_peer_match_len(const struct wireguard_peer *peer, const ip_addr_t *addr);
 
+/*
+ * The keypair transport data to `peer` is encrypted with: curr, or prev while
+ * curr is a responder keypair the initiator has not confirmed yet (no data
+ * received on it). NULL if neither can send. Expiry and the message limit are
+ * not checked here. The caller serialises against keypair changes.
+ */
+struct wireguard_keypair *wg_peer_tx_keypair(struct wireguard_peer *peer);
+
 /* Outbound cryptokey routing: longest-prefix match; session only breaks ties. */
 struct wireguard_peer *wg_peer_lookup_by_allowed_ip(struct wireguard_device *device, const ip_addr_t *ipaddr);
 

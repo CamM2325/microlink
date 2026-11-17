@@ -62,6 +62,18 @@ int wg_peer_match_len(const struct wireguard_peer *peer, const ip_addr_t *addr) 
 	return best;
 }
 
+struct wireguard_keypair *wg_peer_tx_keypair(struct wireguard_peer *peer) {
+	struct wireguard_keypair *keypair = &peer->curr_keypair;
+	// We may not be able to use the current keypair if we haven't received data, may need to resort to using previous keypair
+	if (keypair->valid && !keypair->initiator && (keypair->last_rx == 0)) {
+		keypair = &peer->prev_keypair;
+	}
+	if (keypair->valid && (keypair->initiator || (keypair->last_rx != 0))) {
+		return keypair;
+	}
+	return NULL;
+}
+
 /*
  * Cryptokey routing (outbound): longest-prefix match across all peers.
  * A more specific route always wins — e.g. a /32 tailnet peer beats a
