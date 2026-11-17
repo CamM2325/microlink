@@ -3092,7 +3092,9 @@ void ml_coord_task(void *arg) {
                     if (now - last_expiry_check_ms > 60000) {
                         last_expiry_check_ms = now;
                         if (ml->key_expired) {
-                            if (ml->config.auth_key) {
+                            /* init requires a non-NULL auth_key; "" means the
+                             * device was provisioned without one. */
+                            if (ml->config.auth_key && ml->config.auth_key[0]) {
                                 ESP_LOGW(TAG, "Key expired, re-registering with auth_key...");
                                 state = COORD_RECONNECTING;
                                 break;
