@@ -225,8 +225,10 @@ static int coord_recv_ex(microlink_t *ml, uint8_t *buf, size_t len, bool must_co
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
+            int err = errno;  /* logging may clobber it; callers test it */
             ESP_LOGE(TAG, "coord_recv failed: %d (errno %d, recvd %d/%d)",
-                     n, errno, (int)recvd, (int)len);
+                     n, err, (int)recvd, (int)len);
+            errno = err;
             return -1;
         }
         uint64_t now = ml_get_time_ms();
