@@ -21,10 +21,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Fetch lwIP headers
-        run: git clone --depth 1 --branch STABLE-2_2_0_RELEASE https://github.com/lwip-tcpip/lwip.git "$RUNNER_TEMP/lwip"
+      - name: Fetch lwIP headers and cJSON
+        run: |
+          git clone --depth 1 --branch STABLE-2_2_0_RELEASE https://github.com/lwip-tcpip/lwip.git "$RUNNER_TEMP/lwip"
+          git clone --depth 1 --branch v1.7.18 https://github.com/DaveGamble/cJSON.git "$RUNNER_TEMP/cjson"
       - name: Configure
-        run: cmake -S test/host -B build-host -DLWIP_INCLUDE_DIR="$RUNNER_TEMP/lwip/src/include"
+        run: cmake -S test/host -B build-host -DLWIP_INCLUDE_DIR="$RUNNER_TEMP/lwip/src/include" -DCJSON_DIR="$RUNNER_TEMP/cjson"
       - name: Build
         run: cmake --build build-host -j
       - name: Test
