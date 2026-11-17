@@ -125,6 +125,29 @@ jobs:
           idf.py -D SDKCONFIG_DEFAULTS="$defaults" set-target esp32s3
           idf.py -D SDKCONFIG_DEFAULTS="$defaults" build
 
+  package:
+    name: Registry package (pack, then build a project from the archive)
+    runs-on: ubuntu-latest
+    container: espressif/idf:${{ matrix.idf }}
+    strategy:
+      fail-fast: false
+      matrix:
+        idf: [v5.3.6, v6.1.1]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pack and build
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh" >/dev/null
+          (cd components/microlink && compote component pack --name microlink --dest-dir "$GITHUB_WORKSPACE/build-package")
+          mkdir -p build-package/camm2325__microlink
+          tar -xzf build-package/microlink_*.tgz -C build-package/camm2325__microlink
+          cd tests/package_consumer
+          idf.py set-target esp32s3
+          idf.py build
+
   static-analysis:
     name: cppcheck
     runs-on: ubuntu-latest

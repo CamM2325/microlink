@@ -23,6 +23,27 @@ set(SRCS
     "src/ml_config_httpd.c"
 )
 
+# WireGuard (wireguard-lwip, BSD-3-Clause) is compiled as part of this
+# component, so MicroLink is one self-contained component (and one ESP
+# Component Registry package). components/wireguard_lwip/CMakeLists.txt is
+# only a stub for projects that still list components/microlink/components.
+set(WG_DIR "components/wireguard_lwip/src")
+set(WG_CRYPTO
+    "${WG_DIR}/crypto/refc/blake2s.c"
+    "${WG_DIR}/crypto/refc/chacha20.c"
+    "${WG_DIR}/crypto/refc/chacha20poly1305.c"
+    "${WG_DIR}/crypto/refc/poly1305-donna.c"
+    "${WG_DIR}/crypto/refc/x25519.c"
+)
+list(APPEND SRCS
+    "${WG_DIR}/wireguard.c"
+    "${WG_DIR}/wireguardif.c"
+    "${WG_DIR}/wireguard-filter.c"
+    "${WG_DIR}/crypto.c"
+    "${WG_DIR}/wireguard-platform-esp32.c"
+    ${WG_CRYPTO}
+)
+
 set(REQUIRES
     nvs_flash
     esp_wifi
@@ -53,12 +74,19 @@ idf_component_register(
     INCLUDE_DIRS
         "include"
         "src"
+    # The WireGuard headers, including the X25519 (crypto/refc/x25519.h) used
+    # by microlink.c, ml_noise.c and nacl_box.c
+    PRIV_INCLUDE_DIRS
+        "${WG_DIR}"
+        "${WG_DIR}/crypto/refc"
     REQUIRES ${REQUIRES}
-    # wireguard_lwip also provides the X25519 (crypto/refc/x25519.h) used by
-    # microlink.c, ml_noise.c and nacl_box.c
-    PRIV_REQUIRES
-        wireguard_lwip
 )
+
+target_compile_definitions(${COMPONENT_LIB} PRIVATE WIREGUARD_CRYPTO_REFC=1)
+
+# False positive of GCC's array-bounds check in x25519.c
+set_source_files_properties("${WG_DIR}/crypto/refc/x25519.c"
+    PROPERTIES COMPILE_FLAGS "-Wno-stringop-overread")
 
 # CONFIG_ML_LOG_LEVEL_*: compile MicroLink's logs at their own level. A -D is
 # seen before any esp_log.h include, unlike a #define in the sources.
@@ -66,8 +94,11 @@ if(CONFIG_ML_LOG_LEVEL AND NOT CONFIG_ML_LOG_LEVEL_DEFAULT)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE LOG_LOCAL_LEVEL=${CONFIG_ML_LOG_LEVEL})
 endif()
 
-# DISCO crypto_box (XSalsa20-Poly1305) runs on every DISCO packet: -O2 like
-# the wireguard_lwip crypto (see that CMakeLists).
+# The data path (ChaCha20-Poly1305, BLAKE2s), the handshakes (X25519) and
+# the DISCO crypto_box (XSalsa20-Poly1305, every DISCO packet) are the hot
+# code: build them with -O2 whatever the project-wide level is (-Os in the
+# examples, -Og by default). Only a -O0 debugging build is left alone.
+# test/host/test_crypto_kat.c checks the WireGuard crypto at -O2 and -Os.
 if(NOT CONFIG_COMPILER_OPTIMIZATION_NONE)
-    set_source_files_properties(src/nacl_box.c PROPERTIES COMPILE_OPTIONS "-O2")
+    set_source_files_properties(src/nacl_box.c ${WG_CRYPTO} PROPERTIES COMPILE_OPTIONS "-O2")
 endif()

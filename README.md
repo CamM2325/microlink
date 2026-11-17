@@ -127,8 +127,10 @@ echo "hi" | nc -u -w1 <device-vpn-ip> 9000     # basic_connect replies "ECHO: hi
 
 ## Using MicroLink in your project
 
-Add `components/microlink` and `components/microlink/components` (which holds `wireguard_lwip`)
-to your project's `EXTRA_COMPONENT_DIRS`, as the examples do, then:
+`components/microlink` is one self-contained ESP-IDF component, WireGuard included. Add this
+repository's `components` directory to your project's `EXTRA_COMPONENT_DIRS`, as the examples do
+(older setups that also list `components/microlink/components` keep working). The component is
+packaged for the ESP Component Registry (`idf_component.yml`; not published yet). Then:
 
 ```c
 #include "microlink.h"

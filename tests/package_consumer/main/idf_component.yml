@@ -1,0 +1,5 @@
+# The archive made by `compote component pack`, unpacked under the name a
+# registry download gets (build-package/ is created by the CI job).
+dependencies:
+  camm2325/microlink:
+    path: ../../../build-package/camm2325__microlink

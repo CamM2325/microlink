@@ -2,10 +2,7 @@
 # on any ESP32 chip, or QEMU's emulated Ethernet (see sdkconfig.qemu.defaults).
 cmake_minimum_required(VERSION 3.16)
 
-set(EXTRA_COMPONENT_DIRS
-    "../../components"
-    "../../components/microlink/components"
-)
+set(EXTRA_COMPONENT_DIRS "../../components")
 
 # Optional, git-ignored credentials (copy ../basic_connect/sdkconfig.credentials.example).
 # Like all sdkconfig defaults, it only applies when sdkconfig is (re)created.

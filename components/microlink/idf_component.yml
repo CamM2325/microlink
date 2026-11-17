@@ -1,4 +1,28 @@
-## IDF Component Manager manifest for microlink
+## IDF Component Manager manifest for microlink (ESP Component Registry package)
+version: "2.3.0"
+description: >-
+  Tailscale-compatible WireGuard VPN client for ESP32: Noise control protocol,
+  DISCO/STUN NAT traversal, DERP relay, ACL enforcement, subnet routes, over
+  WiFi, Ethernet or 4G (SIMCom PPP / AT socket bridge).
+url: https://github.com/CamM2325/microlink
+repository: https://github.com/CamM2325/microlink.git
+repository_info:
+  path: components/microlink
+issues: https://github.com/CamM2325/microlink/issues
+documentation: https://github.com/CamM2325/microlink#readme
+# MicroLink is MIT; the bundled wireguard-lwip (components/wireguard_lwip) is
+# BSD-3-Clause, with its own LICENSE file.
+license: MIT AND BSD-3-Clause
+tags:
+  - tailscale
+  - wireguard
+  - vpn
+  - headscale
+  - networking
+files:
+  exclude:
+    - "**/build/**"
+    - "**/.*"
 dependencies:
   idf: ">=5.3"
   # ESP-IDF 6 dropped its built-in `json` component; ESP-IDF 5 keeps it.

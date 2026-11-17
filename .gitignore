@@ -40,3 +40,4 @@ Thumbs.db
 
 # tests/conformance output
 build-conformance/
+build-package/
