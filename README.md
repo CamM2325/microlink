@@ -294,8 +294,11 @@ and lets you change the auth key, WiFi list, cellular settings, control host and
 
 - **Login**: HTTP Basic auth, user `admin`. Set `ML_CONFIG_HTTPD_PASSWORD`, or leave it empty and a
   random password is generated on first boot, stored in NVS and printed once on the serial console.
-- **Reachable only on the tailnet address** unless `ML_CONFIG_HTTPD_ALLOW_LAN=y` (then the password
-  crosses the LAN unencrypted). Never on the cellular carrier address.
+- **Reachable only on the device's own tailnet (VPN) address** unless `ML_CONFIG_HTTPD_ALLOW_LAN=y`
+  (then also on the WiFi station / Ethernet interface's own address, and the password crosses the LAN
+  unencrypted). Never on the cellular (PPP) carrier address, even if the carrier hands out a 100.64/10
+  CGNAT address. Browse to the IP address itself (`http://100.x.y.z/`): requests whose `Host` header is
+  a host name are refused, which blocks DNS rebinding.
 - The **allowlist** is an access filter: peers not on it get no WireGuard tunnel to the device.
 
 ## Security
