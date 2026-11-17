@@ -47,6 +47,7 @@
 #include "lwip/sys.h"
 #include "lwip/timeouts.h"
 #include "lwip/tcpip.h"
+#include "arch/sys_arch.h" /* sys_thread_tcpip() */
 
 #include "wireguard.h"
 #include "crypto.h"
@@ -116,48 +117,63 @@ void wireguardif_disable_socket_bind(void) {
 	g_disable_socket_bind = true;
 }
 
-// netif_set_link_up() is core lwIP netif state and must only run on
-// tcpip_thread (confirmed on real hardware via CONFIG_LWIP_CHECK_THREAD_SAFETY,
-// which asserts immediately otherwise). Both call sites below run on whatever
-// task calls wireguardif_network_rx() (this project's ml_wg_mgr task, never
-// tcpip_thread - handshake messages are processed here directly, never via
-// the tcpip_input()-based inner-IP-packet path), so this always needs
-// dispatching, unlike wg_udp_output_cb's context-dependent case. Fire-and-forget
-// (tcpip_callback(), no wait): nothing here depends on netif_set_link_up()
-// having completed before this function returns, so there's no reason to pay
-// for a blocking round-trip on every handshake completion.
+// netif_set_link_up()/netif_set_link_down() are core lwIP netif state and
+// must only run on tcpip_thread (confirmed on real hardware via
+// CONFIG_LWIP_CHECK_THREAD_SAFETY, which asserts immediately otherwise).
+// The callers run on whatever task calls wireguardif_network_rx() or
+// wireguardif_periodic(): normally the ml_wg_mgr task, but with
+// CONFIG_ML_ZERO_COPY_WG the receive path runs on tcpip_thread itself.
+//  - On tcpip_thread (or holding the core lock): set the flag directly.
+//    Posting to our own mailbox with the blocking tcpip_callback() would
+//    deadlock as soon as the mailbox is full under RX load.
+//  - Elsewhere: tcpip_try_callback(), fire-and-forget and non-blocking.
+//    Nothing here depends on the flag having changed before returning, and
+//    a post dropped on a full mailbox is retried: link-up is re-checked on
+//    every data packet, link-down on every periodic tick.
 static void netif_set_link_up_in_tcpip(void *arg) {
 	netif_set_link_up((struct netif *)arg);
 }
-static void wireguardif_mark_link_up(struct netif *netif) {
-	// One call site is per-data-packet (wireguard_process_data_message()'s
-	// defensive "make sure link is reported as up"), not just per-handshake -
-	// skip the tcpip_callback() dispatch entirely once the flag is already
-	// set, so the common case (link already up) costs one flag read, not a
-	// callback queued on every packet. Reading netif->flags without the core
-	// lock is fine here: it's a single bit that only ever transitions
-	// unset->set for the life of a session, so a stale read costs at most one
-	// redundant (still correct) dispatch, never a wrong result.
-	if (netif->flags & NETIF_FLAG_LINK_UP) {
-		return;
-	}
-	tcpip_callback(netif_set_link_up_in_tcpip, netif);
-}
-
-// Same thread-safety requirement and same reasoning as wireguardif_mark_link_up()
-// above - both of this function's call sites (wireguardif_tmr() and
-// wireguardif_periodic(), the periodic per-peer keepalive/rekey/timeout sweep)
-// run once per tick, not once per packet, but still worth skipping the
-// dispatch once the flag is already clear (the common steady-state case,
-// either "link up" or "link already reported down").
 static void netif_set_link_down_in_tcpip(void *arg) {
 	netif_set_link_down((struct netif *)arg);
 }
+static void wireguardif_set_link(struct netif *netif, bool up) {
+	if (sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER)) {
+		if (up) {
+			netif_set_link_up(netif);
+		} else {
+			netif_set_link_down(netif);
+		}
+		return;
+	}
+	if (tcpip_try_callback(up ? netif_set_link_up_in_tcpip : netif_set_link_down_in_tcpip, netif) != ERR_OK) {
+		WG_DEBUG("[WG] link %s post dropped (tcpip mailbox full), will retry", up ? "up" : "down");
+	}
+}
+
+static void wireguardif_mark_link_up(struct netif *netif) {
+	// One call site is per-data-packet (wireguard_process_data_message()'s
+	// defensive "make sure link is reported as up"), not just per-handshake -
+	// skip the dispatch entirely once the flag is already set, so the common
+	// case (link already up) costs one flag read, not a callback queued on
+	// every packet. Reading netif->flags without the core lock is fine here:
+	// it's a single bit, so a stale read costs at most one redundant (still
+	// correct) dispatch, never a wrong result.
+	if (netif->flags & NETIF_FLAG_LINK_UP) {
+		return;
+	}
+	wireguardif_set_link(netif, true);
+}
+
+// Both call sites (wireguardif_tmr() and wireguardif_periodic(), the periodic
+// per-peer keepalive/rekey/timeout sweep) run once per tick, not once per
+// packet, but still worth skipping the dispatch once the flag is already
+// clear (the common steady-state case, either "link up" or "link already
+// reported down").
 static void wireguardif_mark_link_down(struct netif *netif) {
 	if (!(netif->flags & NETIF_FLAG_LINK_UP)) {
 		return;
 	}
-	tcpip_callback(netif_set_link_down_in_tcpip, netif);
+	wireguardif_set_link(netif, false);
 }
 
 
