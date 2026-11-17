@@ -179,6 +179,13 @@ static int at_send_cmd(const char *cmd, char *response, size_t resp_size, int ti
     return ret;
 }
 
+static bool at_cmd_ok_locked(const char *cmd, int timeout_ms)
+{
+    char resp[512];
+    int len = at_send_cmd_locked(cmd, resp, sizeof(resp), timeout_ms);
+    return (len > 0 && strstr(resp, "OK") != NULL);
+}
+
 static bool at_cmd_ok(const char *cmd, int timeout_ms)
 {
     char resp[512];
@@ -262,17 +269,94 @@ static esp_err_t uart_init(void)
  * Modem Setup (AT command phase)
  * ========================================================================== */
 
+/* "+++" escape (back to command mode if the modem was left in data mode).
+ * SIM7600/SIM7670 need 1 s of silence before and after it, so no other
+ * bytes may be sent meanwhile: caller holds s_uart_lock. */
+static void escape_data_mode_locked(void)
+{
+    vTaskDelay(pdMS_TO_TICKS(1100));
+    uart_write_bytes(UART_NUM, "+++", 3);
+    vTaskDelay(pdMS_TO_TICKS(1100));
+    uart_flush_input(UART_NUM);
+}
+
+/* Probe the other common baud rates, in case the modem was left at another
+ * speed with AT+IPR. On success the UART and s_cell.config.baud_rate match
+ * the modem. Caller holds s_uart_lock: the UART rate changes underneath any
+ * other command, so nothing else may run in between. */
+static bool probe_alt_bauds_locked(void)
+{
+#ifdef CONFIG_ML_BOARD_LILYGO_T_SIM7670G
+    /* SIM7670G: only probe 115200 — unreliable at higher rates */
+    int try_bauds[] = {115200};
+    int num_bauds = 1;
+#else
+    int try_bauds[] = {921600, 460800, 115200};
+    int num_bauds = 3;
+#endif
+    for (int b = 0; b < num_bauds; b++) {
+        if (try_bauds[b] == s_cell.config.baud_rate) continue;
+        ESP_LOGI(TAG, "Trying alternate baud rate %d...", try_bauds[b]);
+        uart_set_baudrate(UART_NUM, try_bauds[b]);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        /* Also try +++ at this baud in case modem is stuck in data mode */
+        escape_data_mode_locked();
+        if (at_cmd_ok_locked("AT", AT_SHORT_TIMEOUT_MS)) {
+            ESP_LOGI(TAG, "Modem responding at %d baud", try_bauds[b]);
+            /* AT+IPR persists in the modem, so a modem left at another
+             * speed (e.g. by an earlier fast-baud attempt) stays there
+             * forever. Bring it back to the configured rate. */
+            int want = s_cell.config.baud_rate;
+            char ipr[32];
+            snprintf(ipr, sizeof(ipr), "AT+IPR=%d", want);
+            if (at_cmd_ok_locked(ipr, AT_SHORT_TIMEOUT_MS)) {
+                /* The modem acknowledged: it should be at `want` now.
+                 * Give the UART time to settle and retry the check a
+                 * few times. */
+                vTaskDelay(pdMS_TO_TICKS(300));
+                uart_set_baudrate(UART_NUM, want);
+                bool restored = false;
+                for (int v = 0; v < 4 && !restored; v++) {
+                    vTaskDelay(pdMS_TO_TICKS(300));
+                    uart_flush_input(UART_NUM);
+                    restored = at_cmd_ok_locked("AT", AT_SHORT_TIMEOUT_MS);
+                }
+                if (restored) {
+                    ESP_LOGI(TAG, "Modem baud restored to %d", want);
+                    return true;
+                }
+                /* The switch did not take (or the reply was lost):
+                 * go back to the rate that worked a moment ago. */
+                ESP_LOGW(TAG, "No answer at %d after AT+IPR; trying %d again",
+                         want, try_bauds[b]);
+                uart_set_baudrate(UART_NUM, try_bauds[b]);
+                vTaskDelay(pdMS_TO_TICKS(300));
+                uart_flush_input(UART_NUM);
+                if (at_cmd_ok_locked("AT", AT_SHORT_TIMEOUT_MS)) {
+                    ESP_LOGW(TAG, "Modem stays at %d baud", try_bauds[b]);
+                    s_cell.config.baud_rate = try_bauds[b];
+                    return true;
+                }
+                continue;   /* lost at both rates: keep probing */
+            }
+            s_cell.config.baud_rate = try_bauds[b];
+            return true;
+        }
+    }
+    /* Restore original baud rate and keep trying */
+    uart_set_baudrate(UART_NUM, s_cell.config.baud_rate);
+    return false;
+}
+
 static esp_err_t modem_wait_ready(void)
 {
     ESP_LOGI(TAG, "Waiting for modem...");
 
     /* If modem is stuck in data mode (e.g. from a previous PPP session that
-     * didn't cleanly exit), send +++ escape sequence to return to command mode.
-     * SIM7600/SIM7670: requires 1s guard time before and after +++ */
-    vTaskDelay(pdMS_TO_TICKS(1100));
-    uart_write_bytes(UART_NUM, "+++", 3);
-    vTaskDelay(pdMS_TO_TICKS(1100));
-    uart_flush_input(UART_NUM);
+     * didn't cleanly exit), send +++ escape sequence to return to command mode. */
+    if (!ml_cellular_uart_lock()) return ESP_ERR_INVALID_STATE;
+    escape_data_mode_locked();
+    ml_cellular_uart_unlock();
 
     /* Try AT command with retries (modem may still be booting) */
     for (int i = 0; i < 10; i++) {
@@ -284,71 +368,13 @@ static esp_err_t modem_wait_ready(void)
         /* After 3 failed attempts, try common baud rates in case the modem
          * was previously set to a different speed with AT+IPR */
         if (i == 3) {
-#ifdef CONFIG_ML_BOARD_LILYGO_T_SIM7670G
-            /* SIM7670G: only probe 115200 — unreliable at higher rates */
-            int try_bauds[] = {115200};
-            int num_bauds = 1;
-#else
-            int try_bauds[] = {921600, 460800, 115200};
-            int num_bauds = 3;
-#endif
-            for (int b = 0; b < num_bauds; b++) {
-                if (try_bauds[b] == s_cell.config.baud_rate) continue;
-                ESP_LOGI(TAG, "Trying alternate baud rate %d...", try_bauds[b]);
-                uart_set_baudrate(UART_NUM, try_bauds[b]);
-                vTaskDelay(pdMS_TO_TICKS(100));
-                /* Also try +++ at this baud in case modem is stuck in data mode */
-                vTaskDelay(pdMS_TO_TICKS(1100));
-                uart_write_bytes(UART_NUM, "+++", 3);
-                vTaskDelay(pdMS_TO_TICKS(1100));
-                uart_flush_input(UART_NUM);
-                if (at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) {
-                    ESP_LOGI(TAG, "Modem responding at %d baud", try_bauds[b]);
-                    /* AT+IPR persists in the modem, so a modem left at another
-                     * speed (e.g. by an earlier fast-baud attempt) stays there
-                     * forever. Bring it back to the configured rate. */
-                    int want = s_cell.config.baud_rate;
-                    char ipr[32];
-                    snprintf(ipr, sizeof(ipr), "AT+IPR=%d", want);
-                    if (at_cmd_ok(ipr, AT_SHORT_TIMEOUT_MS)) {
-                        /* The modem acknowledged: it should be at `want` now.
-                         * Give the UART time to settle and retry the check a
-                         * few times. */
-                        vTaskDelay(pdMS_TO_TICKS(300));
-                        uart_set_baudrate(UART_NUM, want);
-                        bool restored = false;
-                        for (int v = 0; v < 4 && !restored; v++) {
-                            vTaskDelay(pdMS_TO_TICKS(300));
-                            uart_flush_input(UART_NUM);
-                            restored = at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS);
-                        }
-                        if (restored) {
-                            ESP_LOGI(TAG, "Modem baud restored to %d", want);
-                            s_cell.state = ML_CELL_STATE_AT_OK;
-                            return ESP_OK;
-                        }
-                        /* The switch did not take (or the reply was lost):
-                         * go back to the rate that worked a moment ago. */
-                        ESP_LOGW(TAG, "No answer at %d after AT+IPR; trying %d again",
-                                 want, try_bauds[b]);
-                        uart_set_baudrate(UART_NUM, try_bauds[b]);
-                        vTaskDelay(pdMS_TO_TICKS(300));
-                        uart_flush_input(UART_NUM);
-                        if (at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) {
-                            ESP_LOGW(TAG, "Modem stays at %d baud", try_bauds[b]);
-                            s_cell.config.baud_rate = try_bauds[b];
-                            s_cell.state = ML_CELL_STATE_AT_OK;
-                            return ESP_OK;
-                        }
-                        continue;   /* lost at both rates: keep probing */
-                    }
-                    s_cell.config.baud_rate = try_bauds[b];
-                    s_cell.state = ML_CELL_STATE_AT_OK;
-                    return ESP_OK;
-                }
+            if (!ml_cellular_uart_lock()) return ESP_ERR_INVALID_STATE;
+            bool found = probe_alt_bauds_locked();
+            ml_cellular_uart_unlock();
+            if (found) {
+                s_cell.state = ML_CELL_STATE_AT_OK;
+                return ESP_OK;
             }
-            /* Restore original baud rate and keep trying */
-            uart_set_baudrate(UART_NUM, s_cell.config.baud_rate);
         }
         ESP_LOGW(TAG, "AT retry %d/10...", i + 1);
         vTaskDelay(pdMS_TO_TICKS(2000));
@@ -945,6 +971,45 @@ static void clear_config_strs(void)
     s_cell.config.ppp_pass = NULL;
 }
 
+/* Switch modem and UART to fast_baud; on failure fall back to base_baud.
+ * Caller holds s_uart_lock. */
+static esp_err_t fast_baud_switch_locked(int fast_baud, int base_baud)
+{
+    char ipr_cmd[32];
+    snprintf(ipr_cmd, sizeof(ipr_cmd), "AT+IPR=%d", fast_baud);
+    if (at_cmd_ok_locked(ipr_cmd, AT_SHORT_TIMEOUT_MS)) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        /* Reconfigure ESP32 UART to match */
+        uart_set_baudrate(UART_NUM, fast_baud);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        /* Verify communication at new baud rate */
+        if (at_cmd_ok_locked("AT", AT_SHORT_TIMEOUT_MS)) {
+            s_cell.config.baud_rate = fast_baud;
+            ESP_LOGI(TAG, "UART baud rate upgraded: 115200 -> %d", fast_baud);
+        } else {
+            /* The modem is now at fast_baud (and AT+IPR persists), so the
+             * revert must be sent at fast_baud: replies may be garbled but
+             * the command usually gets through. Then return to base_baud. */
+            ESP_LOGW(TAG, "Fast baud %d failed, reverting to %d", fast_baud, base_baud);
+            char revert[32];
+            int rlen = snprintf(revert, sizeof(revert), "AT+IPR=%d\r", base_baud);
+            for (int r = 0; r < 3; r++) {
+                uart_write_bytes(UART_NUM, revert, rlen);
+                vTaskDelay(pdMS_TO_TICKS(150));
+            }
+            uart_set_baudrate(UART_NUM, base_baud);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            uart_flush_input(UART_NUM);
+            if (!at_cmd_ok_locked("AT", AT_SHORT_TIMEOUT_MS)) {
+                ESP_LOGE(TAG, "Modem not responding after baud revert; its baud "
+                              "rate is re-detected (and normalised) on the next init");
+                return ESP_ERR_TIMEOUT;
+            }
+        }
+    }
+    return ESP_OK;
+}
+
 /* Undo a failed ml_cellular_init() after the UART was installed. s_cell.info
  * is kept for diagnostics (it is reset by the next init). */
 static void init_failed_cleanup(void)
@@ -1026,38 +1091,12 @@ static esp_err_t modem_bringup(void)
 #endif
     const int base_baud = s_cell.config.baud_rate;
     if (fast_baud && fast_baud != base_baud) {
-        char ipr_cmd[32];
-        snprintf(ipr_cmd, sizeof(ipr_cmd), "AT+IPR=%d", fast_baud);
-        if (at_cmd_ok(ipr_cmd, AT_SHORT_TIMEOUT_MS)) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            /* Reconfigure ESP32 UART to match */
-            uart_set_baudrate(UART_NUM, fast_baud);
-            vTaskDelay(pdMS_TO_TICKS(100));
-            /* Verify communication at new baud rate */
-            if (at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) {
-                s_cell.config.baud_rate = fast_baud;
-                ESP_LOGI(TAG, "UART baud rate upgraded: 115200 -> %d", fast_baud);
-            } else {
-                /* The modem is now at fast_baud (and AT+IPR persists), so the
-                 * revert must be sent at fast_baud: replies may be garbled but
-                 * the command usually gets through. Then return to base_baud. */
-                ESP_LOGW(TAG, "Fast baud %d failed, reverting to %d", fast_baud, base_baud);
-                char revert[32];
-                int rlen = snprintf(revert, sizeof(revert), "AT+IPR=%d\r", base_baud);
-                for (int r = 0; r < 3; r++) {
-                    uart_write_bytes(UART_NUM, revert, rlen);
-                    vTaskDelay(pdMS_TO_TICKS(150));
-                }
-                uart_set_baudrate(UART_NUM, base_baud);
-                vTaskDelay(pdMS_TO_TICKS(200));
-                uart_flush_input(UART_NUM);
-                if (!at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) {
-                    ESP_LOGE(TAG, "Modem not responding after baud revert; its baud "
-                                  "rate is re-detected (and normalised) on the next init");
-                    return ESP_ERR_TIMEOUT;
-                }
-            }
-        }
+        /* The whole switch runs under the UART lock: a command from another
+         * task in the middle would go out at the wrong rate. */
+        if (!ml_cellular_uart_lock()) return ESP_ERR_INVALID_STATE;
+        err = fast_baud_switch_locked(fast_baud, base_baud);
+        ml_cellular_uart_unlock();
+        if (err != ESP_OK) return err;
     }
 
     /* Setup SIM card (check status, enter PIN if needed) */
@@ -1260,16 +1299,15 @@ esp_err_t ml_cellular_ppp_stop(void)
         s_cell.ppp_events = NULL;
     }
 
-    /* 5. Escape PPP data mode → AT command mode via Hayes +++ */
-    vTaskDelay(pdMS_TO_TICKS(1100)); /* Guard time before +++ */
-    uart_write_bytes(UART_NUM, "+++", 3);
-    vTaskDelay(pdMS_TO_TICKS(1100)); /* Guard time after +++ */
-
-    char resp[256];
-    at_send_cmd("AT", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
-
-    /* Hang up */
-    at_cmd_ok("ATH", AT_TIMEOUT_MS);
+    /* 5. Escape PPP data mode → AT command mode via Hayes +++ (under the
+     *    UART lock, so nothing is sent during the guard times), then hang up */
+    if (ml_cellular_uart_lock()) {
+        escape_data_mode_locked();
+        char resp[256];
+        at_send_cmd_locked("AT", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
+        at_cmd_ok_locked("ATH", AT_TIMEOUT_MS);
+        ml_cellular_uart_unlock();
+    }
 
     s_cell.info.data_connected = false;
     if (s_cell.info.registered) {
