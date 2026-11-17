@@ -514,6 +514,14 @@ int nacl_box_shared_get(uint8_t *shared_key,
     return 0;
 }
 
+void nacl_box_shared_cache_wipe(void) {
+    taskENTER_CRITICAL(&s_shared_cache_lock);
+    memset(s_shared_cache, 0, sizeof(s_shared_cache));
+    memset(s_shared_cache_owner_sk, 0, sizeof(s_shared_cache_owner_sk));
+    s_shared_cache_next = 0;
+    taskEXIT_CRITICAL(&s_shared_cache_lock);
+}
+
 int nacl_box_afternm(uint8_t *ciphertext,
                      const uint8_t *plaintext, size_t plaintext_len,
                      const uint8_t *nonce,

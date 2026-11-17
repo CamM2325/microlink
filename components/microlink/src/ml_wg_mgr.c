@@ -2431,6 +2431,10 @@ void ml_wg_mgr_task(void *arg) {
     for (int i = 0; i < ML_MAX_PEERS; i++) {
         __atomic_store_n(&ml->wg_session_up_ip[i], 0, __ATOMIC_RELEASE);
     }
+    /* wg_mgr is the only DISCO user: drop the cached shared keys and the
+     * cache's copy of our disco private key, which would otherwise outlive
+     * microlink_destroy() in static RAM. */
+    nacl_box_shared_cache_wipe();
 
     ESP_LOGI(TAG, "WG Manager task exiting");
     ml_task_exit(ml, ML_TASK_BIT_WG_MGR);
