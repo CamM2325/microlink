@@ -348,6 +348,20 @@ static bool probe_alt_bauds_locked(void)
     return false;
 }
 
+/* A modem left in a data call by an earlier session (for example the ESP32
+ * reset in the middle of PPP) answers AT after +++, but the call stays up and
+ * buffered PPP frames can still arrive on the UART, garbling the next replies.
+ * Hang the call up and drain the UART. ATH is harmless when no call is up. */
+static void hangup_stale_call(void)
+{
+    at_cmd_ok("ATH", AT_SHORT_TIMEOUT_MS);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    if (ml_cellular_uart_lock()) {
+        uart_flush_input(UART_NUM);
+        ml_cellular_uart_unlock();
+    }
+}
+
 static esp_err_t modem_wait_ready(void)
 {
     ESP_LOGI(TAG, "Waiting for modem...");
@@ -363,6 +377,7 @@ static esp_err_t modem_wait_ready(void)
         if (at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) {
             s_cell.state = ML_CELL_STATE_AT_OK;
             ESP_LOGI(TAG, "Modem responding at %d baud", s_cell.config.baud_rate);
+            hangup_stale_call();
             return ESP_OK;
         }
         /* After 3 failed attempts, try common baud rates in case the modem
@@ -373,6 +388,7 @@ static esp_err_t modem_wait_ready(void)
             ml_cellular_uart_unlock();
             if (found) {
                 s_cell.state = ML_CELL_STATE_AT_OK;
+                hangup_stale_call();
                 return ESP_OK;
             }
         }
@@ -523,8 +539,18 @@ static esp_err_t sim_setup(void)
 {
     char resp[512];
 
-    /* Check SIM status */
-    at_send_cmd("AT+CPIN?", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
+    /* Check SIM status. Ask again while the reply has no +CPIN: line: right
+     * after a modem boot the SIM can still be busy, and stray bytes from an
+     * earlier data call can take the place of the answer. */
+    for (int i = 0; i < 5; i++) {
+        at_send_cmd("AT+CPIN?", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
+        if (strstr(resp, "+CPIN:")) break;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (ml_cellular_uart_lock()) {
+            uart_flush_input(UART_NUM);
+            ml_cellular_uart_unlock();
+        }
+    }
 
     if (cpin_is(resp, "READY")) {
         s_cell.info.sim_ready = true;
