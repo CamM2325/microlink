@@ -117,8 +117,8 @@ echo "hi" | nc -u -w1 <device-vpn-ip> 9000     # basic_connect replies "ECHO: hi
 
 ## Using MicroLink in your project
 
-Add `components/microlink` (and `components/microlink/components/wireguard_lwip`) to your
-project's component directories, then:
+Add `components/microlink` and `components/microlink/components` (which holds `wireguard_lwip`)
+to your project's `EXTRA_COMPONENT_DIRS`, as the examples do, then:
 
 ```c
 #include "microlink.h"
@@ -212,10 +212,11 @@ override the Kconfig defaults at runtime.
 | `ML_ZERO_COPY_WG` | n | High-throughput receive path on a raw lwIP PCB (contributed by dj-oyu). |
 | `ML_UDP_RX_TASK_PRIO` | 7 | UDP callback task priority. |
 | `ML_STOP_TIMEOUT_MS` | 30000 | How long `microlink_stop()` waits. |
+| MicroLink log verbosity | Same as ESP-IDF | Compile-time level for MicroLink's own logs (`ML_LOG_LEVEL_WARN` / `_INFO` / `_DEBUG` / `_VERBOSE`). Warning saves about 17–23 KB of flash. Debug/Verbose messages also need `esp_log_level_set("<tag>", ...)` at run time. |
 | **Credentials** | | `ML_WIFI_SSID`, `ML_WIFI_PASSWORD`, `ML_TAILSCALE_AUTH_KEY`, `ML_DEVICE_NAME` (compiled into the image). |
 | **Control Plane** | | `ML_CTRL_HOST`, `ML_CTRL_TLS`, `ML_CTRL_TLS_VERIFY_CERT` (y), `ML_CTRL_NOISE_PUBKEY_HEX`. |
 | **Cellular Modem** | | `ML_ENABLE_CELLULAR`, board preset, pins, `ML_CELLULAR_APN`, `ML_CELLULAR_SIM_PIN`, `ML_CELLULAR_PPP_USER/PASS`, data mode, `ML_CELLULAR_FAST_BAUD` (0). |
-| **Network Switching** | | `ML_ENABLE_NET_SWITCH` (timing is set in `ml_net_switch_config_t`). |
+| **Network Switching** | | `ML_ENABLE_NET_SWITCH`, `ML_NET_SWITCH_WIFI_TIMEOUT_MS` (30000), `ML_NET_SWITCH_HEALTH_INTERVAL_MS` (30000), `ML_NET_SWITCH_FAILBACK_MS` (120000, 0 = no failback): defaults for the `ml_net_switch_config_t` timing fields left at 0. |
 | **HTTP Config Server** | | `ML_ENABLE_CONFIG_HTTPD` (n), `ML_CONFIG_HTTPD_PASSWORD`, `ML_CONFIG_HTTPD_ALLOW_LAN` (n), `ML_CONFIG_MAX_ALLOWED_PEERS`. |
 
 APN, SIM PIN, PPP credentials and the control host are validated; invalid values are rejected at
@@ -309,14 +310,40 @@ and lets you change the auth key, WiFi list, cellular settings, control host and
 
 ## Memory
 
-On ESP32-S3 with PSRAM, MicroLink's own code is roughly 115–140 KB of flash (measured Nov 2026,
-`idf.py size-components`, `basic_connect` / `cellular_connect`). The four internal tasks use 42 KB of
+On ESP32-S3 with PSRAM, MicroLink's own code and strings take roughly 105–130 KB of flash
+(`basic_connect` / `cellular_connect`, ESP-IDF 5.3, `-Os`, measured Nov 2026 from the linker map),
+or 85–105 KB with `CONFIG_ML_LOG_LEVEL_WARN`. The four internal tasks use 42 KB of
 stack (8 + 14 + 12 + 8 KB), plus 4 KB per UDP socket. Map-response buffers are allocated while
 fetching and use PSRAM when available.
 
 Without PSRAM, reduce `ML_H2_BUFFER_SIZE_KB`/`ML_JSON_BUFFER_SIZE_KB` and `ML_MAX_PEERS`. One
 measurement (ESP32-C3, PR #43) saw about 3 KB of map data per peer, so 64 KB buffers fit roughly
 20 peers. Exact limits depend on your tailnet.
+
+### Smaller images
+
+The examples build with `-Os`; the WireGuard/DISCO crypto is still compiled with `-O2`.
+`examples/sdkconfig.size.defaults` is an optional overlay that trims ESP-IDF further:
+
+```bash
+cd examples/basic_connect
+rm -f sdkconfig   # defaults only apply when sdkconfig is created
+idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;../sdkconfig.size.defaults" build
+```
+
+| Image size in bytes (esp32s3) | `basic_connect` | `cellular_connect` |
+|---|---:|---:|
+| ESP-IDF 5.3, example defaults | 995,996 | 782,904 |
+| ESP-IDF 5.3, + `sdkconfig.size.defaults` | 769,012 | 598,840 |
+| ESP-IDF 5.3, + `CONFIG_ML_LOG_LEVEL_WARN=y` as well | 753,320 | 577,920 |
+| ESP-IDF 6.1.1, example defaults | 991,915 | 721,771 |
+| ESP-IDF 6.1.1, + `sdkconfig.size.defaults` | 855,635 | 639,463 |
+
+The overlay uses the common CA bundle instead of the full one (Let's Encrypt, used by Tailscale, is
+included; a headscale or DERP server with a certificate from a less common CA needs the full
+bundle), newlib-nano printf (no 64-bit or float formats in your own logs), a client-only mbedTLS
+with fewer curves and ciphers, WiFi without Enterprise/SoftAP/OWE, and no `esp_err_to_name()`
+strings or log colours. The file lists each option; check them against your deployment.
 
 ## Troubleshooting
 

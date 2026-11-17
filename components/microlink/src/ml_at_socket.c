@@ -531,7 +531,7 @@ static int at_query_pending(int link_num)
     if (sscanf(p, "+CIPRXGET: 4,%d,%d", &ln, &pending) >= 2) {
         int64_t elapsed_ms = (esp_timer_get_time() - t0) / 1000;
         if (pending > 0) {
-            ESP_LOGD(TAG, "QUERY: link=%d pending=%d %lldms", link_num, pending, elapsed_ms);
+            ESP_LOGD(TAG, "QUERY: link=%d pending=%d %ldms", link_num, pending, (long)elapsed_ms);
         }
         return pending;
     }
@@ -683,8 +683,8 @@ static int at_read_data_chunk(int link_num, int max_bytes, int *out_remaining)
     if (out_remaining) *out_remaining = h.rest_len;
 
     int64_t chunk_elapsed_ms = (esp_timer_get_time() - start) / 1000;
-    ESP_LOGD(TAG, "CHUNK: link=%d req=%d got=%d remaining=%d %lldms",
-             link_num, req_len, total_written, h.rest_len, chunk_elapsed_ms);
+    ESP_LOGD(TAG, "CHUNK: link=%d req=%d got=%d remaining=%d %ldms",
+             link_num, req_len, total_written, h.rest_len, (long)chunk_elapsed_ms);
 
     return total_written;
 

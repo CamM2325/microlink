@@ -531,7 +531,7 @@ static esp_err_t network_register(void)
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 
-    ESP_LOGE(TAG, "Network registration timeout (%llds)", (long long)reg_timeout_s);
+    ESP_LOGE(TAG, "Network registration timeout (%lds)", (long)reg_timeout_s);
     if (last_rssi == 99 || last_rssi == 0) {
         ESP_LOGE(TAG, "  No signal (CSQ=%d): check the LTE antenna (MAIN port) and that the modem has a >=2 A supply", last_rssi);
     } else if (last_creg == 3 || last_cereg == 3) {

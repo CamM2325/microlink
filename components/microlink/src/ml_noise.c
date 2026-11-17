@@ -330,7 +330,7 @@ esp_err_t ml_noise_decrypt(const uint8_t *key, uint64_t nonce,
                             uint8_t *plaintext) {
     if (noise_aead_decrypt(key, nonce, ad, ad_len,
                             ciphertext, ct_len, plaintext) != 0) {
-        ESP_LOGE(TAG, "Noise decrypt failed (nonce=%llu)", (unsigned long long)nonce);
+        ESP_LOGE(TAG, "Noise decrypt failed (nonce=%lu)", (unsigned long)nonce);
         return ESP_ERR_INVALID_MAC;
     }
     return ESP_OK;

@@ -57,11 +57,13 @@ typedef struct {
     const char *tailscale_auth_key;
     const char *device_name;
 
-    /* Timing (0 = use defaults) */
+    /* Timing (0 = use the default; the _ms defaults come from Kconfig
+     * "Network Switching", CONFIG_ML_NET_SWITCH_*) */
     uint32_t wifi_timeout_ms;           /* WiFi connect timeout (default: 30000) */
     uint32_t health_check_interval_ms;  /* Health check period (default: 30000) */
     uint32_t health_fail_count;         /* Failures before switch (default: 3) */
-    uint32_t failback_check_ms;         /* WiFi recovery check (default: 120000, 0=disable) */
+    uint32_t failback_check_ms;         /* WiFi recovery check (default: 120000; set
+                                           CONFIG_ML_NET_SWITCH_FAILBACK_MS=0 to disable) */
 
     /* Callbacks (all optional) */
     void (*on_connected)(ml_net_type_t type, void *user_data);

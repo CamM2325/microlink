@@ -38,6 +38,18 @@ static const char *TAG = "ml_net_sw";
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
 #define NET_SW_STACK_SIZE   6144
+
+/* Defaults for the ml_net_switch_config_t timing fields left at 0
+ * (Kconfig "Network Switching"; the fallbacks are the Kconfig defaults). */
+#ifndef CONFIG_ML_NET_SWITCH_WIFI_TIMEOUT_MS
+#define CONFIG_ML_NET_SWITCH_WIFI_TIMEOUT_MS    30000
+#endif
+#ifndef CONFIG_ML_NET_SWITCH_HEALTH_INTERVAL_MS
+#define CONFIG_ML_NET_SWITCH_HEALTH_INTERVAL_MS 30000
+#endif
+#ifndef CONFIG_ML_NET_SWITCH_FAILBACK_MS
+#define CONFIG_ML_NET_SWITCH_FAILBACK_MS        120000
+#endif
 #define WIFI_DISCONNECT_DEBOUNCE_MS  5000  /* Wait 5s before declaring WiFi dead */
 
 /* Backoff between full attempts after WiFi and cellular both failed */
@@ -746,10 +758,13 @@ esp_err_t ml_net_switch_init(const ml_net_switch_config_t *config)
     if (config->device_name) strncpy(s_ctx.device_name, config->device_name, sizeof(s_ctx.device_name) - 1);
 
     /* Timing defaults */
-    s_ctx.wifi_timeout_ms = config->wifi_timeout_ms ? config->wifi_timeout_ms : 30000;
-    s_ctx.health_check_interval_ms = config->health_check_interval_ms ? config->health_check_interval_ms : 30000;
+    s_ctx.wifi_timeout_ms = config->wifi_timeout_ms ? config->wifi_timeout_ms
+                                                    : CONFIG_ML_NET_SWITCH_WIFI_TIMEOUT_MS;
+    s_ctx.health_check_interval_ms = config->health_check_interval_ms ? config->health_check_interval_ms
+                                                                      : CONFIG_ML_NET_SWITCH_HEALTH_INTERVAL_MS;
     s_ctx.health_fail_count = config->health_fail_count ? config->health_fail_count : 3;
-    s_ctx.failback_check_ms = config->failback_check_ms ? config->failback_check_ms : 120000;
+    s_ctx.failback_check_ms = config->failback_check_ms ? config->failback_check_ms
+                                                        : CONFIG_ML_NET_SWITCH_FAILBACK_MS;
 
     /* Callbacks */
     s_ctx.on_connected = config->on_connected;

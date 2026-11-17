@@ -70,13 +70,39 @@ static void bytes_to_hex(const uint8_t *bytes, size_t len, char *hex) {
     hex[len * 2] = '\0';
 }
 
+/* Decimal string for a 64-bit value: newlib-nano printf (CONFIG_NEWLIB_NANO_FORMAT)
+ * has no %lld, and tailcfg NodeIDs do not fit in 32 bits. buf: >= 21 bytes. */
+static const char *i64_to_str(char *buf, int64_t v) {
+    char tmp[20];
+    int n = 0;
+    uint64_t u = v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+    do {
+        tmp[n++] = (char)('0' + (int)(u % 10));
+        u /= 10;
+    } while (u);
+    char *o = buf;
+    if (v < 0) *o++ = '-';
+    while (n) *o++ = tmp[--n];
+    *o = '\0';
+    return buf;
+}
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Runs for every node and disco key in a netmap, so no sscanf per byte. */
 static int hex_to_bytes(const char *hex, uint8_t *bytes, size_t max_len) {
     size_t hex_len = strlen(hex);
     if (hex_len % 2 != 0 || hex_len / 2 > max_len) return -1;
     for (size_t i = 0; i < hex_len / 2; i++) {
-        unsigned int val;
-        if (sscanf(hex + i * 2, "%2x", &val) != 1) return -1;
-        bytes[i] = (uint8_t)val;
+        int hi = hex_nibble(hex[i * 2]);
+        int lo = hex_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        bytes[i] = (uint8_t)((hi << 4) | lo);
     }
     return hex_len / 2;
 }
@@ -235,7 +261,7 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
                           NULL, 0,
                           ciphertext, ct_len,
                           plaintext) != ESP_OK) {
-        ESP_LOGE(TAG, "Noise decrypt failed (nonce=%llu)", (unsigned long long)noise->rx_nonce);
+        ESP_LOGE(TAG, "Noise decrypt failed (nonce=%lu)", (unsigned long)noise->rx_nonce);
         free(ciphertext);
         return -1;
     }
@@ -269,7 +295,7 @@ static int do_tcp_connect(microlink_t *ml) {
     }
 
     int64_t t_dns = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] DNS resolve: %lld ms", (t_dns - t_start) / 1000);
+    ESP_LOGI(TAG, "[TIMING] DNS resolve: %ld ms", (long)((t_dns - t_start) / 1000));
 
     int sock = ml_socket(res->ai_family, SOCK_STREAM, IPPROTO_TCP);
     if (sock < 0) {
@@ -304,8 +330,8 @@ static int do_tcp_connect(microlink_t *ml) {
     ml_freeaddrinfo(res);
 
     int64_t t_tcp = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] TCP connect: %lld ms (total: %lld ms)",
-             (t_tcp - t_dns) / 1000, (t_tcp - t_start) / 1000);
+    ESP_LOGI(TAG, "[TIMING] TCP connect: %ld ms (total: %ld ms)",
+             (long)((t_tcp - t_dns) / 1000), (long)((t_tcp - t_start) / 1000));
 
     ml->coord_sock = sock;
 
@@ -316,7 +342,7 @@ static int do_tcp_connect(microlink_t *ml) {
         return -1;
     }
     int64_t t_tls = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] Control TLS handshake: %lld ms", (t_tls - t_tcp) / 1000);
+    ESP_LOGI(TAG, "[TIMING] Control TLS handshake: %ld ms", (long)((t_tls - t_tcp) / 1000));
 #endif
 
     return 0;
@@ -510,7 +536,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     }
 
     int64_t t_noise_done = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] Noise handshake: %lld ms", (t_noise_done - t_noise_start) / 1000);
+    ESP_LOGI(TAG, "[TIMING] Noise handshake: %ld ms", (long)((t_noise_done - t_noise_start) / 1000));
     ESP_LOGI(TAG, "Noise handshake complete, transport keys derived");
 
     /* Save extra data after msg2 (proactive server transport frames)
@@ -753,7 +779,7 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
     }
 
     int64_t t_h2_done = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] H2 preface: %lld ms", (t_h2_done - t_h2_start) / 1000);
+    ESP_LOGI(TAG, "[TIMING] H2 preface: %ld ms", (long)((t_h2_done - t_h2_start) / 1000));
 
     return 0;
 }
@@ -870,8 +896,8 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     free(h2_buf);
 
     int64_t t_reg_sent = esp_timer_get_time();
-    ESP_LOGI(TAG, "RegisterRequest sent (%d H2 bytes) [TIMING] send: %lld ms",
-             h2_pos, (t_reg_sent - t_reg_start) / 1000);
+    ESP_LOGI(TAG, "RegisterRequest sent (%d H2 bytes) [TIMING] send: %ld ms",
+             h2_pos, (long)((t_reg_sent - t_reg_start) / 1000));
 
     /* Read RegisterResponse - accumulate all Noise frames into H2 buffer first,
      * then parse H2 frames (same pattern as MapResponse). */
@@ -1099,7 +1125,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON_Delete(resp_json);
 
     int64_t t_reg_done = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] Register total: %lld ms", (t_reg_done - t_reg_start) / 1000);
+    ESP_LOGI(TAG, "[TIMING] Register total: %ld ms", (long)((t_reg_done - t_reg_start) / 1000));
 
     return 0;
 }
@@ -1297,7 +1323,8 @@ check_removed:
             update->action = ML_PEER_REMOVE;
             if (is_id) {
                 update->node_id = (int64_t)key_item->valuedouble;
-                ESP_LOGI(TAG, "  Remove peer: NodeID %lld", (long long)update->node_id);
+                char id_str[21];
+                ESP_LOGI(TAG, "  Remove peer: NodeID %s", i64_to_str(id_str, update->node_id));
             } else {
                 const char *hex = key_item->valuestring;
                 if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
@@ -1393,8 +1420,9 @@ check_removed:
                         update->endpoint_count = ep_count;
                     }
 
-                    ESP_LOGD(TAG, "  Patch peer: NodeID %lld eps=%d key=%d disco=%d",
-                             (long long)update->node_id, update->endpoint_count,
+                    char id_str[21];
+                    ESP_LOGD(TAG, "  Patch peer: NodeID %s eps=%d key=%d disco=%d",
+                             i64_to_str(id_str, update->node_id), update->endpoint_count,
                              update->key_valid, update->disco_valid);
 
                     if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -1558,8 +1586,9 @@ static void parse_self_node_from_map(microlink_t *ml, cJSON *map_json) {
             }
             days += dy - 1;
             ml->key_expiry_epoch = days * 86400 + hr * 3600 + mn * 60 + sc;
-            ESP_LOGI(TAG, "Key expiry: %s (epoch: %lld)", key_expiry->valuestring,
-                     (long long)ml->key_expiry_epoch);
+            char epoch_str[21];
+            ESP_LOGI(TAG, "Key expiry: %s (epoch: %s)", key_expiry->valuestring,
+                     i64_to_str(epoch_str, ml->key_expiry_epoch));
         }
     }
 
@@ -1740,7 +1769,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     free(h2_buf);
 
     int64_t t_map_sent = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] MapRequest send: %lld ms", (t_map_sent - t_map_start) / 1000);
+    ESP_LOGI(TAG, "[TIMING] MapRequest send: %ld ms", (long)((t_map_sent - t_map_start) / 1000));
 
     /* Read MapResponse - accumulate ALL decrypted Noise frames first, then parse H2.
      * This is critical because a single H2 frame can span multiple Noise frames
@@ -1965,7 +1994,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
                 else if (cJSON_IsString(field))
                     ESP_LOGI(TAG, "  - %s (string): %.40s", field->string, field->valuestring);
                 else if (cJSON_IsNumber(field))
-                    ESP_LOGI(TAG, "  - %s (number): %g", field->string, field->valuedouble);
+                    ESP_LOGI(TAG, "  - %s (number): %d", field->string, field->valueint);
                 else if (cJSON_IsBool(field))
                     ESP_LOGI(TAG, "  - %s (bool): %s", field->string, cJSON_IsTrue(field) ? "true" : "false");
                 else
@@ -1987,9 +2016,9 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     free(resp_buf);
 
     int64_t t_map_done = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] MapResponse recv+parse: %lld ms (total map: %lld ms, %dKB)",
-             (t_map_done - t_map_sent) / 1000,
-             (t_map_done - t_map_start) / 1000,
+    ESP_LOGI(TAG, "[TIMING] MapResponse recv+parse: %ld ms (total map: %ld ms, %dKB)",
+             (long)((t_map_done - t_map_sent) / 1000),
+             (long)((t_map_done - t_map_start) / 1000),
              (int)(h2_total / 1024));
 
     return 0;
@@ -2300,8 +2329,8 @@ static int do_read_initial_netmap(microlink_t *ml, ml_noise_state_t *noise) {
     free(resp_buf);
 
     int64_t t_map_done = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] Initial netmap recv+parse: %lld ms (%dKB)",
-             (t_map_done - t_map_start) / 1000, (int)(json_total / 1024));
+    ESP_LOGI(TAG, "[TIMING] Initial netmap recv+parse: %ld ms (%dKB)",
+             (long)((t_map_done - t_map_start) / 1000), (int)(json_total / 1024));
 
     return 0;
 }
@@ -2405,7 +2434,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     }
     free(h2_buf);
 
-    ESP_LOGI(TAG, "Endpoint update sent on H2 stream %lu", (unsigned long)sid);
+    ESP_LOGD(TAG, "Endpoint update sent on H2 stream %lu", (unsigned long)sid);
     /* Response body is discarded — server may send empty response or
      * we'll consume it in the next poll_map_update() iteration.
      * Only the HTTP status code matters (200 = success). */
@@ -2967,7 +2996,7 @@ void ml_coord_task(void *arg) {
                                 ml->stun_public_port = port6;
                             }
                             ml->stun_retry_count = 0;  /* Got a result, stop retrying */
-                            ESP_LOGI(TAG, "STUN IPv6 result obtained, port %u", port6);
+                            ESP_LOGD(TAG, "STUN IPv6 result obtained, port %u", port6);
                             /* Trigger NAT type check if not done yet */
                             if (!ml->stun_nat_checked && ml->stun_fallback_ip) {
                                 ml_stun_send_probe_to(ml, ml->stun_fallback_ip,

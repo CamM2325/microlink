@@ -46,3 +46,25 @@ set_source_files_properties(${WG_SRC}/crypto/refc/chacha20.c
   PROPERTIES COMPILE_OPTIONS -Wno-sign-compare)
 add_test(NAME noise_aead COMMAND test_noise_aead)
 add_test(NAME at_validate COMMAND test_at_validate)
+
+# Crypto known-answer tests (RFC 7748 / 8439 / 7693 + NaCl box). The firmware
+# compiles these sources with -O2 and the rest with -Os, so build the test at
+# both levels: optimiser-sensitive UB in the vendored crypto fails here first.
+set(CRYPTO_SRC
+  ${WG_SRC}/crypto/refc/x25519.c
+  ${WG_SRC}/crypto/refc/chacha20.c
+  ${WG_SRC}/crypto/refc/chacha20poly1305.c
+  ${WG_SRC}/crypto/refc/poly1305-donna.c
+  ${WG_SRC}/crypto/refc/blake2s.c
+  ${WG_SRC}/crypto.c
+  ${ML_SRC}/src/nacl_box.c)
+# Same GCC false positive the component CMakeLists silences
+set_source_files_properties(${WG_SRC}/crypto/refc/x25519.c
+  PROPERTIES COMPILE_OPTIONS -Wno-stringop-overread)
+foreach(opt O2 Os)
+  add_executable(test_crypto_kat_${opt} test_crypto_kat.c ${CRYPTO_SRC})
+  target_compile_options(test_crypto_kat_${opt} PRIVATE -${opt})
+  target_include_directories(test_crypto_kat_${opt} PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/include ${ML_SRC}/src ${WG_SRC} ${WG_SRC}/crypto/refc)
+  add_test(NAME crypto_kat_${opt} COMMAND test_crypto_kat_${opt})
+endforeach()

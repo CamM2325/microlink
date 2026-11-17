@@ -1,0 +1,73 @@
+# MicroLink size profile: an overlay for any example's sdkconfig.defaults.
+#
+#   cd examples/basic_connect
+#   idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;../sdkconfig.size.defaults" build
+#
+# (sdkconfig.credentials, if present, is still added by the example's
+# CMakeLists.) sdkconfig defaults only apply when sdkconfig is created, so
+# delete the example's sdkconfig when switching profiles.
+#
+# Measured on esp32s3 (image size, example defaults -> this profile):
+#   ESP-IDF 5.3    basic_connect     995,996 -> 769,012 bytes  (-222 KB)
+#                  cellular_connect  782,904 -> 598,840 bytes  (-180 KB)
+#   ESP-IDF 6.1.1  basic_connect     991,915 -> 855,635 bytes  (-133 KB)
+#                  cellular_connect  721,771 -> 639,463 bytes  (-80 KB)
+#
+# Trade-offs; check them against your deployment before shipping:
+# - CA bundle: common CAs only. Let's Encrypt (Tailscale control plane and
+#   DERP) is included; a headscale/DERP server whose certificate chains to a
+#   less common CA needs the full bundle back.
+# - newlib-nano printf/scanf (ESP-IDF 5.x; ESP-IDF 6 uses picolibc): no 64-bit
+#   or float conversions. MicroLink's logs avoid them; check your own code.
+# - mbedTLS: TLS client only, no renegotiation, fewer curves and ciphers.
+#   Tailscale needs ECDHE (P-256/P-384/X25519) with AES-GCM, which stay.
+# - mbedTLS ChaCha20-Poly1305 is off: MicroLink's Noise channel uses the
+#   wireguard_lwip implementation. TLS then offers AES-GCM suites only.
+# - WiFi: no WPA2/WPA3-Enterprise, no SoftAP, no OWE.
+# - esp_err_to_name() returns numbers only; logs have no colours.
+#
+# MicroLink's own INFO logs can go too (another 17-23 KB, but the log then
+# only shows warnings and errors):
+# CONFIG_ML_LOG_LEVEL_WARN=y
+
+# Certificates
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+
+# C library formatting (newlib only; ESP-IDF 6 defaults to picolibc)
+CONFIG_NEWLIB_NANO_FORMAT=y
+
+# mbedTLS: client only, trimmed features
+CONFIG_MBEDTLS_TLS_CLIENT_ONLY=y
+CONFIG_MBEDTLS_SSL_RENEGOTIATION=n
+CONFIG_MBEDTLS_ERROR_STRINGS=n
+CONFIG_MBEDTLS_PEM_WRITE_C=n
+CONFIG_MBEDTLS_X509_CRL_PARSE_C=n
+CONFIG_MBEDTLS_X509_CSR_PARSE_C=n
+CONFIG_MBEDTLS_PKCS7_C=n
+CONFIG_MBEDTLS_CCM_C=n
+CONFIG_MBEDTLS_CMAC_C=n
+CONFIG_MBEDTLS_CHACHA20_C=n
+CONFIG_MBEDTLS_POLY1305_C=n
+CONFIG_MBEDTLS_CHACHAPOLY_C=n
+# Static ECDH key exchanges (ECDHE stays)
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA=n
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECDH_RSA=n
+# Curves: keep P-256, P-384 and Curve25519
+CONFIG_MBEDTLS_ECP_DP_SECP192R1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_SECP224R1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_SECP521R1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_SECP192K1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_SECP224K1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_SECP256K1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_BP256R1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_BP384R1_ENABLED=n
+CONFIG_MBEDTLS_ECP_DP_BP512R1_ENABLED=n
+
+# WiFi station without Enterprise, SoftAP or OWE
+CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
+CONFIG_ESP_WIFI_ENABLE_WPA3_OWE_STA=n
+
+# Strings
+CONFIG_ESP_ERR_TO_NAME_LOOKUP=n
+CONFIG_LOG_COLORS=n

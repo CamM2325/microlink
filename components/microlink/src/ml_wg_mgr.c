@@ -1407,8 +1407,8 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
             continue;
         }
 
-        ESP_LOGD(TAG, "DISCO PONG from %s: RTT=%llu ms (via %s)",
-                 p->hostname, (unsigned long long)rtt_ms,
+        ESP_LOGD(TAG, "DISCO PONG from %s: RTT=%lu ms (via %s)",
+                 p->hostname, (unsigned long)rtt_ms,
                  pkt->via_derp ? "DERP" : "direct");
 
         p->last_pong_recv_ms = now;
@@ -1451,7 +1451,7 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                                  (int)pkt->src_port, p->hostname);
                     }
                 } else {
-                    ESP_LOGI(TAG, "WG endpoint stored (no session): %d.%d.%d.%d:%d for %s",
+                    ESP_LOGD(TAG, "WG endpoint stored (no session): %d.%d.%d.%d:%d for %s",
                              (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
                              (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
                              (int)pkt->src_port, p->hostname);
@@ -1782,7 +1782,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
                 plaintext[pt_len++] = local_port & 0xFF;
                 ep_count++;
 
-                ESP_LOGI(TAG, "CMM endpoint: LAN %lu.%lu.%lu.%lu:%u",
+                ESP_LOGD(TAG, "CMM endpoint: LAN %lu.%lu.%lu.%lu:%u",
                          (unsigned long)((local_ip >> 24) & 0xFF),
                          (unsigned long)((local_ip >> 16) & 0xFF),
                          (unsigned long)((local_ip >> 8) & 0xFF),
@@ -1807,7 +1807,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
         plaintext[pt_len++] = pub_port & 0xFF;
         ep_count++;
 
-        ESP_LOGI(TAG, "CMM endpoint: STUN %lu.%lu.%lu.%lu:%u",
+        ESP_LOGD(TAG, "CMM endpoint: STUN %lu.%lu.%lu.%lu:%u",
                  (unsigned long)((pub_ip >> 24) & 0xFF),
                  (unsigned long)((pub_ip >> 16) & 0xFF),
                  (unsigned long)((pub_ip >> 8) & 0xFF),
@@ -1840,7 +1840,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     /* Send via DERP */
     esp_err_t err = ml_derp_queue_send(ml, p->public_key, pkt, pos);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "CallMeMaybe sent to %s (%d endpoints)", p->hostname, ep_count);
+        ESP_LOGD(TAG, "CallMeMaybe sent to %s (%d endpoints)", p->hostname, ep_count);
     } else {
         ESP_LOGW(TAG, "CallMeMaybe send failed for %s: %d", p->hostname, err);
     }
@@ -1926,13 +1926,21 @@ bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip) {
         if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
             struct wireguard_peer *wp = &dev->peers[p->wg_peer_index];
             bool key_match = (memcmp(wp->public_key, p->public_key, 32) == 0);
-            ESP_LOGI(TAG, "WG peer UP: %s wg_idx=%d ep=%s:%u key=%02x%02x%02x%02x %s",
-                     p->hostname, p->wg_peer_index,
-                     ip_addr_isany(&cur_ip) ? "DERP" : ipaddr_ntoa(&cur_ip),
-                     cur_port,
-                     wp->public_key[0], wp->public_key[1],
-                     wp->public_key[2], wp->public_key[3],
-                     key_match ? "KEY_OK" : "KEY_MISMATCH!");
+            if (key_match) {
+                ESP_LOGD(TAG, "WG peer UP: %s wg_idx=%d ep=%s:%u key=%02x%02x%02x%02x",
+                         p->hostname, p->wg_peer_index,
+                         ip_addr_isany(&cur_ip) ? "DERP" : ipaddr_ntoa(&cur_ip),
+                         cur_port,
+                         wp->public_key[0], wp->public_key[1],
+                         wp->public_key[2], wp->public_key[3]);
+            } else {
+                ESP_LOGW(TAG, "WG peer UP but KEY_MISMATCH: %s wg_idx=%d ep=%s:%u key=%02x%02x%02x%02x",
+                         p->hostname, p->wg_peer_index,
+                         ip_addr_isany(&cur_ip) ? "DERP" : ipaddr_ntoa(&cur_ip),
+                         cur_port,
+                         wp->public_key[0], wp->public_key[1],
+                         wp->public_key[2], wp->public_key[3]);
+            }
         }
     }
     return up;
@@ -2184,7 +2192,7 @@ void ml_wg_mgr_task(void *arg) {
             wireguardif_periodic((struct netif *)ml->wg_netif);
             uint64_t dt = ml_get_time_ms() - t0;
             last_wg_periodic_ms = now;
-            ESP_LOGD(TAG, "wireguardif_periodic: %llu ms", (unsigned long long)dt);
+            ESP_LOGD(TAG, "wireguardif_periodic: %lu ms", (unsigned long)dt);
         }
 
         /* Periodic DISCO probes (every 1s check) */
@@ -2194,7 +2202,7 @@ void ml_wg_mgr_task(void *arg) {
             disco_periodic_probes(ml);
             uint64_t dt = ml_get_time_ms() - t0;
             last_disco_probe_ms = now;
-            ESP_LOGD(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
+            ESP_LOGD(TAG, "disco_periodic_probes: %lu ms", (unsigned long)dt);
         }
 
         /* No trailing delay: the blocking receive above paces the loop and

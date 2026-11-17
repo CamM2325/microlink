@@ -1,0 +1,12 @@
+# Line endings for sources and build files.
+#
+# Most of these files are stored with CRLF in the repository today. "text=auto"
+# leaves a file whose committed version already contains CRLF exactly as it is
+# (plain "text" would rewrite it to LF on its next commit), and "eol=crlf"
+# checks every matching file out with CRLF, which matches the current
+# convention. A one-time LF renormalisation is a separate decision.
+*.c             text=auto eol=crlf
+*.h             text=auto eol=crlf
+Kconfig*        text=auto eol=crlf
+CMakeLists.txt  text=auto eol=crlf
+*.defaults      text=auto eol=crlf

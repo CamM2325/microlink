@@ -547,7 +547,7 @@ void ml_derp_tx_task(void *arg) {
         {
             uint64_t now_ms = loop_start;
             if (now_ms - last_status_ms > 10000) {
-                ESP_LOGI(TAG, "DERP status: connected=%d fd=%d rx=%lu tx=%lu loops=%lu",
+                ESP_LOGD(TAG, "DERP status: connected=%d fd=%d rx=%lu tx=%lu loops=%lu",
                          ml->derp.connected, ml->derp.sockfd,
                          (unsigned long)frames_rx, (unsigned long)frames_tx,
                          (unsigned long)loop_count);
@@ -763,7 +763,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     }
 
     int64_t t_derp_dns = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] DERP DNS: %lld ms", (t_derp_dns - t_derp_start) / 1000);
+    ESP_LOGD(TAG, "[TIMING] DERP DNS: %ld ms", (long)((t_derp_dns - t_derp_start) / 1000));
 
     /* TCP connect — use address family from DNS result */
     int sock = ml_socket(res->ai_family, SOCK_STREAM, 0);
@@ -786,7 +786,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     ml_freeaddrinfo(res);
 
     int64_t t_derp_tcp = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] DERP TCP connect: %lld ms", (t_derp_tcp - t_derp_dns) / 1000);
+    ESP_LOGD(TAG, "[TIMING] DERP TCP connect: %ld ms", (long)((t_derp_tcp - t_derp_dns) / 1000));
 
     /* TLS setup */
     mbedtls_ssl_init(&ml->derp.ssl);
@@ -884,7 +884,12 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
             continue;
         }
         char err_buf[128];
+#if defined(MBEDTLS_ERROR_C)
         mbedtls_strerror(ret, err_buf, sizeof(err_buf));
+#else
+        /* CONFIG_MBEDTLS_ERROR_STRINGS=n: mbedTLS 4 has no strerror stub */
+        snprintf(err_buf, sizeof(err_buf), "-0x%04x", (unsigned)-ret);
+#endif
         ESP_LOGE(TAG, "TLS handshake failed: %s", err_buf);
 #if CONFIG_ML_DERP_VERIFY_CERT
         uint32_t vflags = mbedtls_ssl_get_verify_result(&ml->derp.ssl);
@@ -899,8 +904,8 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     }
 
     int64_t t_derp_tls = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] DERP TLS handshake: %lld ms", (t_derp_tls - t_derp_tcp) / 1000);
-    ESP_LOGI(TAG, "TLS connected to DERP");
+    ESP_LOGD(TAG, "[TIMING] DERP TLS handshake: %ld ms", (long)((t_derp_tls - t_derp_tcp) / 1000));
+    ESP_LOGD(TAG, "TLS connected to DERP");
 
     /* HTTP Upgrade: GET /derp with Upgrade: DERP header */
     char upgrade_req[256];
@@ -968,7 +973,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
             derp_tls_abort(ml, sock);
             return ESP_FAIL;
         }
-        ESP_LOGI(TAG, "HTTP 101 Switching Protocols received");
+        ESP_LOGD(TAG, "HTTP 101 Switching Protocols received");
     }
 
     /* Match v1 exactly: O_NONBLOCK + short SO_RCVTIMEO + SO_SNDTIMEO.
@@ -1022,7 +1027,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         derp_tls_abort(ml, sock);
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "DERP magic verified");
+    ESP_LOGD(TAG, "DERP magic verified");
 
     /* Read 32-byte server public key */
     uint8_t derp_server_key[32];
@@ -1032,7 +1037,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "DERP server key received (first 8): %02x%02x%02x%02x%02x%02x%02x%02x",
+    ESP_LOGD(TAG, "DERP server key received (first 8): %02x%02x%02x%02x%02x%02x%02x%02x",
              derp_server_key[0], derp_server_key[1], derp_server_key[2], derp_server_key[3],
              derp_server_key[4], derp_server_key[5], derp_server_key[6], derp_server_key[7]);
 
@@ -1091,7 +1096,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         memcpy(ci_payload + 32 + NACL_BOX_NONCEBYTES, ciphertext, ciphertext_len);
         free(ciphertext);
 
-        ESP_LOGI(TAG, "DERP ClientInfo node_key=%02x%02x%02x%02x%02x%02x%02x%02x",
+        ESP_LOGD(TAG, "DERP ClientInfo node_key=%02x%02x%02x%02x%02x%02x%02x%02x",
                  ml->wg_public_key[0], ml->wg_public_key[1],
                  ml->wg_public_key[2], ml->wg_public_key[3],
                  ml->wg_public_key[4], ml->wg_public_key[5],
@@ -1106,7 +1111,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         }
         free(ci_payload);
 
-        ESP_LOGI(TAG, "ClientInfo sent");
+        ESP_LOGD(TAG, "ClientInfo sent");
     }
 
     /* Step 3: Read ServerInfo frame (type 0x03) */
@@ -1121,7 +1126,7 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
                 derp_tls_read_all(ml, si_buf, si_len, DERP_CONNECT_TIMEOUT_MS);
                 free(si_buf);
             }
-            ESP_LOGI(TAG, "ServerInfo received (discarded)");
+            ESP_LOGD(TAG, "ServerInfo received (discarded)");
         } else if (err != ESP_OK) {
             ESP_LOGW(TAG, "No ServerInfo frame (continuing anyway)");
         }
@@ -1149,12 +1154,12 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECTED);
 
     int64_t t_derp_done = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] DERP total: %lld ms (DNS=%lld, TCP=%lld, TLS=%lld, proto=%lld)",
-             (t_derp_done - t_derp_start) / 1000,
-             (t_derp_dns - t_derp_start) / 1000,
-             (t_derp_tcp - t_derp_dns) / 1000,
-             (t_derp_tls - t_derp_tcp) / 1000,
-             (t_derp_done - t_derp_tls) / 1000);
+    ESP_LOGI(TAG, "[TIMING] DERP total: %ld ms (DNS=%ld, TCP=%ld, TLS=%ld, proto=%ld)",
+             (long)((t_derp_done - t_derp_start) / 1000),
+             (long)((t_derp_dns - t_derp_start) / 1000),
+             (long)((t_derp_tcp - t_derp_dns) / 1000),
+             (long)((t_derp_tls - t_derp_tcp) / 1000),
+             (long)((t_derp_done - t_derp_tls) / 1000));
     ESP_LOGI(TAG, "DERP handshake complete, connected");
     return ESP_OK;
 }
