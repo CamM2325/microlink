@@ -54,3 +54,30 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
           files: dist/*
+
+  # Publish components/microlink to the ESP Component Registry as
+  # camm2325/microlink. Needs the repository secret IDF_COMPONENT_API_TOKEN
+  # (a registry token with write access to the camm2325 namespace).
+  registry:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Check that the tag matches idf_component.yml
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          manifest=$(sed -nE 's/^version:[[:space:]]*"?([^"[:space:]]+)"?.*/\1/p' components/microlink/idf_component.yml)
+          if [ "v$manifest" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match idf_component.yml version $manifest"
+            exit 1
+          fi
+      - uses: espressif/upload-components-ci-action@2ce17d73e35473317c1419dbd4f007aacb593040 # v2.2.1
+        with:
+          components: "microlink:components/microlink"
+          namespace: "camm2325"
+          api_token: ${{ secrets.IDF_COMPONENT_API_TOKEN }}

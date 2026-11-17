@@ -1,5 +1,7 @@
 # MicroLink
 
+[![ESP Component Registry](https://components.espressif.com/components/camm2325/microlink/badge.svg)](https://components.espressif.com/components/camm2325/microlink)
+
 An unofficial, Tailscale-compatible VPN client for ESP32, packaged as an ESP-IDF component.
 MicroLink puts an ESP32 on your tailnet with its own `100.x.y.z` address, so other tailnet
 devices can reach it (and it can reach them) over WireGuard, through NATs and cellular networks.
@@ -128,10 +130,17 @@ echo "hi" | nc -u -w1 <device-vpn-ip> 9000     # basic_connect replies "ECHO: hi
 
 ## Using MicroLink in your project
 
-`components/microlink` is one self-contained ESP-IDF component, WireGuard included. Add this
-repository's `components` directory to your project's `EXTRA_COMPONENT_DIRS`, as the examples do
-(older setups that also list `components/microlink/components` keep working). The component is
-packaged for the ESP Component Registry (`idf_component.yml`; not published yet). Then:
+`components/microlink` is one self-contained ESP-IDF component, WireGuard included. It is
+published on the [ESP Component Registry](https://components.espressif.com/components/camm2325/microlink)
+as `camm2325/microlink`; from your project directory run:
+
+```bash
+idf.py add-dependency "camm2325/microlink^2.3.0"
+```
+
+Or use it from a clone: add this repository's `components` directory to your project's
+`EXTRA_COMPONENT_DIRS`, as the examples do (older setups that also list
+`components/microlink/components` keep working). Then:
 
 ```c
 #include "microlink.h"
