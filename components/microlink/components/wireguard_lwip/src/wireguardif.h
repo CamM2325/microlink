@@ -125,7 +125,7 @@ err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip
 // Try and connect to the given peer
 err_t wireguardif_connect(struct netif *netif, u8_t peer_index);
 
-// Is the given peer "up"? A peer is up if it has a valid session key it can communicate with
+// Is the given peer "up"? A peer is up if it has a session keypair transport data can be sent with now (wg_peer_can_send)
 err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *current_ip, u16_t *current_port);
 
 // Register a DERP relay output callback for peers without direct endpoints

@@ -1035,7 +1035,11 @@ err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *cu
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
 	if (result == ERR_OK) {
 		wg_state_lock();
-		if ((peer->curr_keypair.valid) || (peer->prev_keypair.valid)) {
+		// Up means TX has a usable keypair (the same test the output path and
+		// the route tie-break use), not merely that some key material exists:
+		// a peer whose curr keypair expired keeps a valid prev that TX never
+		// uses, and reporting it up stopped callers from re-handshaking.
+		if (wg_peer_can_send(peer)) {
 			result = ERR_OK;
 		} else {
 			result = ERR_CONN;

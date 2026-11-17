@@ -34,7 +34,15 @@ int wg_peer_match_len(const struct wireguard_peer *peer, const ip_addr_t *addr);
  */
 struct wireguard_keypair *wg_peer_tx_keypair(struct wireguard_peer *peer);
 
-/* Outbound cryptokey routing: longest-prefix match; session only breaks ties. */
+/*
+ * True if `peer` has a keypair transport data can be sent with right now:
+ * wg_peer_tx_keypair() is non-NULL, not past Reject-After-Time and below the
+ * message limit. This is what "session up" means for TX.
+ */
+bool wg_peer_can_send(struct wireguard_peer *peer);
+
+/* Outbound cryptokey routing: longest-prefix match; a usable session
+ * (wg_peer_can_send) only breaks ties. */
 struct wireguard_peer *wg_peer_lookup_by_allowed_ip(struct wireguard_device *device, const ip_addr_t *ipaddr);
 
 /* Inbound: true iff inner source `src` routes back to `peer` (no more-specific owner). */

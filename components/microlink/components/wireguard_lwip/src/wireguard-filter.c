@@ -74,13 +74,27 @@ struct wireguard_keypair *wg_peer_tx_keypair(struct wireguard_peer *peer) {
 	return NULL;
 }
 
+bool wg_peer_can_send(struct wireguard_peer *peer) {
+	const struct wireguard_keypair *keypair = wg_peer_tx_keypair(peer);
+	return keypair &&
+		!wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME) &&
+		(keypair->sending_counter < REJECT_AFTER_MESSAGES);
+}
+
 /*
  * Cryptokey routing (outbound): longest-prefix match across all peers.
  * A more specific route always wins — e.g. a /32 tailnet peer beats a
  * 0.0.0.0/0 exit node even when the /32 peer has no session yet (in that
  * case the packet is queued/handshake started for the correct peer rather
  * than being encrypted to the wrong one). Having a live session is only
- * used to break ties between equally specific routes.
+ * used to break ties between equally specific routes, and it counts only if
+ * TX can actually use it: a slot whose curr keypair expired keeps a valid
+ * prev that TX never selects, and must not win the tie over a live peer
+ * (e.g. the old and new node key of a peer that rotated keys, both owning
+ * the same /32 until the old one is removed).
+ *
+ * Runs on tcpip_thread without the state lock: the session test is only a
+ * preference, wireguardif_output_to_peer() re-checks under the lock.
  */
 struct wireguard_peer *wg_peer_lookup_by_allowed_ip(struct wireguard_device *device, const ip_addr_t *ipaddr) {
 	struct wireguard_peer *best = NULL;
@@ -95,7 +109,7 @@ struct wireguard_peer *wg_peer_lookup_by_allowed_ip(struct wireguard_device *dev
 		if (len < 0) {
 			continue;
 		}
-		bool has_session = tmp->curr_keypair.valid || tmp->prev_keypair.valid;
+		bool has_session = wg_peer_can_send(tmp);
 		if (len > best_len || (len == best_len && has_session && !best_has_session)) {
 			best = tmp;
 			best_len = len;
