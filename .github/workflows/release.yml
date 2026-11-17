@@ -3,6 +3,11 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build a draft release for (e.g. v2.2.0)'
+        required: true
 
 permissions:
   contents: read
@@ -18,6 +23,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - name: Build
         shell: bash
         working-directory: examples/${{ matrix.example }}
@@ -28,7 +34,8 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rel-${{ matrix.example }}
-          path: examples/${{ matrix.example }}/${{ matrix.example }}-esp32s3-merged.bin
+          path: examples/${{ matrix.example }}/build/${{ matrix.example }}-esp32s3-merged.bin
+          if-no-files-found: error
 
   publish:
     needs: build
@@ -44,5 +51,6 @@ jobs:
       - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           draft: true
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
           files: dist/*

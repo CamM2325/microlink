@@ -509,12 +509,14 @@ static int complete_proactive_frames(microlink_t *ml, uint8_t **buf, int *len) {
         }
         if (need == 0) return 0;
 
-        if (*len + need > PROACTIVE_MAX_BYTES) {
+        if (need <= 0 || *len < 0 || *len > PROACTIVE_MAX_BYTES ||
+            need > PROACTIVE_MAX_BYTES - *len) {
             ESP_LOGE(TAG, "Proactive frame at offset %d too large (%d bytes missing)", off, need);
             return -1;
         }
+        const size_t alloc_len = (size_t)*len + (size_t)need;   /* <= PROACTIVE_MAX_BYTES */
         ESP_LOGI(TAG, "Incomplete proactive frame at offset %d, reading %d more bytes", off, need);
-        uint8_t *nb = ml_psram_malloc(*len + need);
+        uint8_t *nb = ml_psram_malloc(alloc_len);
         if (!nb) return -1;
         memcpy(nb, *buf, *len);
         free(*buf);
