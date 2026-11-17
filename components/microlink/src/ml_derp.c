@@ -399,8 +399,9 @@ static int poll_derp_read(microlink_t *ml) {
     if (n < 5) {
         /* ssl_read returns at most the rest of the current TLS record, and
          * a relay may split a frame header across records. Finish it; the
-         * stream is only misaligned if the rest never arrives. */
-        if (derp_tls_read_all(ml, header + n, 5 - n, 2000) < 0) {
+         * stream is only misaligned if the rest never arrives. Same 5 s
+         * as the payload: the next record can be slow on the AT bridge. */
+        if (derp_tls_read_all(ml, header + n, 5 - n, 5000) < 0) {
             ESP_LOGW(TAG, "DERP partial header: got %d of 5 bytes", n);
             return -1;
         }
