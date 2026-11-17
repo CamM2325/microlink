@@ -1536,7 +1536,7 @@ static void disco_apply_direct_path(microlink_t *ml, ml_peer_t *p, bool switched
     IP_SET_TYPE_VAL(ep_ip, IPADDR_TYPE_V4);
     ip4_addr_set_u32(ip_2_ip4(&ep_ip), htonl(p->best_ip));
 
-    ip_addr_t cur_ip;
+    ip_addr_t cur_ip = IPADDR4_INIT(0);   /* left untouched if the lookup fails */
     u16_t cur_port = 0;
     bool up = wireguardif_peer_is_up(netif, wg_idx, &cur_ip, &cur_port) == ERR_OK;
     bool on_path = IP_IS_V4(&cur_ip) &&
