@@ -8,7 +8,7 @@
 #   3. boots it in Espressif's QEMU and waits for CONNECTED,
 #   4. pings the device's tailnet address from the Tailscale client, which
 #      only succeeds through a working WireGuard tunnel,
-#   5. uses the device as exit node: IPv4 must reach the internet through
+#   5. uses the device as exit node: IPv4 (HTTP) must reach the internet through
 #      it; QEMU's network has no IPv6, so an IPv6 connection must fail at
 #      once (ICMPv6 "no route" from the device) rather than time out.
 #
@@ -156,12 +156,19 @@ for _ in $(seq 30); do
     sleep 2
 done
 sleep 3
-docker exec "$P-ts" ping -c 10 -i 0.5 -W 3 1.1.1.1 | tee "$OUT/exit-ping4.log" || true
-RECEIVED4=$(awk '/packets transmitted/ {print $4}' "$OUT/exit-ping4.log")
-if [ "${RECEIVED4:-0}" -lt 5 ]; then
-    echo "FAIL: IPv4 through the exit node: only ${RECEIVED4:-0} of 10 pings answered"
+# TCP, not ping: GitHub's runners do not pass ICMP to the internet.
+OK4=0
+for _ in 1 2 3; do
+    docker exec "$P-ts" wget -S -T 15 -O /dev/null http://1.1.1.1/ > "$OUT/exit-http4.log" 2>&1 || true
+    if grep -qE "HTTP/1\.[01] (200|301|302)" "$OUT/exit-http4.log"; then OK4=1; break; fi
+    sleep 3
+done
+cat "$OUT/exit-http4.log"
+if [ "$OK4" != 1 ]; then
+    echo "FAIL: IPv4 (HTTP to 1.1.1.1) through the exit node did not work"
     exit 1
 fi
+RECEIVED4="HTTP ok"
 # The client must send IPv6 into the tunnel, or "unreachable" below would
 # come from its own kernel rather than from the device.
 docker exec "$P-ts" ip -6 route get 2606:4700:4700::1111 | tee "$OUT/exit-route6.log"
@@ -177,4 +184,4 @@ if [ "$ELAPSED" -ge 8 ] || ! grep -qi "unreachable" "$OUT/exit-ipv6.log"; then
     echo "FAIL: IPv6 without IPv6 upstream did not fail fast with 'unreachable' (${ELAPSED} s)"
     exit 1
 fi
-echo "PASS: tunnel 20/20; exit node IPv4 ${RECEIVED4}/10; IPv6 'no route' after ${ELAPSED} s"
+echo "PASS: tunnel 20/20; exit node IPv4 ${RECEIVED4}; IPv6 'no route' after ${ELAPSED} s"
