@@ -233,7 +233,28 @@ int main(void) {
         CHECK(ml_routes_parse("1.2.3.4/", r, ML_MAX_ROUTES) == -1);
         CHECK(ml_routes_parse("1.2.3.4/24x", r, ML_MAX_ROUTES) == -1);
         CHECK(ml_routes_parse("1111.2.3.4", r, ML_MAX_ROUTES) == -1);
-        CHECK(ml_routes_parse("fd00::/8", r, ML_MAX_ROUTES) == -1);
+        CHECK(ml_routes_parse("fd00::/8", r, ML_MAX_ROUTES) == 0);       /* IPv6: not here */
+        CHECK(ml_routes_parse("10.0.0.0/8, 2001:db8::/32", r, ML_MAX_ROUTES) == 1);
+        /* IPv6 prefixes */
+        ml_route6_t r6[ML_MAX_ROUTES];
+        char s6[48];
+        uint8_t a6[16];
+        CHECK(ml_routes_parse6("10.0.0.0/8 2001:db8:1:2::5/64, fd12:3456::/48;fd12:3456::/48 ::/0", r6, ML_MAX_ROUTES) == 2);
+        ml_routes6_format(&r6[0], s6, sizeof(s6));
+        CHECK(strcmp(s6, "2001:db8:1:2::/64") == 0);                    /* host bits cleared */
+        ml_routes6_format(&r6[1], s6, sizeof(s6));
+        CHECK(strcmp(s6, "fd12:3456::/48") == 0);
+        inet_pton(AF_INET6, "2001:db8:1:2:abcd::1", a6);
+        CHECK(ml_routes6_contain(r6, 2, a6));
+        inet_pton(AF_INET6, "2001:db8:1:3::1", a6);
+        CHECK(!ml_routes6_contain(r6, 2, a6));
+        CHECK(ml_routes_parse6("2001:db8::1", r6, ML_MAX_ROUTES) == 1 && r6[0].len == 128);
+        ml_routes6_format(&r6[0], s6, sizeof(s6));
+        CHECK(strcmp(s6, "2001:db8::1/128") == 0);
+        CHECK(ml_routes_parse6("2001:db8::/129", r6, ML_MAX_ROUTES) == -1);
+        CHECK(ml_routes_parse6("2001:db8::/0", r6, ML_MAX_ROUTES) == -1);  /* only ::/0, with 0.0.0.0/0 */
+        CHECK(ml_routes_parse6("2001:zz8::/32", r6, ML_MAX_ROUTES) == -1);
+        CHECK(ml_routes_parse6("192.168.1.0/24", r6, ML_MAX_ROUTES) == 0);
         CHECK(ml_routes_parse("1.0.0.0/8,2.0.0.0/8,3.0.0.0/8", r, 2) == -1);
     }
 
@@ -283,10 +304,19 @@ int main(void) {
         apply("{\"PacketFilter\":" ALLOW_ALL "}");
         /* no tailnet IPv6 address yet: nothing */
         CHECK(!in6(6, "fd7a:115c:a1e0::5", ME6, 22, SYN, 0));
-        ml_filter_set_local6(self6, false);
+        ml_filter_set_local6(self6, false, NULL, 0);
         CHECK(in6(6, "fd7a:115c:a1e0::5", ME6, 22, SYN, 0));            /* "*" covers IPv6 */
         CHECK(!in6(6, "fd7a:115c:a1e0::5", "2606:4700::1111", 443, SYN, 0)); /* not an exit node */
-        ml_filter_set_local6(self6, true);
+        {   /* IPv6 subnet route */
+            ml_route6_t rt6[1];
+            CHECK(ml_routes_parse6("2001:db8:1::/64", rt6, 1) == 1);
+            ml_filter_set_local6(self6, false, rt6, 1);
+            CHECK(in6(6, "fd7a:115c:a1e0::5", "2001:db8:1::20", 22, SYN, 0));
+            CHECK(!in6(6, "fd7a:115c:a1e0::5", "2001:db8:2::20", 22, SYN, 0));
+            ml_filter_set_local6(self6, false, NULL, 0);
+            CHECK(!in6(6, "fd7a:115c:a1e0::5", "2001:db8:1::20", 22, SYN, 0));
+        }
+        ml_filter_set_local6(self6, true, NULL, 0);
         CHECK(in6(6, "fd7a:115c:a1e0::5", "2606:4700::1111", 443, SYN, 0));
         CHECK(!in6(6, "fd7a:115c:a1e0::5", "fd7a:115c:a1e0::9", 22, SYN, 0)); /* other tailnet node */
         CHECK(!in6(6, "fd7a:115c:a1e0::5", "fe80::1", 22, SYN, 0));
@@ -316,7 +346,7 @@ int main(void) {
         CHECK(!in6(6, "fd7a:115c:a1e0::6", "2606:4700::1111", 443, SYN, 0));
         CHECK(in6(58, "fd7a:115c:a1e0::5", ME6, 0, 0, 128));              /* ICMPv6 in the default protocols */
         CHECK(!in6(6, "fd7a:115c:a1e0::5", "fc00::1", 443, SYN, 0));      /* outside 2000::/3 */
-        ml_filter_set_local6(NULL, false);
+        ml_filter_set_local6(NULL, false, NULL, 0);
         CHECK(!in6(6, "fd7a:115c:a1e0::5", ME6, 22, SYN, 0));
     }
 

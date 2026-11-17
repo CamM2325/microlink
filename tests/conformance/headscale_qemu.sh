@@ -7,7 +7,10 @@
 #      Ethernet (OpenCores MAC), pointed at that Headscale,
 #   3. boots it in Espressif's QEMU and waits for CONNECTED,
 #   4. pings the device's tailnet address from the Tailscale client, which
-#      only succeeds through a working WireGuard tunnel.
+#      only succeeds through a working WireGuard tunnel,
+#   5. uses the device as exit node: IPv4 must reach the internet through
+#      it; QEMU's network has no IPv6, so an IPv6 connection must fail at
+#      once (ICMPv6 "no route" from the device) rather than time out.
 #
 # Needs Docker and port 80 on BIND_IP (MicroLink's plain-HTTP control
 # connection always uses port 80). Run from anywhere:
@@ -95,6 +98,9 @@ CONFIG_ML_CTRL_NOISE_PUBKEY_HEX="$NOISE"
 # CONFIG_ML_CTRL_TLS is not set
 CONFIG_ML_TAILSCALE_AUTH_KEY="$KEY"
 CONFIG_ML_DEVICE_NAME="conformance-esp32"
+CONFIG_ML_SUBNET_ROUTER=y
+CONFIG_ML_ADVERTISE_ROUTES="0.0.0.0/0"
+CONFIG_LWIP_HOOK_IP6_INPUT_DEFAULT=y
 EOF
 # sdkconfig defaults only apply when sdkconfig is created: start fresh, or a
 # previous run's server key and auth key would be reused
@@ -116,7 +122,7 @@ docker run -d --name "$P-qemu" -v "$OUT:/out" "$IDF_IMAGE" bash -c '
     . "$IDF_PATH/export.sh" > /dev/null 2>&1
     exec qemu-system-xtensa -nographic -machine esp32 \
         -drive file=/out/build/flash.bin,if=mtd,format=raw \
-        -nic user,model=open_eth > /out/qemu.log 2>&1' > /dev/null
+        -nic user,model=open_eth,ipv6=off > /out/qemu.log 2>&1' > /dev/null
 VPN_IP=
 for _ in $(seq "$BOOT_TIMEOUT"); do
     VPN_IP=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/qemu.log" 2>/dev/null |
@@ -139,4 +145,36 @@ if [ "${RECEIVED:-0}" -lt 15 ]; then
     echo "FAIL: only ${RECEIVED:-0} of 20 pings answered"
     exit 1
 fi
-echo "PASS: $RECEIVED of 20 pings answered by $VPN_IP"
+echo "ok: $RECEIVED of 20 pings answered by $VPN_IP"
+
+log "Use the device as exit node"
+NODE_ID=$(docker exec "$P-headscale" headscale nodes list -o json | python3 -c \
+    'import json,sys; print([n["id"] for n in json.load(sys.stdin) if "'"$VPN_IP"'" in n.get("ip_addresses", [])][0])')
+docker exec "$P-headscale" headscale nodes approve-routes -i "$NODE_ID" -r 0.0.0.0/0,::/0 > /dev/null
+for _ in $(seq 30); do
+    docker exec "$P-ts" tailscale set --exit-node="$VPN_IP" > /dev/null 2>&1 && break
+    sleep 2
+done
+sleep 3
+docker exec "$P-ts" ping -c 10 -i 0.5 -W 3 1.1.1.1 | tee "$OUT/exit-ping4.log" || true
+RECEIVED4=$(awk '/packets transmitted/ {print $4}' "$OUT/exit-ping4.log")
+if [ "${RECEIVED4:-0}" -lt 5 ]; then
+    echo "FAIL: IPv4 through the exit node: only ${RECEIVED4:-0} of 10 pings answered"
+    exit 1
+fi
+# The client must send IPv6 into the tunnel, or "unreachable" below would
+# come from its own kernel rather than from the device.
+docker exec "$P-ts" ip -6 route get 2606:4700:4700::1111 | tee "$OUT/exit-route6.log"
+if ! grep -q "dev tailscale0" "$OUT/exit-route6.log"; then
+    echo "FAIL: the client does not route IPv6 through the exit node"
+    exit 1
+fi
+START=$(date +%s)
+docker exec "$P-ts" wget -T 15 -O /dev/null "http://[2606:4700:4700::1111]/" > "$OUT/exit-ipv6.log" 2>&1 || true
+ELAPSED=$(( $(date +%s) - START ))
+cat "$OUT/exit-ipv6.log"
+if [ "$ELAPSED" -ge 8 ] || ! grep -qi "unreachable" "$OUT/exit-ipv6.log"; then
+    echo "FAIL: IPv6 without IPv6 upstream did not fail fast with 'unreachable' (${ELAPSED} s)"
+    exit 1
+fi
+echo "PASS: tunnel 20/20; exit node IPv4 ${RECEIVED4}/10; IPv6 'no route' after ${ELAPSED} s"

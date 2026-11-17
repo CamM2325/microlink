@@ -65,9 +65,10 @@ typedef struct {
      * false (default) keeps the existing Stream=false one-shot fetch. */
     bool streaming_map_fetch;
 
-    /* Subnet router / exit node (needs CONFIG_ML_SUBNET_ROUTER). IPv4
-     * CIDRs, separated by commas or spaces, that this device offers to the
-     * tailnet, e.g. "192.168.1.0/24". "0.0.0.0/0" offers it as an exit node.
+    /* Subnet router / exit node (needs CONFIG_ML_SUBNET_ROUTER). Prefixes,
+     * separated by commas or spaces, that this device offers to the
+     * tailnet, e.g. "192.168.1.0/24, fd12:3456::/64" (IPv6 needs
+     * CONFIG_ML_ROUTER_IPV6). "0.0.0.0/0" offers it as an exit node.
      * Routes take effect once approved in the admin console (or by an
      * autoApprovers policy). Traffic to them is forwarded out of the
      * device's other interface with its address as source (SNAT), like
@@ -229,6 +230,19 @@ uint32_t microlink_get_vpn_ip(const microlink_t *ml);
  *         a truncated URL would be useless), ESP_ERR_INVALID_ARG
  */
 esp_err_t microlink_get_auth_url(microlink_t *ml, char *buf, size_t buf_len);
+
+/**
+ * @brief Your own lwIP IPv6 input hook, when MicroLink forwards IPv6
+ *
+ * With CONFIG_ML_ROUTER_IPV6, MicroLink implements lwIP's
+ * lwip_hook_ip6_input() (for NAT66), so the application cannot. Define this
+ * function instead: it is called for every IPv6 packet MicroLink does not
+ * consume, after any translation, on tcpip_thread. Return 1 if you consumed
+ * (and freed) the packet, 0 to let lwIP process it. The default does nothing.
+ */
+struct pbuf;
+struct netif;
+int microlink_ip6_input_hook(struct pbuf *p, struct netif *inp);
 
 /**
  * @brief Get number of known peers

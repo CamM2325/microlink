@@ -472,14 +472,22 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     if (!routes) routes = CONFIG_ML_ADVERTISE_ROUTES;
 #endif
     int nroutes = ml_routes_parse(routes, ml->routes, ML_MAX_ROUTES);
-    if (nroutes < 0) {
-        ESP_LOGE(TAG, "Invalid advertise_routes \"%s\": expected up to %d IPv4 CIDRs "
-                 "such as 192.168.1.0/24", routes, ML_MAX_ROUTES);
+    int nroutes6 = ml_routes_parse6(routes, ml->routes6, ML_MAX_ROUTES);
+    if (nroutes < 0 || nroutes6 < 0) {
+        ESP_LOGE(TAG, "Invalid advertise_routes \"%s\": expected up to %d IPv4 and %d IPv6 "
+                 "prefixes such as 192.168.1.0/24 or fd12:3456::/64", routes, ML_MAX_ROUTES, ML_MAX_ROUTES);
         free(ml);
         return NULL;
     }
+#ifndef CONFIG_ML_ROUTER_IPV6
+    if (nroutes6 > 0) {
+        ESP_LOGE(TAG, "IPv6 routes in advertise_routes need CONFIG_ML_ROUTER_IPV6");
+        free(ml);
+        return NULL;
+    }
+#endif
 #ifndef CONFIG_ML_SUBNET_ROUTER
-    if (nroutes > 0) {
+    if (nroutes > 0 || nroutes6 > 0) {
         ESP_LOGE(TAG, "advertise_routes is set but CONFIG_ML_SUBNET_ROUTER is off "
                  "(the device could not forward the traffic)");
         free(ml);
@@ -487,11 +495,17 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     }
 #endif
     ml->route_count = (uint8_t)nroutes;
+    ml->route6_count = (uint8_t)nroutes6;
     for (int i = 0; i < nroutes; i++) {
         char cidr[20];
         ml_routes_format(&ml->routes[i], cidr, sizeof(cidr));
         ESP_LOGI(TAG, "Advertising route %s%s", cidr,
                  ml->routes[i].len == 0 ? " (exit node)" : "");
+    }
+    for (int i = 0; i < nroutes6; i++) {
+        char cidr[48];
+        ml_routes6_format(&ml->routes6[i], cidr, sizeof(cidr));
+        ESP_LOGI(TAG, "Advertising route %s", cidr);
     }
 
     ml->state = ML_STATE_IDLE;

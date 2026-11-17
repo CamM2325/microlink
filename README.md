@@ -54,8 +54,8 @@ control plane over TLS (PR #22).
 
 **Not supported (yet):**
 
-- IPv4 tunnel addresses only (no `fd7a:…` IPv6 inside the tunnel), except for an exit node, which
-  uses its IPv6 tailnet address to forward its clients' IPv6.
+- IPv4 tunnel addresses only (no `fd7a:…` IPv6 inside the tunnel), except on a subnet router or exit
+  node, which uses its IPv6 tailnet address to forward peers' IPv6.
 - Subnet routes work in one direction only: the device can *be* a subnet router or exit node,
   but it does not use other nodes' subnet routes or exit nodes (no `--accept-routes` /
   `--exit-node`).
@@ -359,7 +359,7 @@ interface (WiFi station or Ethernet), like `tailscale up --advertise-routes`:
 
 ```
 CONFIG_ML_SUBNET_ROUTER=y
-CONFIG_ML_ADVERTISE_ROUTES="192.168.1.0/24"    # add 0.0.0.0/0 to offer the device as an exit node
+CONFIG_ML_ADVERTISE_ROUTES="192.168.1.0/24, fd12:3456::/64"   # 0.0.0.0/0 adds an exit node
 ```
 
 (or `advertise_routes` in `microlink_config_t`; `examples/sdkconfig.router.defaults` is a ready-made
@@ -370,14 +370,18 @@ clients: `tailscale set --accept-routes`, or select the device as exit node.
   default `--snat-subnet-routes`, so LAN hosts need no route back to the tailnet.
 - From the tunnel, the device accepts only packets addressed to its tailnet IP or to an advertised
   route, whatever the ACL setting. ACLs (`ML_PACKET_FILTER`) apply to routed traffic too.
-- **IPv6 through an exit node** (`ML_EXIT_NODE_IPV6`, on with the overlay): the device takes its
-  tailnet IPv6 address, gets a global address on the LAN by SLAAC and masquerades its clients' IPv6
-  behind it (NAT66 for TCP, UDP and ping), as Linux exit nodes do. On a LAN without IPv6, clients
-  get an immediate "no route" and fall back to IPv4. It uses lwIP's IPv6 input hook
-  (`CONFIG_LWIP_HOOK_IP6_INPUT_CUSTOM=y`, set by the overlay), so the application must not define
-  `lwip_hook_ip6_input()` itself. Subnet routes are IPv4 only.
-- Measured on an ESP32-S3 over WiFi: about 4 Mbit/s of downloads through the device as exit node,
-  over IPv4 and IPv6 alike (Headscale, Tailscale client; the internet saw the device's SLAAC address).
+- **IPv6** (`ML_ROUTER_IPV6`, on with the overlay): IPv6 prefixes in the list are advertised as
+  subnet routes, and an exit node forwards IPv6 too. The device takes its tailnet IPv6 address, gets
+  an address on the LAN by SLAAC and masquerades peers' IPv6 behind it (NAT66 for TCP, UDP and
+  ping), as Linux exit nodes and subnet routers do. When the LAN has no address that can reach a
+  destination (for example, no IPv6 at all), the peer gets ICMPv6 "no route" at once and falls back
+  to IPv4; the conformance test checks this on an IPv6-less network.
+- IPv6 uses lwIP's IPv6 input hook, which the overlay turns on (`CONFIG_LWIP_HOOK_IP6_INPUT_DEFAULT`)
+  and MicroLink implements. An application that needs that hook itself defines
+  `microlink_ip6_input_hook()` instead: it gets every IPv6 packet MicroLink does not consume.
+- Measured on an ESP32-S3 over WiFi (Headscale, Tailscale client): about 4 Mbit/s of downloads
+  through the device as exit node over IPv4 and IPv6 (the internet saw the device's SLAAC address),
+  and LAN hosts reachable through an IPv6 /64 route.
 
 ## Config web UI
 

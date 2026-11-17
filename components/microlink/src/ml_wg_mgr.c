@@ -354,7 +354,7 @@ static void wg_netif_bring_up_in_tcpip(void *arg) {
      * are mapped back and routed into the tunnel. Needs the netif up. */
     if (ctx->napt && !ip_napt_enable_netif(ctx->netif, 1)) ctx->napt_failed = true;
 #endif
-#ifdef CONFIG_ML_EXIT_NODE_IPV6
+#ifdef CONFIG_ML_ROUTER_IPV6
     if (ctx->ip6) {
         /* Our tailnet IPv6 address, usable at once (no DAD over a point-to-
          * point tunnel): lwIP then routes the tailnet /64 into the tunnel,
@@ -364,8 +364,14 @@ static void wg_netif_bring_up_in_tcpip(void *arg) {
         memcpy(a.addr, ctx->ip6addr, 16);
         s8_t i = -1;
         if (netif_add_ip6_address(ctx->netif, &a, &i) == ERR_OK && i >= 0) {
-            netif_ip6_addr_set_state(ctx->netif, i, IP6_ADDR_PREFERRED);
-            ml_nat66_attach(ctx->netif);
+            /* Set the state directly: netif_ip6_addr_set_state() runs the
+             * netif callbacks, and ESP-IDF's (esp_netif_internal_nd6_cb)
+             * takes netif->state for an esp_netif_t, which on this netif is
+             * the WireGuard device (crash). The address is static (infinite
+             * lifetime) and DAD is pointless on the tunnel, so lwIP never
+             * changes this state again. */
+            ctx->netif->ip6_addr_state[i] = IP6_ADDR_PREFERRED;
+            ml_nat66_attach(ctx->netif, ctx->ip6addr);
         }
     }
 #endif
@@ -408,8 +414,8 @@ typedef struct {
 static void wg_netif_remove_in_tcpip(void *arg) {
     wg_netif_down_ctx_t *ctx = (wg_netif_down_ctx_t *)arg;
     struct netif *netif = ctx->netif;
-#ifdef CONFIG_ML_EXIT_NODE_IPV6
-    ml_nat66_attach(NULL);
+#ifdef CONFIG_ML_ROUTER_IPV6
+    ml_nat66_attach(NULL, NULL);
 #endif
 #if IP_NAPT
     /* Frees the NAPT table if no other netif uses it; needs the netif up */
@@ -505,19 +511,22 @@ static void wg_free_unlinked_device(struct netif *netif) {
     mem_free(device);
 }
 
-#ifdef CONFIG_ML_EXIT_NODE_IPV6
-/* Forwarding IPv6 as an exit node: built in, offering 0.0.0.0/0, and the
- * control plane gave us a tailnet IPv6 address. */
-static bool exit6_active(const microlink_t *ml) {
-    return ml->has_vpn_ip6 && ml_routes_is_exit_node(ml->routes, ml->route_count);
+#ifdef CONFIG_ML_ROUTER_IPV6
+static bool exit_node(const microlink_t *ml) {
+    return ml_routes_is_exit_node(ml->routes, ml->route_count);
+}
+/* Forwarding IPv6: built in, an exit node or IPv6 routes, and the control
+ * plane gave us a tailnet IPv6 address. */
+static bool v6fwd_active(const microlink_t *ml) {
+    return ml->has_vpn_ip6 && (exit_node(ml) || ml->route6_count > 0);
 }
 #endif
 
 /* Add the peer's tailnet IPv6 /128 to its WireGuard peer (exit node only),
  * so its IPv6 passes the inner-source check and replies find it. */
 static void wg_peer_sync_ip6(microlink_t *ml, ml_peer_t *p) {
-#ifdef CONFIG_ML_EXIT_NODE_IPV6
-    if (!exit6_active(ml) || !p->has_ip6 || p->ip6_installed || p->wg_peer_index < 0 || !ml->wg_netif) return;
+#ifdef CONFIG_ML_ROUTER_IPV6
+    if (!v6fwd_active(ml) || !p->has_ip6 || p->ip6_installed || p->wg_peer_index < 0 || !ml->wg_netif) return;
     ip_addr_t ip, mask;
     memset(&ip, 0, sizeof(ip));
     memset(&mask, 0, sizeof(mask));
@@ -548,9 +557,13 @@ static bool wg_filter_rx_cb(void *ctx, const uint8_t *pkt, size_t len) {
     bool v6 = ml->has_vpn_ip6;
     if (self != ml->filter_local_ip || v6 != ml->filter_local_ip6) {
         ml_filter_set_local(self, ml->routes, ml->route_count);
-#ifdef CONFIG_ML_EXIT_NODE_IPV6
-        /* IPv6 is only set up on the WG netif for an exit node */
-        ml_filter_set_local6(exit6_active(ml) ? ml->vpn_ip6 : NULL, exit6_active(ml));
+#ifdef CONFIG_ML_ROUTER_IPV6
+        /* IPv6 is only set up on the WG netif when we forward it */
+        if (v6fwd_active(ml)) {
+            ml_filter_set_local6(ml->vpn_ip6, exit_node(ml), ml->routes6, ml->route6_count);
+        } else {
+            ml_filter_set_local6(NULL, false, NULL, 0);
+        }
 #endif
         ml->filter_local_ip = self;
         ml->filter_local_ip6 = v6;
@@ -617,8 +630,8 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
     {
         wg_netif_up_ctx_t ctx = { .netif = netif, .done = xSemaphoreCreateBinary(),
                                   .napt = ml->route_count > 0, .napt_failed = false };
-#ifdef CONFIG_ML_EXIT_NODE_IPV6
-        if (exit6_active(ml)) {
+#ifdef CONFIG_ML_ROUTER_IPV6
+        if (v6fwd_active(ml)) {
             ctx.ip6 = true;
             memcpy(ctx.ip6addr, ml->vpn_ip6, 16);
             /* NAT66 needs a global address on the LAN side: make sure SLAAC
@@ -631,7 +644,7 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
                     esp_netif_create_ip6_linklocal(lan);
                 }
             }
-            ESP_LOGI(TAG, "Exit node: forwarding IPv6 too (NAT66)");
+            ESP_LOGI(TAG, "Forwarding IPv6 (NAT66)%s", exit_node(ml) ? " as exit node" : "");
         }
 #endif
         if (!ctx.done) {

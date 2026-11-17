@@ -82,6 +82,8 @@ static int        s_nlocal_routes;
 static uint8_t    s_self6[16];
 static bool       s_self6_set;                  /* false: no IPv6 accepted at all */
 static bool       s_exit6;                      /* forward IPv6 to the internet (exit node) */
+static ml_route6_t s_local_routes6[ML_MAX_ROUTES];
+static int        s_nlocal_routes6;
 
 /* ------------------------------------------------------------------------ */
 
@@ -369,14 +371,19 @@ void ml_filter_reset(void) {
     s_nlocal_routes = 0;
     s_self6_set = false;
     s_exit6 = false;
+    s_nlocal_routes6 = 0;
     FLT_UNLOCK();
 }
 
-void ml_filter_set_local6(const uint8_t self6[16], bool exit_node) {
+void ml_filter_set_local6(const uint8_t self6[16], bool exit_node, const ml_route6_t *routes, int n) {
+    if (n < 0 || !routes || !self6) n = 0;
+    if (n > ML_MAX_ROUTES) n = ML_MAX_ROUTES;
     FLT_LOCK();
     s_self6_set = self6 != NULL;
     if (self6) memcpy(s_self6, self6, 16);
     s_exit6 = self6 != NULL && exit_node;
+    if (n) memcpy(s_local_routes6, routes, (size_t)n * sizeof(ml_route6_t));
+    s_nlocal_routes6 = n;
     FLT_UNLOCK();
 }
 
@@ -584,7 +591,10 @@ static bool check_inbound6(const uint8_t *pkt, size_t len) {
     const uint8_t *src = pkt + 8, *dst = pkt + 24;
 
     FLT_LOCK();
-    bool local = s_self6_set && (memcmp(dst, s_self6, 16) == 0 || (s_exit6 && ip6_forwardable(dst)));
+    bool local = s_self6_set &&
+                 (memcmp(dst, s_self6, 16) == 0 ||
+                  (ip6_forwardable(dst) &&
+                   (s_exit6 || ml_routes6_contain(s_local_routes6, s_nlocal_routes6, dst))));
     if (!local) s_stats.dropped++;
     FLT_UNLOCK();
     if (!local) return false;

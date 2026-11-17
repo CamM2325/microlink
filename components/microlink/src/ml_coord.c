@@ -1062,12 +1062,17 @@ static void add_hostinfo(microlink_t *ml, cJSON *root) {
         cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
     }
 
-    if (ml->route_count > 0) {
+    if (ml->route_count > 0 || ml->route6_count > 0) {
         cJSON *routes = cJSON_CreateArray();
         if (routes) {
             for (int i = 0; i < ml->route_count; i++) {
                 char cidr[20];
                 ml_routes_format(&ml->routes[i], cidr, sizeof(cidr));
+                cJSON_AddItemToArray(routes, cJSON_CreateString(cidr));
+            }
+            for (int i = 0; i < ml->route6_count; i++) {
+                char cidr[48];
+                ml_routes6_format(&ml->routes6[i], cidr, sizeof(cidr));
                 cJSON_AddItemToArray(routes, cJSON_CreateString(cidr));
             }
             /* Tailscale treats a node as an exit node only when it

@@ -123,6 +123,41 @@ int main(void) {
     }
     CHECK(ml_nat66_count(1000) == ML_NAT66_SLOTS);
 
+    /* Source scope: a global destination needs a global source. */
+    {
+        uint8_t g[16], ula[16], ll[16], dg[16], du[16];
+        a6("2601:483:4001:fc7b::99", g); a6("fd12::99", ula); a6("fe80::99", ll);
+        a6(SERVER, dg); a6("fd12::1", du);
+        CHECK(ml_nat66_source_ok(g, dg));
+        CHECK(!ml_nat66_source_ok(ula, dg));
+        CHECK(!ml_nat66_source_ok(ll, dg));
+        CHECK(ml_nat66_source_ok(ula, du));
+        CHECK(ml_nat66_source_ok(g, du));
+        CHECK(!ml_nat66_source_ok(ll, du));
+    }
+
+    /* ICMPv6 "no route" back to the peer. */
+    {
+        uint8_t self6[16], out[1280], client[16];
+        a6("fd7a:115c:a1e0::1", self6); a6(CLIENT, client);
+        n = build(b, 6, CLIENT, SERVER, 5555, 443, 0);
+        size_t m = ml_nat66_unreachable(b, n, self6, out, sizeof(out));
+        CHECK(m == 48 + n);
+        CHECK(out[6] == 58 && out[40] == 1 && out[41] == 0);
+        CHECK(memcmp(out + 8, self6, 16) == 0 && memcmp(out + 24, client, 16) == 0);
+        CHECK(memcmp(out + 48, b, n) == 0);
+        CHECK(csum6(out, m) == 0);
+        n = build(b, 58, CLIENT, SERVER, 1, 0, 128);              /* echo request: answered */
+        CHECK(ml_nat66_unreachable(b, n, self6, out, sizeof(out)) > 0);
+        n = build(b, 58, CLIENT, SERVER, 1, 0, 1);                /* an error: never answered */
+        CHECK(ml_nat66_unreachable(b, n, self6, out, sizeof(out)) == 0);
+        CHECK(ml_nat66_unreachable(b, 30, self6, out, sizeof(out)) == 0);
+        static uint8_t big[1500];                                  /* quoted part is capped */
+        memcpy(big, b, n);
+        big[4] = (uint8_t)((1500 - 40) >> 8); big[5] = (uint8_t)(1500 - 40); big[6] = 17;
+        CHECK(ml_nat66_unreachable(big, sizeof(big), self6, out, sizeof(out)) == 1280);
+    }
+
     if (failures) { fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
     printf("all NAT66 tests passed\n");
     return 0;

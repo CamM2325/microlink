@@ -184,26 +184,30 @@ menu "MicroLink V2 Configuration"
         depends on ML_SUBNET_ROUTER
         default ""
         help
-            IPv4 CIDRs separated by commas, e.g. "192.168.1.0/24". Add
-            "0.0.0.0/0" to offer the device as an exit node. Up to 8.
+            Prefixes separated by commas, e.g. "192.168.1.0/24" or
+            "fd12:3456::/64" (IPv6 needs ML_ROUTER_IPV6). Add "0.0.0.0/0" to
+            offer the device as an exit node. Up to 8 of each family.
 
-    config ML_EXIT_NODE_IPV6
-        bool "Exit node: forward IPv6 too (NAT66)"
-        depends on ML_SUBNET_ROUTER && LWIP_IPV6 && LWIP_HOOK_IP6_INPUT_CUSTOM
+    config ML_ROUTER_IPV6
+        bool "Forward IPv6: exit node and IPv6 subnet routes (NAT66)"
+        depends on ML_SUBNET_ROUTER && LWIP_IPV6 && (LWIP_HOOK_IP6_INPUT_DEFAULT || LWIP_HOOK_IP6_INPUT_CUSTOM)
         default y
         select LWIP_IPV6_FORWARD
         select LWIP_IPV6_AUTOCONFIG
         help
-            An exit node advertises ::/0 next to 0.0.0.0/0 (Tailscale needs
-            both). With this, it also forwards its clients' IPv6: the device
-            takes its tailnet IPv6 address, gets a global address on the LAN
-            by SLAAC, and masquerades peers' traffic behind it (NAT66), as
-            Linux exit nodes do. Without a global IPv6 address on the LAN,
-            clients get "no route" (ICMPv6) and fall back to IPv4 at once.
+            Forward peers' IPv6 for an exit node (which advertises ::/0 next
+            to 0.0.0.0/0, as Tailscale needs both) and for IPv6 prefixes in
+            ML_ADVERTISE_ROUTES. The device takes its tailnet IPv6 address,
+            gets an address on the LAN by SLAAC and masquerades peers'
+            traffic behind it (NAT66), as Linux exit nodes and subnet routers
+            do. When the LAN has no address that can reach a destination
+            (e.g. no IPv6 there at all), the peer gets ICMPv6 "no route" and
+            falls back to IPv4 at once.
 
-            Needs lwIP's IPv6 input hook set to "Custom implementation"
-            (LWIP_HOOK_IP6_INPUT_CUSTOM): MicroLink provides
-            lwip_hook_ip6_input(), so the application must not.
+            Needs lwIP's IPv6 input hook (LWIP_HOOK_IP6_INPUT) set to
+            "Default (weak)" or "Custom": MicroLink provides
+            lwip_hook_ip6_input(). An application that needs the hook too
+            defines microlink_ip6_input_hook() instead (see microlink.h).
 
     config ML_OTA_ROLLBACK
         bool "Keep an OTA-updated firmware only once it connects"

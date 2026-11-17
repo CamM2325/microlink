@@ -41,11 +41,24 @@ int ml_nat66_in(uint8_t *pkt, size_t len, uint32_t now_ms);
 /* Number of mappings in use (for tests and diagnostics). */
 int ml_nat66_count(uint32_t now_ms);
 
+/* Whether src can stand in for a peer talking to dst: its scope must reach
+ * dst's (a global destination needs a global address; a unique-local one a
+ * unique-local or global address) and it must not be link-local. */
+bool ml_nat66_source_ok(const uint8_t src[16], const uint8_t dst[16]);
+
+/* The ICMPv6 Destination Unreachable, code 0 "no route" (RFC 4443 3.1), a
+ * router sends back for pkt: from `from` to pkt's source, quoting as much
+ * of pkt as fits in 1280 bytes. Returns its length (written to out), or 0
+ * when nothing is to be sent (pkt is an ICMPv6 error itself, or malformed). */
+size_t ml_nat66_unreachable(const uint8_t *pkt, size_t len, const uint8_t from[16],
+                            uint8_t *out, size_t out_max);
+
 #ifdef ESP_PLATFORM
 struct netif;
-/* Translate between this WireGuard netif and the LAN (tcpip_thread only).
- * NULL detaches and clears the table. */
-void ml_nat66_attach(struct netif *wg_netif);
+/* Translate between this WireGuard netif, whose tailnet IPv6 address is
+ * self6, and the LAN (tcpip_thread only). NULL detaches and clears the
+ * table. */
+void ml_nat66_attach(struct netif *wg_netif, const uint8_t self6[16]);
 #endif
 
 #ifdef __cplusplus

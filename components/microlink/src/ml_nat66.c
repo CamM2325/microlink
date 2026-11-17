@@ -175,6 +175,53 @@ int ml_nat66_in(uint8_t *pkt, size_t len, uint32_t now) {
     return 0;
 }
 
+/* 3 global (and anything else routable), 2 unique local, 1 link-local */
+static int scope6(const uint8_t a[16]) {
+    if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80) return 1;
+    if ((a[0] & 0xfe) == 0xfc) return 2;
+    return 3;
+}
+
+bool ml_nat66_source_ok(const uint8_t src[16], const uint8_t dst[16]) {
+    static const uint8_t zero[16] = { 0 };
+    if (memcmp(src, zero, 16) == 0 || src[0] == 0xff) return false;
+    int s = scope6(src);
+    return s >= 2 && s >= scope6(dst);
+}
+
+/* Full ICMPv6 checksum over the pseudo-header and message. */
+static uint16_t icmp6_checksum(const uint8_t *pkt, size_t len) {
+    uint32_t sum = 0;
+    for (int i = 8; i < 40; i += 2) sum += rd16(pkt + i);
+    uint32_t plen = (uint32_t)(len - 40);
+    sum += (plen >> 16) + (plen & 0xFFFF) + NH_ICMP6;
+    for (size_t i = 40; i < len; i += 2) sum += (uint32_t)(pkt[i] << 8 | (i + 1 < len ? pkt[i + 1] : 0));
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+size_t ml_nat66_unreachable(const uint8_t *pkt, size_t len, const uint8_t from[16],
+                            uint8_t *out, size_t out_max) {
+    if (len < 40 || (pkt[0] >> 4) != 6) return 0;
+    if (pkt[6] == NH_ICMP6 && (len < 41 || pkt[40] < 128)) return 0;   /* never answer an error */
+    size_t quote = len;
+    if (quote > 1280 - 48) quote = 1280 - 48;
+    size_t n = 48 + quote;
+    if (n > out_max) return 0;
+    memset(out, 0, 48);
+    out[0] = 0x60;
+    wr16(out + 4, (uint16_t)(n - 40));
+    out[6] = NH_ICMP6;
+    out[7] = 64;
+    memcpy(out + 8, from, 16);
+    memcpy(out + 24, pkt + 8, 16);           /* back to the sender */
+    out[40] = 1;                             /* Destination Unreachable */
+    out[41] = 0;                             /* no route to destination */
+    memcpy(out + 48, pkt, quote);
+    wr16(out + 42, icmp6_checksum(out, n));
+    return n;
+}
+
 int ml_nat66_count(uint32_t now) {
     int n = 0;
     for (int i = 0; i < ML_NAT66_SLOTS; i++) n += live(&s_slots[i], now);
@@ -188,17 +235,53 @@ int ml_nat66_count(uint32_t now) {
 #include "sdkconfig.h"
 #endif
 
-#if defined(ESP_PLATFORM) && defined(CONFIG_ML_EXIT_NODE_IPV6)
+#if defined(ESP_PLATFORM) && defined(CONFIG_ML_ROUTER_IPV6)
 #include "lwip/ip6.h"
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
 #include "lwip/sys.h"
 
 static struct netif *s_wg;
+static uint8_t s_self6[16];
+static uint8_t s_icmp_buf[1280];         /* tcpip_thread only */
+static uint32_t s_icmp_window_ms;
+static int s_icmp_in_window;
 
-void ml_nat66_attach(struct netif *wg_netif) {
+void ml_nat66_attach(struct netif *wg_netif, const uint8_t self6[16]) {
     s_wg = wg_netif;
+    if (self6) memcpy(s_self6, self6, 16);
     ml_nat66_reset();
+}
+
+/* Applications that need lwIP's IPv6 input hook themselves define this
+ * instead of lwip_hook_ip6_input() (which MicroLink provides); it sees every
+ * packet MicroLink did not consume, after translation. */
+int __attribute__((weak)) microlink_ip6_input_hook(struct pbuf *p, struct netif *inp) {
+    (void)p;
+    (void)inp;
+    return 0;
+}
+
+/* Answer a packet we cannot forward with ICMPv6 "no route", so the peer's
+ * stack fails at once (and falls back to IPv4) instead of timing out.
+ * At most 10 per second. */
+static void send_no_route(struct netif *wg, const uint8_t *pkt, size_t len) {
+    uint32_t now = sys_now();
+    if ((uint32_t)(now - s_icmp_window_ms) >= 1000) {
+        s_icmp_window_ms = now;
+        s_icmp_in_window = 0;
+    }
+    if (++s_icmp_in_window > 10) return;
+    size_t n = ml_nat66_unreachable(pkt, len, s_self6, s_icmp_buf, sizeof(s_icmp_buf));
+    if (!n) return;
+    struct pbuf *q = pbuf_alloc(PBUF_RAW, (u16_t)n, PBUF_RAM);
+    if (!q) return;
+    memcpy(q->payload, s_icmp_buf, n);
+    ip6_addr_t dst;
+    memset(&dst, 0, sizeof(dst));
+    memcpy(dst.addr, s_icmp_buf + 24, 16);
+    wg->output_ip6(wg, q, &dst);
+    pbuf_free(q);
 }
 
 /* Same rule as the packet filter's: not the tailnet range, link-local,
@@ -220,28 +303,36 @@ static bool forwardable(const uint8_t a[16]) {
  * into the tunnel. */
 int lwip_hook_ip6_input(struct pbuf *p, struct netif *inp) {
     struct netif *wg = s_wg;
-    if (!wg || !p || p->len < 40) return 0;
+    if (!wg || !p || p->len < 40) return microlink_ip6_input_hook(p, inp);
     uint8_t *pkt = (uint8_t *)p->payload;
     uint32_t now = sys_now();
 
     if (inp == wg) {
-        if (!forwardable(pkt + 24)) return 0;   /* to us or within the tailnet */
-        ip6_addr_t dst;
-        memcpy(dst.addr, pkt + 24, 16);
-#if LWIP_IPV6_SCOPES
-        dst.zone = IP6_NO_ZONE;
-#endif
-        struct netif *out = ip6_route(IP6_ADDR_ANY6, &dst);
-        if (!out || out == wg) return 0;        /* no route: ip6_forward answers ICMPv6 unreachable */
-        const ip_addr_t *src = ip6_select_source_address(out, &dst);
-        if (!src) return 0;
-        if (ml_nat66_out(pkt, p->len, (const uint8_t *)ip_2_ip6(src)->addr, now) != 0) {
-            pbuf_free(p);                       /* not translatable: never leak a tailnet source */
-            return 1;
+        if (forwardable(pkt + 24)) {
+            /* The packet filter already checked that we forward to this
+             * destination (exit node, or an advertised IPv6 route). */
+            ip6_addr_t dst;
+            memset(&dst, 0, sizeof(dst));
+            memcpy(dst.addr, pkt + 24, 16);
+            /* lwIP falls back to the default interface and to a link-local
+             * source when there is nothing better: forwarding then would
+             * only lose the packet on the LAN. Require a LAN address whose
+             * scope reaches the destination, else answer "no route". */
+            struct netif *out = ip6_route(IP6_ADDR_ANY6, &dst);
+            const ip_addr_t *src = (out && out != wg) ? ip6_select_source_address(out, &dst) : NULL;
+            if (!src || !ml_nat66_source_ok((const uint8_t *)ip_2_ip6(src)->addr, pkt + 24)) {
+                send_no_route(wg, pkt, p->len);
+                pbuf_free(p);
+                return 1;
+            }
+            if (ml_nat66_out(pkt, p->len, (const uint8_t *)ip_2_ip6(src)->addr, now) != 0) {
+                pbuf_free(p);                   /* not translatable: never leak a tailnet source */
+                return 1;
+            }
         }
-        return 0;
+    } else {
+        ml_nat66_in(pkt, p->len, now);
     }
-    ml_nat66_in(pkt, p->len, now);
-    return 0;
+    return microlink_ip6_input_hook(p, inp);
 }
 #endif
