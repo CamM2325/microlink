@@ -261,6 +261,10 @@ For cellular-only apps, call `ml_cellular_init()` and `ml_cellular_connect()` be
 
 PPP uses CHAP when credentials are set, otherwise PAP with empty credentials.
 
+The examples ship with an empty APN (the network's default). Set `CONFIG_ML_CELLULAR_APN` to your
+carrier's APN (in `sdkconfig.credentials`, menuconfig or the config UI) if PPP times out waiting for
+IPCP.
+
 ### WiFi ⇄ cellular failover
 
 With `CONFIG_ML_ENABLE_NET_SWITCH`, `ml_net_switch_init()`/`ml_net_switch_start()` (see
