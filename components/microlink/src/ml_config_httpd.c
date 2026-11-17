@@ -457,14 +457,46 @@ static bool ct_equal(const char *a, const char *b) {
     return diff == 0;
 }
 
-static bool local_addr_allowed(httpd_req_t *req) {
+/* The IPv4 address (host byte order) the request arrived on.
+ *
+ * With CONFIG_LWIP_IPV6 (the ESP-IDF default) esp_http_server listens on an
+ * AF_INET6 socket bound to in6addr_any, and lwIP reports connections that
+ * came in over IPv4 as IPv4-mapped IPv6 addresses (::ffff:a.b.c.d). Those
+ * are unwrapped here. Native IPv6 is not accepted: MicroLink only assigns
+ * the device an IPv4 tailnet address (no fd7a:115c:a1e0::/48 address is
+ * configured on the WireGuard netif), so a native IPv6 connection can only
+ * have come in over a LAN or carrier interface. */
+static bool request_local_ipv4(httpd_req_t *req, uint32_t *ip_out) {
     int fd = httpd_req_to_sockfd(req);
     struct sockaddr_storage ss;
     socklen_t sl = sizeof(ss);
-    if (getsockname(fd, (struct sockaddr *)&ss, &sl) != 0 || ss.ss_family != AF_INET) {
+    if (getsockname(fd, (struct sockaddr *)&ss, &sl) != 0) {
         return false;
     }
-    uint32_t ip = ntohl(((struct sockaddr_in *)&ss)->sin_addr.s_addr);
+    if (ss.ss_family == AF_INET) {
+        *ip_out = ntohl(((struct sockaddr_in *)&ss)->sin_addr.s_addr);
+        return true;
+    }
+#if LWIP_IPV6
+    if (ss.ss_family == AF_INET6) {
+        const uint8_t *a = (const uint8_t *)&((struct sockaddr_in6 *)&ss)->sin6_addr;
+        static const uint8_t v4mapped_prefix[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+        if (memcmp(a, v4mapped_prefix, sizeof(v4mapped_prefix)) != 0) {
+            return false;
+        }
+        *ip_out = ((uint32_t)a[12] << 24) | ((uint32_t)a[13] << 16) |
+                  ((uint32_t)a[14] << 8) | (uint32_t)a[15];
+        return true;
+    }
+#endif
+    return false;
+}
+
+static bool local_addr_allowed(httpd_req_t *req) {
+    uint32_t ip;
+    if (!request_local_ipv4(req, &ip)) {
+        return false;
+    }
     bool tailnet = (ip & 0xFFC00000u) == 0x64400000u;  /* 100.64.0.0/10 */
 #if CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN
     bool lan = ((ip >> 24) == 10) || ((ip >> 16) == 0xC0A8) || (((ip >> 16) & 0xFFF0) == 0xAC10);
