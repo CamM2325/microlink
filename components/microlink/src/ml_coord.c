@@ -272,12 +272,12 @@ static int noise_send(microlink_t *ml, ml_noise_state_t *noise,
     return ret;
 }
 
-/* Receive and decrypt a Noise transport frame, returns plaintext length.
- * On -1, errno is EAGAIN only when nothing was consumed (no data yet); every
- * protocol error sets a different errno, since the stream is unusable then. */
-static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
-                        uint8_t *plaintext, size_t max_len) {
-    /* Read 3-byte frame header */
+/* Read and check a Noise transport frame header: [0x04][len_hi][len_lo].
+ * Returns the ciphertext length (>= 16) that noise_recv_payload() must read
+ * next, or -1. On -1, errno is EAGAIN only when nothing was consumed (no
+ * data yet); every protocol error sets a different errno, since the stream
+ * is unusable then. */
+static int noise_recv_header(microlink_t *ml) {
     uint8_t hdr[3];
     if (coord_recv(ml, hdr, 3) < 0) return -1;
 
@@ -293,13 +293,15 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
         errno = EBADMSG;
         return -1;
     }
-    size_t pt_len = ct_len - 16;
-    if (pt_len > max_len) {
-        ESP_LOGE(TAG, "Noise frame too large: %d > %d", (int)pt_len, (int)max_len);
-        errno = EMSGSIZE;
-        return -1;
-    }
+    return ct_len;
+}
 
+/* Read the ct_len-byte payload of the frame whose header noise_recv_header()
+ * just consumed and decrypt it into plaintext (room for ct_len - 16 bytes).
+ * Returns the plaintext length, or -1: always a hard error (errno != EAGAIN). */
+static int noise_recv_payload(microlink_t *ml, ml_noise_state_t *noise,
+                               uint16_t ct_len, uint8_t *plaintext) {
+    size_t pt_len = ct_len - 16;
     uint8_t *ciphertext = ml_psram_malloc(ct_len);
     if (!ciphertext) {
         errno = ENOMEM;
@@ -328,6 +330,20 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
 
     free(ciphertext);
     return (int)pt_len;
+}
+
+/* Receive and decrypt a Noise transport frame, returns plaintext length.
+ * On -1, errno is EAGAIN only when nothing was consumed (no data yet). */
+static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
+                        uint8_t *plaintext, size_t max_len) {
+    int ct_len = noise_recv_header(ml);
+    if (ct_len < 0) return -1;
+    if ((size_t)ct_len - 16 > max_len) {
+        ESP_LOGE(TAG, "Noise frame too large: %d > %d", ct_len - 16, (int)max_len);
+        errno = EMSGSIZE;
+        return -1;
+    }
+    return noise_recv_payload(ml, noise, (uint16_t)ct_len, plaintext);
 }
 
 /* ============================================================================
@@ -2579,7 +2595,10 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
  * dropped (or worse, misparsed) while the device still reported CONNECTED.
  * Owned by the coord task only.
  * -------------------------------------------------------------------------- */
-#define LP_NOISE_CHUNK   65536u
+/* HTTP/2's default SETTINGS_MAX_FRAME_SIZE. The H2 preface never raises
+ * it, so a server must not send a larger frame (RFC 7540 4.2); a larger
+ * length means the stream is misaligned, not a big frame to buffer. */
+#define LP_H2_MAX_FRAME  16384u
 
 static struct {
     uint8_t *h2;   size_t h2_len,  h2_cap;    /* undecoded H2 bytes */
@@ -2592,10 +2611,13 @@ static void lp_reset(void) {
     memset(&s_lp, 0, sizeof(s_lp));
 }
 
-static bool lp_reserve(uint8_t **buf, size_t *cap, size_t need) {
-    if (need <= *cap) return true;
+/* Grow *buf to hold at least need bytes: doubling from 8 KB, but never past
+ * limit (limit >= need) so the last step doesn't overshoot to twice that. */
+static bool lp_reserve(uint8_t **buf, size_t *cap, size_t need, size_t limit) {
+    if (need <= *cap && *buf) return true;
     size_t ncap = *cap ? *cap : 8192;
     while (ncap < need) ncap *= 2;
+    if (ncap > limit && need <= limit) ncap = limit;
     uint8_t *nb = ml_psram_malloc(ncap);
     if (!nb) return false;
     if (*buf) {
@@ -2675,19 +2697,29 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
     struct timeval tv_recv = { .tv_sec = 2, .tv_usec = 0 };
     ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &tv_recv, sizeof(tv_recv));
 
-    /* Decrypt the next Noise frame straight onto the end of the H2 buffer */
-    if (!lp_reserve(&s_lp.h2, &s_lp.h2_cap, s_lp.h2_len + LP_NOISE_CHUNK)) {
+    /* Read the Noise header first and reserve exactly what this frame
+     * needs (Go servers write frames of at most 4 KB). A fixed 64 KB
+     * headroom turned into a 128 KB contiguous block as soon as a partial
+     * H2 frame was buffered, which boards without PSRAM can't provide. */
+    int ct_len = noise_recv_header(ml);
+    if (ct_len < 0) {
+        /* EAGAIN/EWOULDBLOCK with nothing consumed = no data yet = not an error */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        lp_reset();
+        return -1;
+    }
+    size_t pt_len = (size_t)ct_len - 16;
+    if (!lp_reserve(&s_lp.h2, &s_lp.h2_cap, s_lp.h2_len + pt_len, SIZE_MAX)) {
         ESP_LOGE(TAG, "Long-poll: out of memory for H2 buffer");
         lp_reset();
         return -1;
     }
-    int frame_len = noise_recv(ml, noise, s_lp.h2 + s_lp.h2_len, LP_NOISE_CHUNK);
+    /* Decrypt the frame straight onto the end of the H2 buffer. The header
+     * is consumed, so any failure from here on is a hard error. */
+    int frame_len = noise_recv_payload(ml, noise, (uint16_t)ct_len, s_lp.h2 + s_lp.h2_len);
     if (frame_len <= 0) {
-        int saved_errno = errno;
-        /* EAGAIN/EWOULDBLOCK = no data yet = not an error */
-        if (frame_len < 0 && (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)) return 0;
         lp_reset();
-        return frame_len < 0 ? frame_len : -1;  /* error or connection closed */
+        return -1;  /* error, or an empty frame (as before) */
     }
     s_lp.h2_len += (size_t)frame_len;
 
@@ -2704,6 +2736,12 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
         uint8_t f_flags = fh[4];
         uint32_t f_stream = ((uint32_t)(fh[5] & 0x7F) << 24) | ((uint32_t)fh[6] << 16) |
                             ((uint32_t)fh[7] << 8) | fh[8];
+        if (f_len > LP_H2_MAX_FRAME) {
+            ESP_LOGE(TAG, "Long-poll: H2 frame length %lu over the %u limit; reconnecting",
+                     (unsigned long)f_len, (unsigned)LP_H2_MAX_FRAME);
+            lp_reset();
+            return -1;
+        }
         if (pos + 9 + f_len > s_lp.h2_len) break;  /* partial frame: wait for more */
         const uint8_t *payload = fh + 9;
 
@@ -2714,7 +2752,8 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
                 if (f_len > 0) {
                     size_t need = s_lp.msg_len + f_len + 1;
                     if (need > (size_t)ML_JSON_BUFFER_SIZE ||
-                        !lp_reserve(&s_lp.msg, &s_lp.msg_cap, need)) {
+                        !lp_reserve(&s_lp.msg, &s_lp.msg_cap, need,
+                                    (size_t)ML_JSON_BUFFER_SIZE)) {
                         ESP_LOGE(TAG, "Long-poll message exceeds %u KB buffer; reconnecting",
                                  (unsigned)(ML_JSON_BUFFER_SIZE / 1024));
                         lp_reset();
