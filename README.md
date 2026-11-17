@@ -237,8 +237,10 @@ ESP's 3V3 pin is not enough and causes registration failures. Attach the main LT
 - **PPP only**: lwIP gets a real network interface; direct peer-to-peer UDP is possible.
 - **AT socket only**: uses the modem's own TCP/IP stack; all VPN traffic is relayed through DERP.
   The UART stays in command mode, so your application can send its own AT commands with
-  `ml_cellular_send_at_cmd()` (single `AT+…` commands; commands that would break the bridge, such as
-  `+CIP*`, `+NET*`, `+CFUN` and `+IPR`, are refused).
+  `ml_cellular_send_at_cmd()`. While the bridge runs, only an allowlist of query/information and GNSS
+  commands is accepted (`AT+CSQ`, `AT+CPSI?`, `AT+CREG?`, `AT+CEREG?`, `AT+COPS?`, `AT+CCLK?`, `AT+CBC`,
+  `AT+CPMUTEMP`, `AT+CGMR`, `AT+CGPS=1`, `AT+CGPSINFO`, `AT+CGNSSINFO`, …); anything else could break the
+  bridge. The list is `s_bridge_allowed[]` in `ml_at_validate.c`.
 
 The UART runs at 115200 baud unless you set `ML_CELLULAR_FAST_BAUD` (e.g. 921600 with short wiring
 or flow control). If the modem was left at another rate, the driver detects it and resets it.
@@ -258,6 +260,10 @@ For cellular-only apps, call `ml_cellular_init()` and `ml_cellular_connect()` be
 | Soracom | `soracom.io` | CHAP `sora`/`sora` | Tested (Nov 2026, T-Mobile) |
 
 PPP uses CHAP when credentials are set, otherwise PAP with empty credentials.
+
+The examples ship with an empty APN (the network's default). Set `CONFIG_ML_CELLULAR_APN` to your
+carrier's APN (in `sdkconfig.credentials`, menuconfig or the config UI) if PPP times out waiting for
+IPCP.
 
 ### WiFi ⇄ cellular failover
 
@@ -293,9 +299,13 @@ Enable `CONFIG_ML_ENABLE_CONFIG_HTTPD` (off in all examples). The UI at `http://
 and lets you change the auth key, WiFi list, cellular settings, control host and a peer allowlist.
 
 - **Login**: HTTP Basic auth, user `admin`. Set `ML_CONFIG_HTTPD_PASSWORD`, or leave it empty and a
-  random password is generated on first boot, stored in NVS and printed once on the serial console.
-- **Reachable only on the tailnet address** unless `ML_CONFIG_HTTPD_ALLOW_LAN=y` (then the password
-  crosses the LAN unencrypted). Never on the cellular carrier address.
+  random password is generated on first boot, stored in NVS and printed once on the serial console
+  (a `Config UI password generated` warning). Remove that line from logs you share.
+- **Reachable only on the device's own tailnet (VPN) address** unless `ML_CONFIG_HTTPD_ALLOW_LAN=y`
+  (then also on the WiFi station / Ethernet interface's own address, and the password crosses the LAN
+  unencrypted). Never on the cellular (PPP) carrier address, even if the carrier hands out a 100.64/10
+  CGNAT address. Browse to the IP address itself (`http://100.x.y.z/`): requests whose `Host` header is
+  a host name are refused, which blocks DNS rebinding.
 - The **allowlist** is an access filter: peers not on it get no WireGuard tunnel to the device.
 
 ## Security

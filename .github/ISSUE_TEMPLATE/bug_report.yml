@@ -5,7 +5,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for the report! Please **remove auth keys, Wi-Fi passwords, SIM PINs and node keys** from logs before posting.
+        Thanks for the report! Please **remove auth keys, Wi-Fi passwords, SIM PINs, PPP credentials and node keys** from logs before posting.
+        Also remove or shorten to the last 4 digits: the modem **IMEI** and SIM **ICCID** (device names made from the IMEI, `<prefix>-<IMEI>`, contain it too), and the **config UI password** line ("Config UI password generated") if it appears. Tailnet host names and 100.x addresses can be replaced with placeholders.
   - type: input
     id: version
     attributes:

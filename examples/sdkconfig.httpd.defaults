@@ -1,0 +1,11 @@
+# MicroLink CI overlay: builds the config web UI (ml_config_httpd.c), which
+# every example leaves disabled. Used by the firmware-variants CI job:
+#
+#   cd examples/basic_connect
+#   idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;../sdkconfig.httpd.defaults" build
+#
+# CONFIG_LWIP_IPV6 stays at the ESP-IDF default (y): with it the HTTP server
+# listens on a dual-stack socket, the case that once made every request 403.
+# ALLOW_LAN is on so the LAN interface check is compiled too.
+CONFIG_ML_ENABLE_CONFIG_HTTPD=y
+CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN=y

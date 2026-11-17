@@ -66,8 +66,10 @@ CONFIG_ESP_CONSOLE_UART_NUM=0
 # MicroLink — cellular modem (board selected via menuconfig)
 CONFIG_ML_ENABLE_CELLULAR=y
 
-# Cellular APN (REQUIRED for PPP — without this, IPCP gets no response)
-# Google Fi: h2g2, Soracom: soracom.io, Teal: teal
+# Cellular APN: set your carrier's APN here, in sdkconfig.credentials, in
+# menuconfig or in the config UI. Empty = the network's default, which works
+# with many SIMs; if PPP gets no IPCP response, set the APN explicitly.
+# Examples: Soracom soracom.io, EIOT/BICS america.bics, Google Fi h2g2, Teal teal
 CONFIG_ML_CELLULAR_APN=""
 
 # Network switching (WiFi primary, cellular fallback)

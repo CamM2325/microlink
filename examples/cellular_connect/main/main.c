@@ -36,6 +36,7 @@
 #include "microlink.h"
 #include "microlink_internal.h"
 #include "ml_cellular.h"
+#include "ml_at_validate.h"
 #include "ml_config_httpd.h"
 
 static const char *TAG = "cell_main";
@@ -258,8 +259,11 @@ void app_main(void) {
     /* Print modem info */
     ml_cellular_info_t cell_info;
     ml_cellular_get_info(&cell_info);
-    ESP_LOGI(TAG, "Model: %s  IMEI: %s", cell_info.model, cell_info.imei);
-    ESP_LOGI(TAG, "ICCID: %s", cell_info.iccid);
+    /* Last 4 digits only: serial logs end up in bug reports */
+    char imei_masked[ML_AT_MASKED_ID_SIZE], iccid_masked[ML_AT_MASKED_ID_SIZE];
+    ESP_LOGI(TAG, "Model: %s  IMEI: %s", cell_info.model,
+             ml_at_mask_id(cell_info.imei, imei_masked, sizeof(imei_masked)));
+    ESP_LOGI(TAG, "ICCID: %s", ml_at_mask_id(cell_info.iccid, iccid_masked, sizeof(iccid_masked)));
     ESP_LOGI(TAG, "Operator: %s  Signal: %d (%d dBm)",
              cell_info.operator_name, cell_info.rssi, cell_info.rssi_dbm);
 

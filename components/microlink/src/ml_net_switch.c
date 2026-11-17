@@ -63,7 +63,8 @@ static const char *TAG = "ml_net_sw";
 
 /* microlink_stop() attempts (each up to CONFIG_ML_STOP_TIMEOUT_MS) before the
  * handle is destroyed (parked) anyway. The transport must not be torn down
- * under live MicroLink tasks: the AT socket bridge deletes its mutex. */
+ * under live MicroLink tasks: they would still be using its sockets (and,
+ * for PPP, the netif). */
 #define VPN_STOP_ATTEMPTS       6
 
 typedef struct {
@@ -263,6 +264,18 @@ static void wifi_stop(void)
 
 static esp_err_t cellular_start(void)
 {
+    /* A rejected SIM PIN is never retried (it would PUK-lock the SIM), so
+     * powering the modem up again is pointless until reboot. */
+    if (ml_cellular_sim_pin_blocked()) {
+        static bool logged;
+        if (!logged) {
+            ESP_LOGE(TAG, "Cellular disabled until reboot: SIM PIN rejected or attempts "
+                     "nearly used up (fix CONFIG_ML_CELLULAR_SIM_PIN)");
+            logged = true;
+        }
+        return ESP_ERR_NOT_ALLOWED;
+    }
+
     ESP_LOGI(TAG, "Starting cellular modem...");
 
     ml_cellular_config_t cell_config = {
@@ -273,14 +286,15 @@ static esp_err_t cellular_start(void)
         .sim_pin = s_ctx.sim_pin[0] ? s_ctx.sim_pin : NULL,
     };
 
-    /* Apply APN: NVS (web UI) > config struct > Kconfig */
-    static char nvs_apn[32] = "";
+    /* Apply APN: NVS (web UI) > config struct > Kconfig.
+     * ml_cellular_init() copies the strings, so these can be locals. */
+    char nvs_apn[ML_AT_APN_MAX + 1] = "";
     if (ml_config_get_nvs_apn(nvs_apn, sizeof(nvs_apn))) {
         cell_config.apn = nvs_apn;
     }
 
     /* Apply PPP credentials: NVS (web UI) > Kconfig */
-    char nvs_ppp_user[32] = "", nvs_ppp_pass[32] = "";
+    char nvs_ppp_user[ML_AT_CRED_MAX + 1] = "", nvs_ppp_pass[ML_AT_CRED_MAX + 1] = "";
     if (ml_config_get_nvs_ppp(nvs_ppp_user, sizeof(nvs_ppp_user),
                                nvs_ppp_pass, sizeof(nvs_ppp_pass))) {
         cell_config.ppp_user = nvs_ppp_user;
@@ -293,6 +307,8 @@ static esp_err_t cellular_start(void)
     }
 
     esp_err_t err = ml_cellular_init(&cell_config);
+    ml_at_secure_zero(nvs_ppp_user, sizeof(nvs_ppp_user));
+    ml_at_secure_zero(nvs_ppp_pass, sizeof(nvs_ppp_pass));
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Cellular init failed: %s", esp_err_to_name(err));
         return err;
@@ -897,7 +913,11 @@ ml_net_switch_state_t ml_net_switch_get_state(void)
 
 microlink_t *ml_net_switch_get_handle(void)
 {
-    return s_ctx.ml;
+    if (!s_ml_lock) return NULL;
+    xSemaphoreTake(s_ml_lock, portMAX_DELAY);
+    microlink_t *ml = s_ctx.ml;
+    xSemaphoreGive(s_ml_lock);
+    return ml;
 }
 
 const char *ml_net_switch_state_str(ml_net_switch_state_t state)

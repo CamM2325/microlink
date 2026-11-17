@@ -144,21 +144,80 @@ bool ml_at_cmd_is_safe(const char *cmd, size_t maxlen)
     return true;
 }
 
-/* Extended commands that would disturb the AT socket bridge or the UART */
-static const char *const s_bridge_denied[] = {
-    "+CIP",     /* sockets owned by the bridge (CIPOPEN/CIPSEND/CIPRXGET/...) */
-    "+NET",     /* NETOPEN/NETCLOSE: the bridge's PDP/network session */
-    "+CDNS",    /* DNS is done by the bridge */
-    "+IPR",     /* baud rate */
-    "+ICF",     /* character framing */
-    "+IFC",     /* flow control */
-    "+CFUN",    /* radio / modem reset */
-    "+CMUX",    /* multiplexer mode */
-    "+CGACT",   /* PDP context used by the bridge */
-    "+CRESET",
-    "+CPOF",
-    "+CSCLK",   /* UART sleep */
+/* Application commands allowed while the AT socket bridge owns the modem:
+ * an allowlist of query/information commands (plus GNSS control), because
+ * almost anything else can break the bridge: detach or re-register
+ * (+CGATT, +COPS, +CNMP, +CGDCONT), move URCs off the UART (+CATR), power
+ * saving (+CPSMS, +CSCLK), prompt modes that swallow the following bridge
+ * commands (+CMGS, +HTTPDATA, ...), SIM lock (+CLCK), baud/framing, the
+ * bridge's own sockets and PDP context.
+ *
+ * To allow another command, add its name (without "AT+") and the forms it
+ * may be sent in. Names match exactly (case-insensitive). */
+enum {
+    AT_FORM_EXEC = 1 << 0,  /* AT+NAME       */
+    AT_FORM_READ = 1 << 1,  /* AT+NAME?      */
+    AT_FORM_TEST = 1 << 2,  /* AT+NAME=?     */
+    AT_FORM_SET  = 1 << 3,  /* AT+NAME=args  */
 };
+#define AT_FORM_Q   (AT_FORM_READ | AT_FORM_TEST)
+
+static const struct {
+    const char *name;
+    unsigned char forms;
+} s_bridge_allowed[] = {
+    /* Identification */
+    { "CGMI", AT_FORM_EXEC | AT_FORM_TEST },
+    { "CGMM", AT_FORM_EXEC | AT_FORM_TEST },
+    { "CGMR", AT_FORM_EXEC | AT_FORM_TEST },
+    { "CGSN", AT_FORM_EXEC | AT_FORM_TEST },
+    { "GMI",  AT_FORM_EXEC },
+    { "GMM",  AT_FORM_EXEC },
+    { "GMR",  AT_FORM_EXEC },
+    { "GSN",  AT_FORM_EXEC },
+    { "CIMI", AT_FORM_EXEC | AT_FORM_TEST },
+    { "CICCID", AT_FORM_EXEC | AT_FORM_TEST },
+    { "SIMCOMATI", AT_FORM_EXEC },
+    { "CSUB", AT_FORM_EXEC },
+    { "CNUM", AT_FORM_EXEC | AT_FORM_TEST },
+    /* Signal, registration and network state (read only) */
+    { "CSQ",   AT_FORM_EXEC | AT_FORM_TEST },
+    { "CPSI",  AT_FORM_Q },
+    { "CREG",  AT_FORM_Q },
+    { "CEREG", AT_FORM_Q },
+    { "CGREG", AT_FORM_Q },
+    { "COPS",  AT_FORM_Q },
+    { "CNSMOD", AT_FORM_Q },
+    { "CNMP",  AT_FORM_Q },
+    { "CGATT", AT_FORM_Q },
+    { "CGACT", AT_FORM_Q },
+    { "CGDCONT", AT_FORM_Q },
+    { "CGPADDR", AT_FORM_EXEC | AT_FORM_TEST | AT_FORM_SET },  /* =<cid> is a query */
+    { "CPIN",  AT_FORM_Q },
+    /* Clock, supply voltage, temperature */
+    { "CCLK",  AT_FORM_Q },
+    { "CBC",   AT_FORM_EXEC | AT_FORM_TEST },
+    { "CPMUTEMP", AT_FORM_EXEC | AT_FORM_TEST },
+    /* GNSS (SIM7600: +CGPS*, A76xx/SIM767x: +CGNSS*). Periodic NMEA output
+     * to the UART (+CGPSINFO=<n>, +CGNSSINFO=<n>, +CGNSSTST) is not allowed. */
+    { "CGPS",      AT_FORM_Q | AT_FORM_SET },
+    { "CGPSINFO",  AT_FORM_EXEC | AT_FORM_TEST },
+    { "CGPSCOLD",  AT_FORM_EXEC },
+    { "CGPSWARM",  AT_FORM_EXEC },
+    { "CGPSHOT",   AT_FORM_EXEC },
+    { "CGPSAUTO",  AT_FORM_Q },
+    { "CGNSSPWR",  AT_FORM_Q | AT_FORM_SET },
+    { "CGNSSMODE", AT_FORM_Q | AT_FORM_SET },
+    { "CGNSSINFO", AT_FORM_EXEC | AT_FORM_TEST },
+    { "CGNSINF",   AT_FORM_EXEC | AT_FORM_TEST },
+};
+
+/* Characters allowed in the argument list of an allowed set command:
+ * numbers, words and quoted strings, separated by ',' */
+static bool is_arg_char(char c)
+{
+    return is_alnum(c) || c == ',' || c == '.' || c == '-' || c == '"';
+}
 
 bool ml_at_cmd_allowed_with_bridge(const char *cmd)
 {
@@ -170,22 +229,53 @@ bool ml_at_cmd_allowed_with_bridge(const char *cmd)
     if (*rest == '\0') return true;
     if ((rest[0] == 'I' || rest[0] == 'i') && rest[1] == '\0') return true;
     if (rest[0] != '+') return false;
-    if (strchr(rest, ';')) return false;   /* no command concatenation */
+    rest++;
 
-    for (size_t i = 0; i < sizeof(s_bridge_denied) / sizeof(s_bridge_denied[0]); i++) {
-        if (starts_with_ci(rest, s_bridge_denied[i])) return false;
+    /* Command name: letters and digits only, so no space ("AT+ CFUN=0"),
+     * second '+' or other separator can hide another command */
+    const char *name = rest;
+    while (is_alnum(*rest)) rest++;
+    size_t name_len = (size_t)(rest - name);
+    if (name_len == 0) return false;
+
+    unsigned char form;
+    if (rest[0] == '\0') {
+        form = AT_FORM_EXEC;
+    } else if (rest[0] == '?' && rest[1] == '\0') {
+        form = AT_FORM_READ;
+    } else if (rest[0] == '=' && rest[1] == '?' && rest[2] == '\0') {
+        form = AT_FORM_TEST;
+    } else if (rest[0] == '=' && rest[1] != '\0') {
+        for (const char *p = rest + 1; *p; p++) {
+            if (!is_arg_char(*p)) return false;   /* no ';', '+', spaces, ... */
+        }
+        form = AT_FORM_SET;
+    } else {
+        return false;
     }
-    return true;
+
+    for (size_t i = 0; i < sizeof(s_bridge_allowed) / sizeof(s_bridge_allowed[0]); i++) {
+        const char *allowed = s_bridge_allowed[i].name;
+        if (strlen(allowed) == name_len && starts_with_ci(name, allowed)) {
+            return (s_bridge_allowed[i].forms & form) != 0;
+        }
+    }
+    return false;
 }
 
 /* ============================================================================
  * Log redaction
  * ========================================================================== */
 
-/* Commands whose arguments contain a PIN, PUK, password or raw SIM APDU */
+/* Commands whose arguments contain a PIN, PUK, password, raw SIM APDU or
+ * (application pass-through) a service login or a URL that may carry one */
 static const char *const s_secret_cmds[] = {
     "+CPIN=", "+CPIN2=", "+CPWD=", "+CLCK=", "+CGAUTH=", "+CSIM=", "+CRSM=",
     "+CPINR=", "+SPIC=",
+    /* SIMCom FTP(S), MQTT(S), HTTP(S), SSL and e-mail services */
+    "+CFTPLOGIN=", "+CFTPSLOGIN=", "+CFTPUN=", "+CFTPPW=",
+    "+CMQTTCONNECT=", "+CMQTTACCQ=", "+SMCONF=",
+    "+HTTPPARA=", "+CSSLCFG=", "+SMTPAUTH=", "+POP3IN=",
 };
 
 const char *ml_at_redact_cmd(const char *cmd, char *out, size_t out_size)
@@ -213,6 +303,25 @@ const char *ml_at_redact_cmd(const char *cmd, char *out, size_t out_size)
     if (cut) {
         const char *mask = "****";
         for (size_t i = 0; mask[i] && o + 1 < out_size; i++) out[o++] = mask[i];
+    }
+    out[o] = '\0';
+    return out;
+}
+
+const char *ml_at_mask_id(const char *id, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return out;
+    out[0] = '\0';
+    if (!id) return out;
+
+    size_t len = bounded_len(id, 64);
+    if (len == 0) return out;
+    const char *tail = (len > 4 && len <= 64) ? id + len - 4 : NULL;
+    const char *mask = "****";
+    size_t o = 0;
+    for (size_t i = 0; mask[i] && o + 1 < out_size; i++) out[o++] = mask[i];
+    for (size_t i = 0; tail && tail[i] && o + 1 < out_size; i++) {
+        out[o++] = is_print(tail[i]) ? tail[i] : '.';
     }
     out[o] = '\0';
     return out;

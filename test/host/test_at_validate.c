@@ -148,6 +148,50 @@ static void test_cmd(void) {
 	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSQ;+NETCLOSE"));
 	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSQ;H"));
 	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSQ\r\nAT+NETCLOSE"));
+	/* allowlist: queries, info and GNSS */
+	CHECK(ml_at_cmd_allowed_with_bridge("at+csq"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CSQ=?"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CREG?"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CEREG?"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+COPS?"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CCLK?"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CBC"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CPMUTEMP"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+SIMCOMATI"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CGMR"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CGPS?"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CGPS=0"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CGNSSPWR=1"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CGPADDR=1"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CGACT?"));
+	/* not on the list, or not in an allowed form */
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGATT=0"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+COPS=2"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CNMP=38"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGDCONT=1,\"IP\",\"x\""));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSOCKSETPN=1"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CATR=1"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CPSMS=1"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CEDRXS=1"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CMGS=\"123\""));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+HTTPDATA=10,1000"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CLCK=\"SC\",1,\"1234\""));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGPSINFO=10"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGNSSTST=1"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSQ?"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSQX"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGP"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CREG=2"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGPS="));
+	/* spaces and '+' tricks */
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+ CFUN=0"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT +CSQ"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSQ "));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGPS= 1"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSQ+CFUN=0"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGPS=1+CFUN=0"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT++CSQ"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+"));
 }
 
 static void test_redact(void) {
@@ -162,10 +206,32 @@ static void test_redact(void) {
 	             "AT+CGDCONT=1,\"IP\",\"internet\"") == 0);
 	CHECK(strcmp(ml_at_redact_cmd("AT\r\n", out, sizeof(out)), "AT..") == 0);
 	CHECK(strcmp(ml_at_redact_cmd(NULL, out, sizeof(out)), "") == 0);
+	CHECK(strcmp(ml_at_redact_cmd("AT+CFTPSLOGIN=\"ftp.example.com\",21,\"u\",\"p\",0", out, sizeof(out)),
+	             "AT+CFTPSLOGIN=****") == 0);
+	CHECK(strcmp(ml_at_redact_cmd("AT+CMQTTCONNECT=0,\"tcp://h:1883\",60,1,\"u\",\"p\"", out, sizeof(out)),
+	             "AT+CMQTTCONNECT=****") == 0);
+	CHECK(strcmp(ml_at_redact_cmd("AT+HTTPPARA=\"URL\",\"https://u:p@h/\"", out, sizeof(out)),
+	             "AT+HTTPPARA=****") == 0);
+	CHECK(strcmp(ml_at_redact_cmd("AT+CMQTTCONNECT?", out, sizeof(out)), "AT+CMQTTCONNECT?") == 0);
 	char tiny[6];
 	CHECK(strcmp(ml_at_redact_cmd("AT+CPIN=1234", tiny, sizeof(tiny)), "AT+CP") == 0);
 	char one[1];
 	CHECK(ml_at_redact_cmd("AT", one, sizeof(one))[0] == '\0');
+}
+
+static void test_mask_id(void) {
+	char out[ML_AT_MASKED_ID_SIZE];
+	CHECK(strcmp(ml_at_mask_id("490154203237518", out, sizeof(out)), "****7518") == 0);
+	CHECK(strcmp(ml_at_mask_id("89000000000000005678", out, sizeof(out)), "****5678") == 0);
+	CHECK(strcmp(ml_at_mask_id("12345", out, sizeof(out)), "****2345") == 0);
+	CHECK(strcmp(ml_at_mask_id("1234", out, sizeof(out)), "****") == 0);
+	CHECK(strcmp(ml_at_mask_id("", out, sizeof(out)), "") == 0);
+	CHECK(strcmp(ml_at_mask_id(NULL, out, sizeof(out)), "") == 0);
+	CHECK(strcmp(ml_at_mask_id("12345\r", out, sizeof(out)), "****345.") == 0);
+	char small[6];
+	CHECK(strcmp(ml_at_mask_id("490154203237518", small, sizeof(small)), "****7") == 0);
+	char one[1];
+	CHECK(ml_at_mask_id("490154203237518", one, sizeof(one))[0] == '\0');
 }
 
 static void test_rxget(void) {
@@ -221,6 +287,7 @@ int main(void) {
 	test_credential();
 	test_cmd();
 	test_redact();
+	test_mask_id();
 	test_rxget();
 	if (failures) {
 		fprintf(stderr, "%d failure(s)\n", failures);

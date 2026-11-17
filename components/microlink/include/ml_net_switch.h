@@ -132,14 +132,12 @@ ml_net_switch_state_t ml_net_switch_get_state(void);
  * The switcher destroys and recreates the handle when it restarts the VPN
  * (connect timeout, failed rebind, retry after both transports failed), so
  * do not cache it across switches; fetch it again after on_connected.
+ * Before it destroys a handle that on_connected announced, it calls
+ * on_switching or on_disconnected (ml_net_switch_stop() excepted): close
+ * sockets created on the handle (microlink_udp_close()) there and create
+ * them again in on_connected. examples/failover_connect shows the pattern.
  */
 microlink_t *ml_net_switch_get_handle(void);
-
-/**
- * Get the current UDP socket handle (if one was created).
- * Returns NULL if not available.
- */
-microlink_udp_socket_t *ml_net_switch_get_udp_socket(void);
 
 /**
  * Convert state to string for logging.

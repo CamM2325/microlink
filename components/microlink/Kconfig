@@ -320,6 +320,11 @@ menu "MicroLink V2 Configuration"
                 PIN code for the SIM card. Leave empty if no PIN required.
                 Must be 4-8 digits.
 
+                The PIN is only sent when AT+SPIC reports at least 2 attempts
+                left (or, if the modem cannot report them, once per boot),
+                and never again after a rejection until reboot, so a wrong
+                PIN cannot PUK-lock the SIM through retries.
+
         config ML_CELLULAR_PPP_USER
             string "PPP CHAP username"
             depends on ML_ENABLE_CELLULAR
@@ -353,8 +358,9 @@ menu "MicroLink V2 Configuration"
                 in AT command mode, so the application can send its own AT
                 commands (e.g. GPS queries) alongside the data connection with
                 ml_cellular_send_at_cmd(). While the bridge is active only
-                single "AT+..." commands are accepted, and commands that would
-                break the bridge (+CIP*, +NET*, +CFUN, +IPR, ...) are refused.
+                allowlisted query/information and GNSS commands are accepted
+                (AT+CSQ, AT+CPSI?, AT+CREG?, AT+CCLK?, AT+CBC, AT+CGPS=1,
+                AT+CGPSINFO, AT+CGNSSINFO, ...; see ml_at_validate.c).
                 The bridge is much slower than PPP (seconds of latency); with
                 PPP, use the modem's second UART/USB port for GNSS instead.
 
@@ -511,7 +517,7 @@ menu "MicroLink V2 Configuration"
                 WiFi credentials, Tailscale auth key, peer allowlist, etc.
 
                 Every request requires HTTP Basic auth (user "admin") and is
-                only served on the tailnet address unless
+                only served on the device's tailnet (VPN) address unless
                 ML_CONFIG_HTTPD_ALLOW_LAN is set. Anyone with the password
                 can change the auth key and network settings.
 
@@ -534,11 +540,12 @@ menu "MicroLink V2 Configuration"
             depends on ML_ENABLE_CONFIG_HTTPD
             default n
             help
-                By default the config UI only answers on the tailnet address
-                (100.64.0.0/10), where traffic is WireGuard-encrypted. Enable
-                to also answer on private LAN addresses; Basic auth is then
-                sent in cleartext on that LAN. Never served on the cellular
-                carrier address.
+                By default the config UI only answers on the device's own
+                tailnet (VPN) address, where traffic is WireGuard-encrypted.
+                Enable to also answer on the WiFi station / Ethernet
+                interface's own address; Basic auth is then sent in cleartext
+                on that LAN. Never served on the cellular (PPP) carrier
+                address.
 
         config ML_CONFIG_MAX_ALLOWED_PEERS
             int "Maximum peers in allowlist"

@@ -57,7 +57,11 @@ static const char *TAG = "ml_cell";
 #define PPP_GOT_IP6_BIT     BIT5
 
 static struct {
-    ml_cellular_config_t config;
+    ml_cellular_config_t config;   /* string fields point at the copies below */
+    char apn[ML_AT_APN_MAX + 1];
+    char sim_pin[ML_AT_PIN_MAX + 1];
+    char ppp_user[ML_AT_CRED_MAX + 1];
+    char ppp_pass[ML_AT_CRED_MAX + 1];
     volatile ml_cellular_state_t state;
     ml_cellular_info_t info;
     bool uart_installed;
@@ -175,6 +179,13 @@ static int at_send_cmd(const char *cmd, char *response, size_t resp_size, int ti
     return ret;
 }
 
+static bool at_cmd_ok_locked(const char *cmd, int timeout_ms)
+{
+    char resp[512];
+    int len = at_send_cmd_locked(cmd, resp, sizeof(resp), timeout_ms);
+    return (len > 0 && strstr(resp, "OK") != NULL);
+}
+
 static bool at_cmd_ok(const char *cmd, int timeout_ms)
 {
     char resp[512];
@@ -258,17 +269,94 @@ static esp_err_t uart_init(void)
  * Modem Setup (AT command phase)
  * ========================================================================== */
 
+/* "+++" escape (back to command mode if the modem was left in data mode).
+ * SIM7600/SIM7670 need 1 s of silence before and after it, so no other
+ * bytes may be sent meanwhile: caller holds s_uart_lock. */
+static void escape_data_mode_locked(void)
+{
+    vTaskDelay(pdMS_TO_TICKS(1100));
+    uart_write_bytes(UART_NUM, "+++", 3);
+    vTaskDelay(pdMS_TO_TICKS(1100));
+    uart_flush_input(UART_NUM);
+}
+
+/* Probe the other common baud rates, in case the modem was left at another
+ * speed with AT+IPR. On success the UART and s_cell.config.baud_rate match
+ * the modem. Caller holds s_uart_lock: the UART rate changes underneath any
+ * other command, so nothing else may run in between. */
+static bool probe_alt_bauds_locked(void)
+{
+#ifdef CONFIG_ML_BOARD_LILYGO_T_SIM7670G
+    /* SIM7670G: only probe 115200 — unreliable at higher rates */
+    int try_bauds[] = {115200};
+    int num_bauds = 1;
+#else
+    int try_bauds[] = {921600, 460800, 115200};
+    int num_bauds = 3;
+#endif
+    for (int b = 0; b < num_bauds; b++) {
+        if (try_bauds[b] == s_cell.config.baud_rate) continue;
+        ESP_LOGI(TAG, "Trying alternate baud rate %d...", try_bauds[b]);
+        uart_set_baudrate(UART_NUM, try_bauds[b]);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        /* Also try +++ at this baud in case modem is stuck in data mode */
+        escape_data_mode_locked();
+        if (at_cmd_ok_locked("AT", AT_SHORT_TIMEOUT_MS)) {
+            ESP_LOGI(TAG, "Modem responding at %d baud", try_bauds[b]);
+            /* AT+IPR persists in the modem, so a modem left at another
+             * speed (e.g. by an earlier fast-baud attempt) stays there
+             * forever. Bring it back to the configured rate. */
+            int want = s_cell.config.baud_rate;
+            char ipr[32];
+            snprintf(ipr, sizeof(ipr), "AT+IPR=%d", want);
+            if (at_cmd_ok_locked(ipr, AT_SHORT_TIMEOUT_MS)) {
+                /* The modem acknowledged: it should be at `want` now.
+                 * Give the UART time to settle and retry the check a
+                 * few times. */
+                vTaskDelay(pdMS_TO_TICKS(300));
+                uart_set_baudrate(UART_NUM, want);
+                bool restored = false;
+                for (int v = 0; v < 4 && !restored; v++) {
+                    vTaskDelay(pdMS_TO_TICKS(300));
+                    uart_flush_input(UART_NUM);
+                    restored = at_cmd_ok_locked("AT", AT_SHORT_TIMEOUT_MS);
+                }
+                if (restored) {
+                    ESP_LOGI(TAG, "Modem baud restored to %d", want);
+                    return true;
+                }
+                /* The switch did not take (or the reply was lost):
+                 * go back to the rate that worked a moment ago. */
+                ESP_LOGW(TAG, "No answer at %d after AT+IPR; trying %d again",
+                         want, try_bauds[b]);
+                uart_set_baudrate(UART_NUM, try_bauds[b]);
+                vTaskDelay(pdMS_TO_TICKS(300));
+                uart_flush_input(UART_NUM);
+                if (at_cmd_ok_locked("AT", AT_SHORT_TIMEOUT_MS)) {
+                    ESP_LOGW(TAG, "Modem stays at %d baud", try_bauds[b]);
+                    s_cell.config.baud_rate = try_bauds[b];
+                    return true;
+                }
+                continue;   /* lost at both rates: keep probing */
+            }
+            s_cell.config.baud_rate = try_bauds[b];
+            return true;
+        }
+    }
+    /* Restore original baud rate and keep trying */
+    uart_set_baudrate(UART_NUM, s_cell.config.baud_rate);
+    return false;
+}
+
 static esp_err_t modem_wait_ready(void)
 {
     ESP_LOGI(TAG, "Waiting for modem...");
 
     /* If modem is stuck in data mode (e.g. from a previous PPP session that
-     * didn't cleanly exit), send +++ escape sequence to return to command mode.
-     * SIM7600/SIM7670: requires 1s guard time before and after +++ */
-    vTaskDelay(pdMS_TO_TICKS(1100));
-    uart_write_bytes(UART_NUM, "+++", 3);
-    vTaskDelay(pdMS_TO_TICKS(1100));
-    uart_flush_input(UART_NUM);
+     * didn't cleanly exit), send +++ escape sequence to return to command mode. */
+    if (!ml_cellular_uart_lock()) return ESP_ERR_INVALID_STATE;
+    escape_data_mode_locked();
+    ml_cellular_uart_unlock();
 
     /* Try AT command with retries (modem may still be booting) */
     for (int i = 0; i < 10; i++) {
@@ -280,54 +368,13 @@ static esp_err_t modem_wait_ready(void)
         /* After 3 failed attempts, try common baud rates in case the modem
          * was previously set to a different speed with AT+IPR */
         if (i == 3) {
-#ifdef CONFIG_ML_BOARD_LILYGO_T_SIM7670G
-            /* SIM7670G: only probe 115200 — unreliable at higher rates */
-            int try_bauds[] = {115200};
-            int num_bauds = 1;
-#else
-            int try_bauds[] = {921600, 460800, 115200};
-            int num_bauds = 3;
-#endif
-            for (int b = 0; b < num_bauds; b++) {
-                if (try_bauds[b] == s_cell.config.baud_rate) continue;
-                ESP_LOGI(TAG, "Trying alternate baud rate %d...", try_bauds[b]);
-                uart_set_baudrate(UART_NUM, try_bauds[b]);
-                vTaskDelay(pdMS_TO_TICKS(100));
-                /* Also try +++ at this baud in case modem is stuck in data mode */
-                vTaskDelay(pdMS_TO_TICKS(1100));
-                uart_write_bytes(UART_NUM, "+++", 3);
-                vTaskDelay(pdMS_TO_TICKS(1100));
-                uart_flush_input(UART_NUM);
-                if (at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) {
-                    ESP_LOGI(TAG, "Modem responding at %d baud", try_bauds[b]);
-                    /* AT+IPR persists in the modem, so a modem left at another
-                     * speed (e.g. by an earlier fast-baud attempt) stays there
-                     * forever. Bring it back to the configured rate. */
-                    int want = s_cell.config.baud_rate;
-                    char ipr[32];
-                    snprintf(ipr, sizeof(ipr), "AT+IPR=%d", want);
-                    if (at_cmd_ok(ipr, AT_SHORT_TIMEOUT_MS)) {
-                        /* The modem acknowledged: it IS at `want` now. Give the
-                         * UART time to settle and retry the check a few times
-                         * rather than flipping back (which strands it). */
-                        vTaskDelay(pdMS_TO_TICKS(300));
-                        uart_set_baudrate(UART_NUM, want);
-                        for (int v = 0; v < 4; v++) {
-                            vTaskDelay(pdMS_TO_TICKS(300));
-                            uart_flush_input(UART_NUM);
-                            if (at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) break;
-                        }
-                        ESP_LOGI(TAG, "Modem baud restored to %d", want);
-                        s_cell.state = ML_CELL_STATE_AT_OK;
-                        return ESP_OK;
-                    }
-                    s_cell.config.baud_rate = try_bauds[b];
-                    s_cell.state = ML_CELL_STATE_AT_OK;
-                    return ESP_OK;
-                }
+            if (!ml_cellular_uart_lock()) return ESP_ERR_INVALID_STATE;
+            bool found = probe_alt_bauds_locked();
+            ml_cellular_uart_unlock();
+            if (found) {
+                s_cell.state = ML_CELL_STATE_AT_OK;
+                return ESP_OK;
             }
-            /* Restore original baud rate and keep trying */
-            uart_set_baudrate(UART_NUM, s_cell.config.baud_rate);
         }
         ESP_LOGW(TAG, "AT retry %d/10...", i + 1);
         vTaskDelay(pdMS_TO_TICKS(2000));
@@ -362,13 +409,113 @@ static esp_err_t modem_setup(void)
     for (size_t i = 0; i < strlen(s_cell.info.imei) && valid_imei; i++) {
         if (s_cell.info.imei[i] < '0' || s_cell.info.imei[i] > '9') valid_imei = false;
     }
+    /* Identifiers: last 4 digits at INFO (logs end up in bug reports),
+     * the full value only at DEBUG */
+    char masked[ML_AT_MASKED_ID_SIZE];
     if (valid_imei) {
-        ESP_LOGI(TAG, "IMEI: %s", s_cell.info.imei);
+        ESP_LOGI(TAG, "IMEI: %s", ml_at_mask_id(s_cell.info.imei, masked, sizeof(masked)));
+        ESP_LOGD(TAG, "IMEI (full): %s", s_cell.info.imei);
     } else {
-        ESP_LOGW(TAG, "IMEI invalid: '%s'", s_cell.info.imei);
+        ESP_LOGW(TAG, "IMEI invalid (%u chars)", (unsigned)strlen(s_cell.info.imei));
         s_cell.info.imei[0] = '\0';
     }
 
+    return ESP_OK;
+}
+
+/* SIM PIN guard. A wrong PIN must never be retried automatically: three
+ * rejections PUK-lock the SIM, and net_switch / boot loops call
+ * ml_cellular_init() again and again. Kept across deinit/init (RAM only),
+ * so it lasts until reboot or ml_cellular_reset_sim_pin_guard(). */
+static struct {
+    bool blocked;       /* a PIN was rejected or attempts are nearly used up */
+    bool sent_blind;    /* PIN sent once without a known attempt counter */
+    bool known_good;    /* the configured PIN was accepted this boot */
+} s_pin_guard;
+
+bool ml_cellular_sim_pin_blocked(void)
+{
+    return s_pin_guard.blocked;
+}
+
+void ml_cellular_reset_sim_pin_guard(void)
+{
+    memset(&s_pin_guard, 0, sizeof(s_pin_guard));
+}
+
+/* "+CPIN: <code>" with <code> exactly @p code (so "SIM PIN" does not also
+ * match "SIM PIN2" or "PH-SIM PIN") */
+static bool cpin_is(const char *resp, const char *code)
+{
+    const char *p = strstr(resp, "+CPIN:");
+    if (!p) return false;
+    p += 6;
+    while (*p == ' ') p++;
+    size_t n = strlen(code);
+    return strncmp(p, code, n) == 0 && (p[n] == '\r' || p[n] == '\n' || p[n] == '\0');
+}
+
+/* Remaining SIM PIN1 attempts via AT+SPIC ("+SPIC: <pin1>,<puk1>,<pin2>,
+ * <puk2>", SIM7500/SIM7600 and A76xx/SIM767x manuals), or -1 if unknown. */
+static int sim_pin_attempts_left(void)
+{
+    char resp[128];
+    if (at_send_cmd("AT+SPIC", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS) <= 0) return -1;
+    const char *p = strstr(resp, "+SPIC:");
+    int pin1, puk1;
+    if (!p || sscanf(p, "+SPIC: %d,%d", &pin1, &puk1) != 2 || pin1 < 0 || pin1 > 10) return -1;
+    return pin1;
+}
+
+static esp_err_t sim_enter_pin(void)
+{
+    if (!s_cell.config.sim_pin || !s_cell.config.sim_pin[0]) {
+        ESP_LOGE(TAG, "SIM requires PIN but none configured");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!ml_at_valid_pin(s_cell.config.sim_pin)) {
+        /* Never interpolate an unchecked value into an AT command */
+        ESP_LOGE(TAG, "SIM PIN is not 4-8 digits; not sending it");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_pin_guard.blocked) {
+        ESP_LOGE(TAG, "SIM PIN not sent: it was rejected (or too few attempts were left) "
+                 "earlier; fix the PIN and reboot");
+        return ESP_ERR_NOT_ALLOWED;
+    }
+
+    int left = sim_pin_attempts_left();
+    if (left >= 0) {
+        ESP_LOGI(TAG, "SIM PIN attempts left: %d", left);
+        if (left < 2) {
+            /* One wrong PIN now would need the PUK */
+            ESP_LOGE(TAG, "SIM PIN not sent: only %d attempt(s) left. Unlock the SIM "
+                     "in a phone, or check the PIN and reboot", left);
+            s_pin_guard.blocked = true;
+            return ESP_ERR_NOT_ALLOWED;
+        }
+    } else if (s_pin_guard.sent_blind && !s_pin_guard.known_good) {
+        /* No attempt counter: send at most once per boot */
+        ESP_LOGE(TAG, "SIM PIN not sent again: the modem does not report the attempts "
+                 "left and the PIN was already tried this boot");
+        s_pin_guard.blocked = true;
+        return ESP_ERR_NOT_ALLOWED;
+    } else {
+        s_pin_guard.sent_blind = true;
+    }
+
+    char pin_cmd[32];
+    snprintf(pin_cmd, sizeof(pin_cmd), "AT+CPIN=\"%s\"", s_cell.config.sim_pin);
+    bool pin_ok = at_cmd_ok(pin_cmd, AT_TIMEOUT_MS);
+    ml_at_secure_zero(pin_cmd, sizeof(pin_cmd));
+    if (!pin_ok) {
+        /* Rejected, or no answer (outcome unknown): never retry by itself */
+        s_pin_guard.blocked = true;
+        ESP_LOGE(TAG, "SIM PIN rejected; it will not be sent again until reboot");
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_pin_guard.known_good = true;
+    ESP_LOGI(TAG, "SIM PIN accepted");
     return ESP_OK;
 }
 
@@ -379,47 +526,37 @@ static esp_err_t sim_setup(void)
     /* Check SIM status */
     at_send_cmd("AT+CPIN?", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
 
-    if (strstr(resp, "READY")) {
+    if (cpin_is(resp, "READY")) {
         s_cell.info.sim_ready = true;
         s_cell.state = ML_CELL_STATE_SIM_READY;
         ESP_LOGI(TAG, "SIM ready");
-    } else if (strstr(resp, "SIM PIN")) {
-        /* Try to unlock with PIN */
-        if (s_cell.config.sim_pin && s_cell.config.sim_pin[0]) {
-            if (!ml_at_valid_pin(s_cell.config.sim_pin)) {
-                /* Never interpolate an unchecked value into an AT command */
-                ESP_LOGE(TAG, "SIM PIN is not 4-8 digits; not sending it");
-                s_cell.state = ML_CELL_STATE_ERROR;
-                return ESP_ERR_INVALID_ARG;
-            }
-            char pin_cmd[32];
-            snprintf(pin_cmd, sizeof(pin_cmd), "AT+CPIN=\"%s\"", s_cell.config.sim_pin);
-            bool pin_ok = at_cmd_ok(pin_cmd, AT_TIMEOUT_MS);
-            ml_at_secure_zero(pin_cmd, sizeof(pin_cmd));
-            if (pin_ok) {
-                ESP_LOGI(TAG, "SIM PIN accepted");
-                vTaskDelay(pdMS_TO_TICKS(2000)); /* Wait for SIM to initialize */
+    } else if (cpin_is(resp, "SIM PIN")) {
+        esp_err_t err = sim_enter_pin();
+        if (err != ESP_OK) {
+            s_cell.state = ML_CELL_STATE_ERROR;
+            return err;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000)); /* Wait for SIM to initialize */
 
-                /* Verify SIM is now ready */
-                at_send_cmd("AT+CPIN?", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
-                if (strstr(resp, "READY")) {
-                    s_cell.info.sim_ready = true;
-                    s_cell.state = ML_CELL_STATE_SIM_READY;
-                } else {
-                    ESP_LOGE(TAG, "SIM still not ready after PIN");
-                    s_cell.state = ML_CELL_STATE_ERROR;
-                    return ESP_ERR_INVALID_STATE;
-                }
-            } else {
-                ESP_LOGE(TAG, "SIM PIN rejected");
-                s_cell.state = ML_CELL_STATE_ERROR;
-                return ESP_ERR_INVALID_ARG;
-            }
+        /* Verify SIM is now ready */
+        at_send_cmd("AT+CPIN?", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
+        if (cpin_is(resp, "READY")) {
+            s_cell.info.sim_ready = true;
+            s_cell.state = ML_CELL_STATE_SIM_READY;
         } else {
-            ESP_LOGE(TAG, "SIM requires PIN but none configured");
+            ESP_LOGE(TAG, "SIM still not ready after PIN");
             s_cell.state = ML_CELL_STATE_ERROR;
             return ESP_ERR_INVALID_STATE;
         }
+    } else if (cpin_is(resp, "SIM PUK")) {
+        ESP_LOGE(TAG, "SIM is PUK-locked (too many wrong PINs); unlock it in a phone");
+        s_pin_guard.blocked = true;
+        s_cell.state = ML_CELL_STATE_ERROR;
+        return ESP_ERR_NOT_ALLOWED;
+    } else if (strstr(resp, "+CPIN:")) {
+        ESP_LOGE(TAG, "SIM needs an unsupported code (%.40s)", strstr(resp, "+CPIN:"));
+        s_cell.state = ML_CELL_STATE_ERROR;
+        return ESP_ERR_NOT_SUPPORTED;
     } else {
         ESP_LOGE(TAG, "SIM not detected — check SIM card insertion");
         s_cell.state = ML_CELL_STATE_ERROR;
@@ -430,7 +567,9 @@ static esp_err_t sim_setup(void)
     at_send_cmd("AT+CICCID", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
     at_extract_value(resp, "+ICCID:", s_cell.info.iccid, sizeof(s_cell.info.iccid));
     if (s_cell.info.iccid[0]) {
-        ESP_LOGI(TAG, "ICCID: %s", s_cell.info.iccid);
+        char masked[ML_AT_MASKED_ID_SIZE];
+        ESP_LOGI(TAG, "ICCID: %s", ml_at_mask_id(s_cell.info.iccid, masked, sizeof(masked)));
+        ESP_LOGD(TAG, "ICCID (full): %s", s_cell.info.iccid);
     }
 
     return ESP_OK;
@@ -729,13 +868,17 @@ static esp_err_t ppp_setup_and_dial(void)
         /* Auth type: 0=none, 1=PAP, 2=CHAP */
         int auth_type = (ppp_user[0] || ppp_pass[0]) ? 2 : 1;  /* CHAP if creds, PAP if empty */
         char auth_cmd[192];   /* 2 x ML_AT_CRED_MAX + command: never truncated */
+        /* SIMCom order is password first: AT+CGAUTH=<cid>,<auth_type>,
+         * <passwd>,<user> (SIM7500/SIM7600 AT manual V3.00 and A7600
+         * series AT manual V1.01, which covers the A76xx/SIM767x family),
+         * unlike 3GPP TS 27.007's <username>,<password>. */
         snprintf(auth_cmd, sizeof(auth_cmd),
-                 "AT+CGAUTH=1,%d,\"%s\",\"%s\"", auth_type, ppp_user, ppp_pass);
+                 "AT+CGAUTH=1,%d,\"%s\",\"%s\"", auth_type, ppp_pass, ppp_user);
         at_cmd_ok(auth_cmd, AT_TIMEOUT_MS);
         ml_at_secure_zero(auth_cmd, sizeof(auth_cmd));
     }
     if (ppp_user[0] || ppp_pass[0]) {
-        ESP_LOGI(TAG, "PPP credentials: user=%s (CHAP)", ppp_user);
+        ESP_LOGI(TAG, "PPP credentials set (CHAP)");
     } else {
         ESP_LOGI(TAG, "PPP: empty credentials, PAP auth (IMSI-based)");
     }
@@ -797,7 +940,7 @@ static esp_err_t ppp_setup_and_dial(void)
         ppp_status_event_handler, NULL,
         &s_cell.ppp_status_handler);
 
-    ESP_LOGI(TAG, "PPP CHAP auth configured (user=%s)", ppp_user[0] ? ppp_user : "<empty>");
+    ESP_LOGI(TAG, "PPP %s auth configured", (ppp_user[0] || ppp_pass[0]) ? "CHAP" : "PAP");
 
     /* Do NOT call esp_netif_action_start() yet — it immediately sends LCP
      * Configure-Request frames via ppp_transmit(), which would go to the modem
@@ -901,56 +1044,87 @@ static esp_err_t ppp_setup_and_dial(void)
  * Public API
  * ========================================================================== */
 
-esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
+/* Copy a validated config string into driver-owned storage (NULL stays NULL) */
+static const char *copy_config_str(char *dst, size_t dst_size, const char *src)
 {
-    if (s_cell.state != ML_CELL_STATE_OFF) {
-        ESP_LOGW(TAG, "Already initialized");
-        return ESP_ERR_INVALID_STATE;
+    if (!src) {
+        dst[0] = '\0';
+        return NULL;
     }
+    strlcpy(dst, src, dst_size);
+    return dst;
+}
 
-    /* Apply config or defaults */
-    if (config) {
-        s_cell.config = *config;
-    } else {
-        ml_cellular_config_t def = ML_CELLULAR_DEFAULT_CONFIG();
-        s_cell.config = def;
-    }
+static void clear_config_strs(void)
+{
+    ml_at_secure_zero(s_cell.sim_pin, sizeof(s_cell.sim_pin));
+    ml_at_secure_zero(s_cell.ppp_user, sizeof(s_cell.ppp_user));
+    ml_at_secure_zero(s_cell.ppp_pass, sizeof(s_cell.ppp_pass));
+    s_cell.apn[0] = '\0';
+    s_cell.config.apn = NULL;
+    s_cell.config.sim_pin = NULL;
+    s_cell.config.ppp_user = NULL;
+    s_cell.config.ppp_pass = NULL;
+}
 
-    /* Reject values that cannot be passed safely inside an AT command
-     * (Kconfig, NVS and application config all arrive here). */
-    {
-        const char *bad = NULL;
-        if (s_cell.config.apn && !ml_at_valid_apn(s_cell.config.apn)) {
-            bad = "APN (letters, digits, '-' and '.', max 100)";
-        } else if (s_cell.config.sim_pin && s_cell.config.sim_pin[0] &&
-                   !ml_at_valid_pin(s_cell.config.sim_pin)) {
-            bad = "SIM PIN (4-8 digits)";
-        } else if (s_cell.config.ppp_user && !ml_at_valid_credential(s_cell.config.ppp_user)) {
-            bad = "PPP user (printable ASCII without '\"' or '\\', max 64)";
-        } else if (s_cell.config.ppp_pass && !ml_at_valid_credential(s_cell.config.ppp_pass)) {
-            bad = "PPP password (printable ASCII without '\"' or '\\', max 64)";
+/* Switch modem and UART to fast_baud; on failure fall back to base_baud.
+ * Caller holds s_uart_lock. */
+static esp_err_t fast_baud_switch_locked(int fast_baud, int base_baud)
+{
+    char ipr_cmd[32];
+    snprintf(ipr_cmd, sizeof(ipr_cmd), "AT+IPR=%d", fast_baud);
+    if (at_cmd_ok_locked(ipr_cmd, AT_SHORT_TIMEOUT_MS)) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        /* Reconfigure ESP32 UART to match */
+        uart_set_baudrate(UART_NUM, fast_baud);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        /* Verify communication at new baud rate */
+        if (at_cmd_ok_locked("AT", AT_SHORT_TIMEOUT_MS)) {
+            s_cell.config.baud_rate = fast_baud;
+            ESP_LOGI(TAG, "UART baud rate upgraded: 115200 -> %d", fast_baud);
+        } else {
+            /* The modem is now at fast_baud (and AT+IPR persists), so the
+             * revert must be sent at fast_baud: replies may be garbled but
+             * the command usually gets through. Then return to base_baud. */
+            ESP_LOGW(TAG, "Fast baud %d failed, reverting to %d", fast_baud, base_baud);
+            char revert[32];
+            int rlen = snprintf(revert, sizeof(revert), "AT+IPR=%d\r", base_baud);
+            for (int r = 0; r < 3; r++) {
+                uart_write_bytes(UART_NUM, revert, rlen);
+                vTaskDelay(pdMS_TO_TICKS(150));
+            }
+            uart_set_baudrate(UART_NUM, base_baud);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            uart_flush_input(UART_NUM);
+            if (!at_cmd_ok_locked("AT", AT_SHORT_TIMEOUT_MS)) {
+                ESP_LOGE(TAG, "Modem not responding after baud revert; its baud "
+                              "rate is re-detected (and normalised) on the next init");
+                return ESP_ERR_TIMEOUT;
+            }
         }
-        if (bad) {
-            ESP_LOGE(TAG, "Invalid cellular config: %s", bad);
-            return ESP_ERR_INVALID_ARG;
-        }
     }
+    return ESP_OK;
+}
 
-    if (!s_uart_lock) {
-        s_uart_lock = xSemaphoreCreateMutex();
-        if (!s_uart_lock) return ESP_ERR_NO_MEM;
+/* Undo a failed ml_cellular_init() after the UART was installed. s_cell.info
+ * is kept for diagnostics (it is reset by the next init). */
+static void init_failed_cleanup(void)
+{
+    bool locked = ml_cellular_uart_lock();
+    if (s_cell.uart_installed) {
+        s_cell.uart_installed = false;
+        uart_driver_delete(UART_NUM);
     }
+    clear_config_strs();
+    s_cell.data_mode = ML_DATA_MODE_NONE;
+    s_cell.state = ML_CELL_STATE_OFF;
+    if (locked) ml_cellular_uart_unlock();
+}
 
-    if (s_cell.config.tx_pin == 0) s_cell.config.tx_pin = 43;
-    if (s_cell.config.rx_pin == 0) s_cell.config.rx_pin = 44;
-    if (s_cell.config.baud_rate == 0) s_cell.config.baud_rate = 115200;
-
-    memset(&s_cell.info, 0, sizeof(s_cell.info));
-    s_cell.state = ML_CELL_STATE_INIT;
-
-    /* Initialize UART */
-    esp_err_t err = uart_init();
-    if (err != ESP_OK) return err;
+/* Power up the modem and bring it to REGISTERED (UART already installed) */
+static esp_err_t modem_bringup(void)
+{
+    esp_err_t err;
 
     /* Board-specific modem power-on sequence.
      * Use gpio_config() instead of gpio_set_direction() for reliable GPIO init
@@ -1013,38 +1187,12 @@ esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
 #endif
     const int base_baud = s_cell.config.baud_rate;
     if (fast_baud && fast_baud != base_baud) {
-        char ipr_cmd[32];
-        snprintf(ipr_cmd, sizeof(ipr_cmd), "AT+IPR=%d", fast_baud);
-        if (at_cmd_ok(ipr_cmd, AT_SHORT_TIMEOUT_MS)) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            /* Reconfigure ESP32 UART to match */
-            uart_set_baudrate(UART_NUM, fast_baud);
-            vTaskDelay(pdMS_TO_TICKS(100));
-            /* Verify communication at new baud rate */
-            if (at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) {
-                s_cell.config.baud_rate = fast_baud;
-                ESP_LOGI(TAG, "UART baud rate upgraded: 115200 -> %d", fast_baud);
-            } else {
-                /* The modem is now at fast_baud (and AT+IPR persists), so the
-                 * revert must be sent at fast_baud: replies may be garbled but
-                 * the command usually gets through. Then return to base_baud. */
-                ESP_LOGW(TAG, "Fast baud %d failed, reverting to %d", fast_baud, base_baud);
-                char revert[32];
-                int rlen = snprintf(revert, sizeof(revert), "AT+IPR=%d\r", base_baud);
-                for (int r = 0; r < 3; r++) {
-                    uart_write_bytes(UART_NUM, revert, rlen);
-                    vTaskDelay(pdMS_TO_TICKS(150));
-                }
-                uart_set_baudrate(UART_NUM, base_baud);
-                vTaskDelay(pdMS_TO_TICKS(200));
-                uart_flush_input(UART_NUM);
-                if (!at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) {
-                    ESP_LOGE(TAG, "Modem not responding after baud revert; it will be "
-                                  "re-detected (and normalised) on the next init");
-                    return ESP_ERR_TIMEOUT;
-                }
-            }
-        }
+        /* The whole switch runs under the UART lock: a command from another
+         * task in the middle would go out at the wrong rate. */
+        if (!ml_cellular_uart_lock()) return ESP_ERR_INVALID_STATE;
+        err = fast_baud_switch_locked(fast_baud, base_baud);
+        ml_cellular_uart_unlock();
+        if (err != ESP_OK) return err;
     }
 
     /* Setup SIM card (check status, enter PIN if needed) */
@@ -1055,30 +1203,121 @@ esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
     err = network_register();
     if (err != ESP_OK) return err;
 
+    char masked_imei[ML_AT_MASKED_ID_SIZE];
     ESP_LOGI(TAG, "Cellular modem ready: %s IMEI=%s Operator=%s RSSI=%d",
-             s_cell.info.model, s_cell.info.imei,
+             s_cell.info.model, ml_at_mask_id(s_cell.info.imei, masked_imei, sizeof(masked_imei)),
              s_cell.info.operator_name, s_cell.info.rssi);
 
     return ESP_OK;
+}
+
+esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
+{
+    if (s_cell.state != ML_CELL_STATE_OFF) {
+        ESP_LOGW(TAG, "Already initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Apply config or defaults */
+    if (config) {
+        s_cell.config = *config;
+    } else {
+        ml_cellular_config_t def = ML_CELLULAR_DEFAULT_CONFIG();
+        s_cell.config = def;
+    }
+
+    /* Reject values that cannot be passed safely inside an AT command
+     * (Kconfig, NVS and application config all arrive here). */
+    {
+        const char *bad = NULL;
+        if (s_cell.config.apn && !ml_at_valid_apn(s_cell.config.apn)) {
+            bad = "APN (letters, digits, '-' and '.', max 100)";
+        } else if (s_cell.config.sim_pin && s_cell.config.sim_pin[0] &&
+                   !ml_at_valid_pin(s_cell.config.sim_pin)) {
+            bad = "SIM PIN (4-8 digits)";
+        } else if (s_cell.config.ppp_user && !ml_at_valid_credential(s_cell.config.ppp_user)) {
+            bad = "PPP user (printable ASCII without '\"' or '\\', max 64)";
+        } else if (s_cell.config.ppp_pass && !ml_at_valid_credential(s_cell.config.ppp_pass)) {
+            bad = "PPP password (printable ASCII without '\"' or '\\', max 64)";
+        }
+        if (bad) {
+            ESP_LOGE(TAG, "Invalid cellular config: %s", bad);
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    /* Keep our own copies: the PPP credentials are handed to lwIP
+     * (ppp_set_auth() stores the pointers) and used again on a CHAP
+     * re-challenge long after the caller's buffers are gone. The lengths
+     * were checked above, so nothing is truncated. */
+    s_cell.config.apn = copy_config_str(s_cell.apn, sizeof(s_cell.apn), s_cell.config.apn);
+    s_cell.config.sim_pin = copy_config_str(s_cell.sim_pin, sizeof(s_cell.sim_pin),
+                                            s_cell.config.sim_pin);
+    s_cell.config.ppp_user = copy_config_str(s_cell.ppp_user, sizeof(s_cell.ppp_user),
+                                             s_cell.config.ppp_user);
+    s_cell.config.ppp_pass = copy_config_str(s_cell.ppp_pass, sizeof(s_cell.ppp_pass),
+                                             s_cell.config.ppp_pass);
+
+    if (!s_uart_lock) {
+        s_uart_lock = xSemaphoreCreateMutex();
+        if (!s_uart_lock) {
+            clear_config_strs();
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (s_cell.config.tx_pin == 0) s_cell.config.tx_pin = 43;
+    if (s_cell.config.rx_pin == 0) s_cell.config.rx_pin = 44;
+    if (s_cell.config.baud_rate == 0) s_cell.config.baud_rate = 115200;
+
+    memset(&s_cell.info, 0, sizeof(s_cell.info));
+    s_cell.state = ML_CELL_STATE_INIT;
+
+    /* Initialize UART */
+    esp_err_t err = uart_init();
+    if (err != ESP_OK) {
+        clear_config_strs();
+        s_cell.state = ML_CELL_STATE_OFF;
+        return err;
+    }
+
+    err = modem_bringup();
+    if (err != ESP_OK) {
+        /* Leave nothing behind, so the next ml_cellular_init() starts from
+         * scratch instead of failing with "Already initialized". */
+        init_failed_cleanup();
+    }
+    return err;
 }
 
 void ml_cellular_deinit(void)
 {
     if (s_cell.state == ML_CELL_STATE_OFF) return;
 
-    /* Stop PPP if running */
-    if (s_cell.ppp_running) {
+    /* The AT socket bridge sends commands on the UART: stop it before the
+     * driver goes away (no-op unless the bridge is active). */
+    ml_cellular_data_stop();
+
+    /* Stop PPP if running (or half set up after a failed dial) */
+    if (s_cell.ppp_running || s_cell.ppp_netif) {
         ml_cellular_ppp_stop();
     }
 
-    /* Uninstall UART */
+    /* An application task may be inside ml_cellular_send_at_cmd(), blocked
+     * in uart_read_bytes() with the UART lock held. Deleting the driver
+     * under it frees the ring buffer and semaphores it is waiting on, so
+     * wait for the lock. Commands that arrive later find uart_installed
+     * false and fail cleanly. */
+    bool locked = ml_cellular_uart_lock();
     if (s_cell.uart_installed) {
-        uart_driver_delete(UART_NUM);
         s_cell.uart_installed = false;
+        uart_driver_delete(UART_NUM);
     }
-
     memset(&s_cell.info, 0, sizeof(s_cell.info));
+    clear_config_strs();
+    s_cell.data_mode = ML_DATA_MODE_NONE;
     s_cell.state = ML_CELL_STATE_OFF;
+    if (locked) ml_cellular_uart_unlock();
     ESP_LOGI(TAG, "Cellular deinitialized");
 }
 
@@ -1157,16 +1396,15 @@ esp_err_t ml_cellular_ppp_stop(void)
         s_cell.ppp_events = NULL;
     }
 
-    /* 5. Escape PPP data mode → AT command mode via Hayes +++ */
-    vTaskDelay(pdMS_TO_TICKS(1100)); /* Guard time before +++ */
-    uart_write_bytes(UART_NUM, "+++", 3);
-    vTaskDelay(pdMS_TO_TICKS(1100)); /* Guard time after +++ */
-
-    char resp[256];
-    at_send_cmd("AT", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
-
-    /* Hang up */
-    at_cmd_ok("ATH", AT_TIMEOUT_MS);
+    /* 5. Escape PPP data mode → AT command mode via Hayes +++ (under the
+     *    UART lock, so nothing is sent during the guard times), then hang up */
+    if (ml_cellular_uart_lock()) {
+        escape_data_mode_locked();
+        char resp[256];
+        at_send_cmd_locked("AT", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
+        at_cmd_ok_locked("ATH", AT_TIMEOUT_MS);
+        ml_cellular_uart_unlock();
+    }
 
     s_cell.info.data_connected = false;
     if (s_cell.info.registered) {
