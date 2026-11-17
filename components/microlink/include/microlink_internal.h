@@ -449,6 +449,28 @@ typedef struct {
 } ml_coord_tls_t;
 
 /* ============================================================================
+ * Coordination connection state (ml_coord.c, coord task only)
+ *
+ * Kept per instance, not as file statics: a coord task left running after a
+ * stop timeout (an orphaned context) must not free or write buffers that a
+ * newer instance's coord task is using.
+ * ========================================================================== */
+
+typedef struct {
+    /* Long-poll stream reassembly */
+    struct {
+        uint8_t *h2;   size_t h2_len,  h2_cap;    /* undecoded H2 bytes */
+        uint8_t *msg;  size_t msg_len, msg_cap;   /* stream-5 payload bytes */
+    } lp;
+    /* Server proactive frames (kept between handshake and H2 preface) */
+    uint8_t *extra_data;
+    int extra_data_len;
+    /* NodeKeyChallenge from EarlyNoise (kept between handshake and register) */
+    uint8_t node_key_challenge[32];
+    bool has_node_key_challenge;
+} ml_coord_state_t;
+
+/* ============================================================================
  * Main Context
  * ========================================================================== */
 
@@ -509,6 +531,7 @@ struct microlink_s {
 #ifdef CONFIG_ML_CTRL_TLS
     ml_coord_tls_t coord_tls;
 #endif
+    ml_coord_state_t coord_st;          /* Owned exclusively by coord task */
     uint32_t h2_next_stream_id;         /* Next H2 stream ID for endpoint updates (odd, starts at 7) */
 
     /* WireGuard netif (owned exclusively by wg_mgr task) */

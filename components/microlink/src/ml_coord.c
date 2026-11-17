@@ -39,10 +39,6 @@ static const char *TAG = "ml_coord";
 /* Effective control plane host: NVS override or compiled default */
 #define CTRL_HOST(ml) ((ml)->ctrl_host[0] ? (ml)->ctrl_host : ML_CTRL_HOST)
 
-/* NodeKeyChallenge from EarlyNoise (stored between handshake and register) */
-static uint8_t s_node_key_challenge[32] = {0};
-static bool s_has_node_key_challenge = false;
-
 /* Coordination state machine */
 typedef enum {
     COORD_IDLE,
@@ -432,9 +428,8 @@ static int do_tcp_connect(microlink_t *ml) {
  * State: NOISE_HANDSHAKE (HTTP/1.1 Upgrade with Noise msg1)
  * ========================================================================== */
 
-/* Server proactive data (stored between handshake and H2 preface) */
-static uint8_t *s_server_extra_data = NULL;
-static int s_server_extra_data_len = 0;
+/* Server proactive data is kept in ml->coord_st.extra_data between the
+ * handshake and the H2 preface. */
 
 /* Upper bound for the proactive frames kept from the handshake. EarlyNoise
  * is a few small frames; Go servers never write a frame over 4 KB. */
@@ -737,9 +732,9 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
         ESP_LOGI(TAG, "Server sent %d proactive transport frames", frame_count);
 
         /* Store for processing after handshake */
-        if (s_server_extra_data) free(s_server_extra_data);
-        s_server_extra_data = extra_data;
-        s_server_extra_data_len = extra_len;
+        if (ml->coord_st.extra_data) free(ml->coord_st.extra_data);
+        ml->coord_st.extra_data = extra_data;
+        ml->coord_st.extra_data_len = extra_len;
     } else {
         if (extra_data) free(extra_data);
     }
@@ -756,12 +751,12 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
  * ========================================================================== */
 
 static void process_proactive_frames(microlink_t *ml, ml_noise_state_t *noise) {
-    if (!s_server_extra_data || s_server_extra_data_len <= 0) {
+    if (!ml->coord_st.extra_data || ml->coord_st.extra_data_len <= 0) {
         return;
     }
 
-    ESP_LOGI(TAG, "Processing %d bytes of server proactive data", s_server_extra_data_len);
-    s_has_node_key_challenge = false;
+    ESP_LOGI(TAG, "Processing %d bytes of server proactive data", ml->coord_st.extra_data_len);
+    ml->coord_st.has_node_key_challenge = false;
 
     /* Decrypt ALL proactive frames and accumulate plaintext.
      * EarlyNoise content (magic + length + JSON) is split across
@@ -776,11 +771,11 @@ static void process_proactive_frames(microlink_t *ml, ml_noise_state_t *noise) {
     int frame_count = 0;
     uint64_t nonce = 0;
 
-    while (offset + 3 <= s_server_extra_data_len) {
-        uint8_t ft = s_server_extra_data[offset];
-        uint16_t fl = (s_server_extra_data[offset + 1] << 8) | s_server_extra_data[offset + 2];
+    while (offset + 3 <= ml->coord_st.extra_data_len) {
+        uint8_t ft = ml->coord_st.extra_data[offset];
+        uint16_t fl = (ml->coord_st.extra_data[offset + 1] << 8) | ml->coord_st.extra_data[offset + 2];
 
-        if (offset + 3 + fl > s_server_extra_data_len) break;
+        if (offset + 3 + fl > ml->coord_st.extra_data_len) break;
 
         ESP_LOGI(TAG, "Proactive frame %d: type=0x%02x, len=%u", frame_count, ft, fl);
 
@@ -791,7 +786,7 @@ static void process_proactive_frames(microlink_t *ml, ml_noise_state_t *noise) {
             if (plaintext) {
                 esp_err_t ret = ml_noise_decrypt(noise->rx_key, nonce,
                                                   NULL, 0,
-                                                  s_server_extra_data + offset + 3, fl,
+                                                  ml->coord_st.extra_data + offset + 3, fl,
                                                   plaintext);
                 if (ret == ESP_OK) {
                     ESP_LOGI(TAG, "  Decrypted frame %d: %d bytes (nonce=%d)",
@@ -839,8 +834,8 @@ static void process_proactive_frames(microlink_t *ml, ml_noise_state_t *noise) {
                     /* Parse "chalpub:hex..." format (v1 lines 1402-1424) */
                     if (strncmp(chal_str, "chalpub:", 8) == 0) {
                         const char *hex = chal_str + 8;
-                        if (parse_key32(hex, s_node_key_challenge)) {
-                            s_has_node_key_challenge = true;
+                        if (parse_key32(hex, ml->coord_st.node_key_challenge)) {
+                            ml->coord_st.has_node_key_challenge = true;
                             ESP_LOGI(TAG, "NodeKeyChallenge decoded (32 bytes)");
                         } else {
                             ESP_LOGW(TAG, "NodeKeyChallenge malformed, ignored");
@@ -857,9 +852,9 @@ static void process_proactive_frames(microlink_t *ml, ml_noise_state_t *noise) {
     ESP_LOGI(TAG, "Setting rx_nonce=%d (skipping %d proactive frames)", frame_count, frame_count);
     noise->rx_nonce = frame_count;
 
-    free(s_server_extra_data);
-    s_server_extra_data = NULL;
-    s_server_extra_data_len = 0;
+    free(ml->coord_st.extra_data);
+    ml->coord_st.extra_data = NULL;
+    ml->coord_st.extra_data_len = 0;
 }
 
 /* ============================================================================
@@ -971,12 +966,12 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     /* NodeKeyChallengeResponse - prove we own the WireGuard private key
      * Server sends challenge public key in EarlyNoise; we respond with
      * X25519(wg_private_key, challenge_public_key). (v1 lines 1754-1785) */
-    if (s_has_node_key_challenge) {
+    if (ml->coord_st.has_node_key_challenge) {
         ESP_LOGI(TAG, "Computing NodeKeyChallengeResponse...");
 
         /* X25519(wg_private_key, challenge_public_key) */
         uint8_t challenge_pub_copy[32];
-        memcpy(challenge_pub_copy, s_node_key_challenge, 32);
+        memcpy(challenge_pub_copy, ml->coord_st.node_key_challenge, 32);
         challenge_pub_copy[31] &= 0x7F;  /* Clear high bit per RFC 7748 */
 
         uint8_t challenge_response[32];
@@ -2178,9 +2173,9 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
  * omit_peers=false is for streaming_map_fetch: when the initial peer fetch
  * is not done via Stream=false, the first stream message must carry the
  * full netmap (Peers + DERPMap), so OmitPeers is dropped. */
-static void lp_reset(void);
+static void lp_reset(microlink_t *ml);
 static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise, bool omit_peers) {
-    lp_reset();   /* fresh stream: drop any partial frames/messages */
+    lp_reset(ml);   /* fresh stream: drop any partial frames/messages */
     cJSON *root = cJSON_CreateObject();
     if (!root) return -1;
 
@@ -2287,15 +2282,11 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise, bool omi
  * length means the stream is misaligned, not a big frame to buffer. */
 #define LP_H2_MAX_FRAME  16384u
 
-static struct {
-    uint8_t *h2;   size_t h2_len,  h2_cap;    /* undecoded H2 bytes */
-    uint8_t *msg;  size_t msg_len, msg_cap;   /* stream-5 payload bytes */
-} s_lp;
-
-static void lp_reset(void) {
-    free(s_lp.h2);
-    free(s_lp.msg);
-    memset(&s_lp, 0, sizeof(s_lp));
+/* The reassembly state lives in ml->coord_st.lp (one per instance). */
+static void lp_reset(microlink_t *ml) {
+    free(ml->coord_st.lp.h2);
+    free(ml->coord_st.lp.msg);
+    memset(&ml->coord_st.lp, 0, sizeof(ml->coord_st.lp));
 }
 
 /* Grow *buf to hold at least need bytes: doubling from 8 KB, but never past
@@ -2365,9 +2356,9 @@ static void lp_handle_message(microlink_t *ml, const char *json, size_t len) {
     cJSON_Delete(update_json);
 }
 
-/* Read one Noise frame and append its plaintext to s_lp.h2.
+/* Read one Noise frame and append its plaintext to ml->coord_st.lp.h2.
  * Returns 1, 0 when there is no data yet (nothing consumed), or -1 on a
- * hard error (s_lp has been reset). */
+ * hard error (the long-poll state has been reset). */
 static int lp_read_frame(microlink_t *ml, ml_noise_state_t *noise) {
     /* Read the Noise header first and reserve exactly what this frame
      * needs (Go servers write frames of at most 4 KB). A fixed 64 KB
@@ -2377,23 +2368,23 @@ static int lp_read_frame(microlink_t *ml, ml_noise_state_t *noise) {
     if (ct_len < 0) {
         /* EAGAIN/EWOULDBLOCK with nothing consumed = no data yet = not an error */
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        lp_reset();
+        lp_reset(ml);
         return -1;
     }
     size_t pt_len = (size_t)ct_len - 16;
-    if (!lp_reserve(&s_lp.h2, &s_lp.h2_cap, s_lp.h2_len + pt_len, SIZE_MAX)) {
+    if (!lp_reserve(&ml->coord_st.lp.h2, &ml->coord_st.lp.h2_cap, ml->coord_st.lp.h2_len + pt_len, SIZE_MAX)) {
         ESP_LOGE(TAG, "Long-poll: out of memory for H2 buffer");
-        lp_reset();
+        lp_reset(ml);
         return -1;
     }
     /* Decrypt the frame straight onto the end of the H2 buffer. The header
      * is consumed, so any failure from here on is a hard error. */
-    int frame_len = noise_recv_payload(ml, noise, (uint16_t)ct_len, s_lp.h2 + s_lp.h2_len);
+    int frame_len = noise_recv_payload(ml, noise, (uint16_t)ct_len, ml->coord_st.lp.h2 + ml->coord_st.lp.h2_len);
     if (frame_len <= 0) {
-        lp_reset();
+        lp_reset(ml);
         return -1;  /* error, or an empty frame (as before) */
     }
-    s_lp.h2_len += (size_t)frame_len;
+    ml->coord_st.lp.h2_len += (size_t)frame_len;
     return 1;
 }
 
@@ -2403,13 +2394,13 @@ typedef struct {
     bool stream5_closed;    /* END_STREAM/RST_STREAM on 5, or GOAWAY */
 } lp_h2_result_t;
 
-/* Consume every COMPLETE H2 frame in s_lp.h2 and keep a trailing partial
- * one. Stream-5 DATA is appended to s_lp.msg; PING and SETTINGS are
- * answered. Returns 0, or -1 on a protocol/size error (s_lp reset). */
+/* Consume every COMPLETE H2 frame in ml->coord_st.lp.h2 and keep a trailing partial
+ * one. Stream-5 DATA is appended to ml->coord_st.lp.msg; PING and SETTINGS are
+ * answered. Returns 0, or -1 on a protocol/size error (state reset). */
 static int lp_consume_h2(microlink_t *ml, ml_noise_state_t *noise, lp_h2_result_t *r) {
     size_t pos = 0;
-    while (pos + 9 <= s_lp.h2_len) {
-        const uint8_t *fh = s_lp.h2 + pos;
+    while (pos + 9 <= ml->coord_st.lp.h2_len) {
+        const uint8_t *fh = ml->coord_st.lp.h2 + pos;
         uint32_t f_len = ((uint32_t)fh[0] << 16) | ((uint32_t)fh[1] << 8) | fh[2];
         uint8_t f_type = fh[3];
         uint8_t f_flags = fh[4];
@@ -2418,10 +2409,10 @@ static int lp_consume_h2(microlink_t *ml, ml_noise_state_t *noise, lp_h2_result_
         if (f_len > LP_H2_MAX_FRAME) {
             ESP_LOGE(TAG, "Long-poll: H2 frame length %lu over the %u limit; reconnecting",
                      (unsigned long)f_len, (unsigned)LP_H2_MAX_FRAME);
-            lp_reset();
+            lp_reset(ml);
             return -1;
         }
-        if (pos + 9 + f_len > s_lp.h2_len) break;  /* partial frame: wait for more */
+        if (pos + 9 + f_len > ml->coord_st.lp.h2_len) break;  /* partial frame: wait for more */
         const uint8_t *payload = fh + 9;
 
         if (f_type == 0x00) {  /* DATA */
@@ -2429,17 +2420,17 @@ static int lp_consume_h2(microlink_t *ml, ml_noise_state_t *noise, lp_h2_result_
             if (f_stream == 5) {
                 r->stream5_heard = true;
                 if (f_len > 0) {
-                    size_t need = s_lp.msg_len + f_len + 1;
+                    size_t need = ml->coord_st.lp.msg_len + f_len + 1;
                     if (need > (size_t)ML_JSON_BUFFER_SIZE ||
-                        !lp_reserve(&s_lp.msg, &s_lp.msg_cap, need,
+                        !lp_reserve(&ml->coord_st.lp.msg, &ml->coord_st.lp.msg_cap, need,
                                     (size_t)ML_JSON_BUFFER_SIZE)) {
                         ESP_LOGE(TAG, "Long-poll message exceeds %u KB buffer; reconnecting",
                                  (unsigned)(ML_JSON_BUFFER_SIZE / 1024));
-                        lp_reset();
+                        lp_reset(ml);
                         return -1;
                     }
-                    memcpy(s_lp.msg + s_lp.msg_len, payload, f_len);
-                    s_lp.msg_len += f_len;
+                    memcpy(ml->coord_st.lp.msg + ml->coord_st.lp.msg_len, payload, f_len);
+                    ml->coord_st.lp.msg_len += f_len;
                 }
                 if (f_flags & 0x01) {
                     ESP_LOGW(TAG, "Long-poll stream ended by server (END_STREAM)");
@@ -2479,34 +2470,34 @@ static int lp_consume_h2(microlink_t *ml, ml_noise_state_t *noise, lp_h2_result_
         pos += 9 + f_len;
     }
     if (pos > 0) {
-        memmove(s_lp.h2, s_lp.h2 + pos, s_lp.h2_len - pos);
-        s_lp.h2_len -= pos;
+        memmove(ml->coord_st.lp.h2, ml->coord_st.lp.h2 + pos, ml->coord_st.lp.h2_len - pos);
+        ml->coord_st.lp.h2_len -= pos;
     }
     return 0;
 }
 
-/* Handle every complete length-prefixed MapResponse message in s_lp.msg and
- * keep a trailing partial one. Returns 0, or -1 on a bad length (s_lp reset). */
+/* Handle every complete length-prefixed MapResponse message in ml->coord_st.lp.msg and
+ * keep a trailing partial one. Returns 0, or -1 on a bad length (state reset). */
 static int lp_drain_messages(microlink_t *ml) {
     size_t mpos = 0;
-    while (s_lp.msg_len - mpos >= 4) {
-        const uint8_t *m = s_lp.msg + mpos;
+    while (ml->coord_st.lp.msg_len - mpos >= 4) {
+        const uint8_t *m = ml->coord_st.lp.msg + mpos;
         uint32_t mlen = (uint32_t)m[0] | ((uint32_t)m[1] << 8) |
                         ((uint32_t)m[2] << 16) | ((uint32_t)m[3] << 24);
         if (mlen > (uint32_t)ML_JSON_BUFFER_SIZE) {
             ESP_LOGE(TAG, "Long-poll message length %lu invalid; reconnecting", (unsigned long)mlen);
-            lp_reset();
+            lp_reset(ml);
             return -1;
         }
-        if (s_lp.msg_len - mpos - 4 < mlen) break;  /* incomplete message */
+        if (ml->coord_st.lp.msg_len - mpos - 4 < mlen) break;  /* incomplete message */
         if (mlen > 0) {
             lp_handle_message(ml, (const char *)(m + 4), mlen);
         }
         mpos += 4 + mlen;
     }
     if (mpos > 0) {
-        memmove(s_lp.msg, s_lp.msg + mpos, s_lp.msg_len - mpos);
-        s_lp.msg_len -= mpos;
+        memmove(ml->coord_st.lp.msg, ml->coord_st.lp.msg + mpos, ml->coord_st.lp.msg_len - mpos);
+        ml->coord_st.lp.msg_len -= mpos;
     }
     return 0;
 }
@@ -2533,7 +2524,7 @@ static void lp_send_window_update(microlink_t *ml, ml_noise_state_t *noise,
  * Instead, message completion is detected via the 4-byte length prefix at
  * the start of each message (the Tailscale/headscale map stream framing).
  *
- * The netmap is reassembled in the long-poll buffers (s_lp, reset by
+ * The netmap is reassembled in the long-poll buffers (ml->coord_st.lp, reset by
  * do_start_long_poll), so whatever the server wrote right behind it - a
  * PeersRemoved / PeersChangedPatch / DERPMap delta, or the first part of
  * one - is not dropped: complete messages are handled right after the
@@ -2559,10 +2550,10 @@ static int do_read_initial_netmap(microlink_t *ml, ml_noise_state_t *noise) {
     bool stream_closed = false;
 
     for (int read_count = 0; read_count < 200 && !msg_complete && !stream_closed; read_count++) {
-        if (lp_read_frame(ml, noise) <= 0) break;  /* timeout, or error (s_lp reset) */
+        if (lp_read_frame(ml, noise) <= 0) break;  /* timeout, or error (state reset) */
 
         /* Consume only complete H2 frames, in order. An H2 frame can span
-         * multiple Noise frames; a partial one stays in s_lp.h2. */
+         * multiple Noise frames; a partial one stays in ml->coord_st.lp.h2. */
         lp_h2_result_t h2 = {0};
         if (lp_consume_h2(ml, noise, &h2) < 0) break;
         window_consumed += h2.data_bytes;
@@ -2573,8 +2564,8 @@ static int do_read_initial_netmap(microlink_t *ml, ml_noise_state_t *noise) {
          * against implementation differences, try BE if the LE value is
          * implausible; raw JSON without a prefix (starting with '{') is
          * considered complete once it parses fully. */
-        const uint8_t *mb = s_lp.msg;
-        size_t have = s_lp.msg_len;
+        const uint8_t *mb = ml->coord_st.lp.msg;
+        size_t have = ml->coord_st.lp.msg_len;
         if (have >= 4 && msg_len == 0 && mb[0] != '{') {
             size_t le = (size_t)mb[0] | ((size_t)mb[1] << 8) |
                         ((size_t)mb[2] << 16) | ((size_t)mb[3] << 24);
@@ -2631,39 +2622,39 @@ static int do_read_initial_netmap(microlink_t *ml, ml_noise_state_t *noise) {
 
     if (!msg_complete) {
         ESP_LOGW(TAG, "Initial netmap not received (got %d bytes, stream %s)",
-                 (int)s_lp.msg_len, stream_closed ? "closed" : "open");
-        lp_reset();
+                 (int)ml->coord_st.lp.msg_len, stream_closed ? "closed" : "open");
+        lp_reset(ml);
         return -1;
     }
 
     /* Parse the body (skipping the prefix), cut at msg_len. */
-    cJSON *map_json = cJSON_ParseWithLength((const char *)s_lp.msg + msg_off, msg_len);
+    cJSON *map_json = cJSON_ParseWithLength((const char *)ml->coord_st.lp.msg + msg_off, msg_len);
     if (!map_json) {
         const char *err = cJSON_GetErrorPtr();
         ESP_LOGE(TAG, "Initial netmap JSON parse failed near: %.50s", err ? err : "unknown");
-        lp_reset();
+        lp_reset(ml);
         return -1;
     }
 
     /* Hand whatever follows the netmap to the long-poll reassembler. */
     size_t used = msg_off + msg_len;
-    memmove(s_lp.msg, s_lp.msg + used, s_lp.msg_len - used);
-    s_lp.msg_len -= used;
+    memmove(ml->coord_st.lp.msg, ml->coord_st.lp.msg + used, ml->coord_st.lp.msg_len - used);
+    ml->coord_st.lp.msg_len -= used;
     /* The buffer grew to the netmap size; long-poll deltas are small, so
      * don't hold that block for the whole session. lp_reserve() grows it
      * again if a large delta arrives. */
-    if (s_lp.msg_cap > 8192 && s_lp.msg_len < 8192) {
+    if (ml->coord_st.lp.msg_cap > 8192 && ml->coord_st.lp.msg_len < 8192) {
         uint8_t *nb = ml_psram_malloc(8192);
         if (nb) {
-            memcpy(nb, s_lp.msg, s_lp.msg_len);
-            free(s_lp.msg);
-            s_lp.msg = nb;
-            s_lp.msg_cap = 8192;
+            memcpy(nb, ml->coord_st.lp.msg, ml->coord_st.lp.msg_len);
+            free(ml->coord_st.lp.msg);
+            ml->coord_st.lp.msg = nb;
+            ml->coord_st.lp.msg_cap = 8192;
         }
     }
-    if (s_lp.msg_len > 0 || s_lp.h2_len > 0) {
+    if (ml->coord_st.lp.msg_len > 0 || ml->coord_st.lp.h2_len > 0) {
         ESP_LOGI(TAG, "Initial netmap: %u message + %u H2 bytes after it kept for the long-poll",
-                 (unsigned)s_lp.msg_len, (unsigned)s_lp.h2_len);
+                 (unsigned)ml->coord_st.lp.msg_len, (unsigned)ml->coord_st.lp.h2_len);
     }
 
     /* Ingest self-node info / peers / DERPMap (via the same shared parsers
@@ -2681,7 +2672,7 @@ static int do_read_initial_netmap(microlink_t *ml, ml_noise_state_t *noise) {
     if (stream_closed) {
         /* The netmap is applied, but this stream can't carry updates. */
         ESP_LOGW(TAG, "Map stream closed by the server after the initial netmap");
-        lp_reset();
+        lp_reset(ml);
         return -1;
     }
 
@@ -2831,7 +2822,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
 
     if (h2.stream5_closed) {
         /* Reconnect now rather than waiting for the watchdog. */
-        lp_reset();
+        lp_reset(ml);
         return -1;
     }
 
@@ -3369,13 +3360,12 @@ void ml_coord_task(void *arg) {
     /* Cleanup */
     coord_close_conn(ml);
     memset(&noise, 0, sizeof(noise));
-    /* The long-poll reassembly buffers and handshake leftovers are file
-     * statics: free them here, or they stay allocated after stop/destroy
-     * until a later long-poll starts (if ever). */
-    lp_reset();
-    free(s_server_extra_data);
-    s_server_extra_data = NULL;
-    s_server_extra_data_len = 0;
+    /* Free this instance's long-poll buffers and handshake leftovers, or
+     * they stay allocated after stop/destroy. */
+    lp_reset(ml);
+    free(ml->coord_st.extra_data);
+    ml->coord_st.extra_data = NULL;
+    ml->coord_st.extra_data_len = 0;
 
     ESP_LOGI(TAG, "Coord task exiting");
     ml_task_exit(ml, ML_TASK_BIT_COORD);
