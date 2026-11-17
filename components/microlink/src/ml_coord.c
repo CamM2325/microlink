@@ -2649,6 +2649,18 @@ static int do_read_initial_netmap(microlink_t *ml, ml_noise_state_t *noise) {
     size_t used = msg_off + msg_len;
     memmove(s_lp.msg, s_lp.msg + used, s_lp.msg_len - used);
     s_lp.msg_len -= used;
+    /* The buffer grew to the netmap size; long-poll deltas are small, so
+     * don't hold that block for the whole session. lp_reserve() grows it
+     * again if a large delta arrives. */
+    if (s_lp.msg_cap > 8192 && s_lp.msg_len < 8192) {
+        uint8_t *nb = ml_psram_malloc(8192);
+        if (nb) {
+            memcpy(nb, s_lp.msg, s_lp.msg_len);
+            free(s_lp.msg);
+            s_lp.msg = nb;
+            s_lp.msg_cap = 8192;
+        }
+    }
     if (s_lp.msg_len > 0 || s_lp.h2_len > 0) {
         ESP_LOGI(TAG, "Initial netmap: %u message + %u H2 bytes after it kept for the long-poll",
                  (unsigned)s_lp.msg_len, (unsigned)s_lp.h2_len);
