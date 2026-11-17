@@ -7,6 +7,7 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "nvs.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "lwip/sys.h"
 #include <string.h>
@@ -37,6 +38,12 @@ uint32_t wireguard_sys_now() {
  *   exceeds anything sent before the last reboot. The floor is re-persisted at
  *   most once per SAVE_INTERVAL (flash wear), and every timestamp handed out
  *   since the last save is < floor + SAVE_INTERVAL by construction.
+ *   That bound holds only for saves that reached flash, so the in-RAM floor
+ *   advances after a successful commit, and a failed write is retried.
+ *   Remaining gap: while one caller's write is in flight, another caller may
+ *   hand out (and send) a timestamp above the old floor + SAVE_INTERVAL; a
+ *   reboot in that window can repeat it. Initiations are only created on
+ *   the wg_mgr task, so in practice there is no second caller.
  *   First boot (no floor yet) starts at 2025-01-01, above any uptime value the
  *   old firmware could have sent, and below real wall-clock time, so adopting
  *   SNTP time later keeps the sequence monotonic.
@@ -50,7 +57,9 @@ uint32_t wireguard_sys_now() {
 static portMUX_TYPE s_ts_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool     s_ts_ready;
 static uint64_t s_ts_base;       /* seconds; t = base + uptime */
-static uint64_t s_ts_saved;      /* last floor written to NVS */
+static uint64_t s_ts_saved;      /* last floor committed to NVS */
+static bool     s_ts_saving;     /* a task is writing a new floor */
+static bool     s_ts_save_err_logged;
 static uint64_t s_ts_last_s;
 static uint32_t s_ts_last_ns;
 
@@ -66,13 +75,18 @@ static uint64_t ts_load_floor(void) {
     return v;
 }
 
-static void ts_store_floor(uint64_t v) {
+static esp_err_t ts_store_floor(uint64_t v) {
     nvs_handle_t h;
-    if (nvs_open(WG_TS_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u64(h, WG_TS_NVS_KEY, v);
-        nvs_commit(h);
-        nvs_close(h);
+    esp_err_t err = nvs_open(WG_TS_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
     }
+    err = nvs_set_u64(h, WG_TS_NVS_KEY, v);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
 }
 
 void wireguard_tai64n_now(uint8_t *output) {
@@ -117,14 +131,37 @@ void wireguard_tai64n_now(uint8_t *output) {
     }
     s_ts_last_s = seconds;
     s_ts_last_ns = nanoseconds;
-    if (s_ts_saved == 0 || seconds >= s_ts_saved + WG_TS_SAVE_INTERVAL_S) {
-        s_ts_saved = seconds;
+    /* s_ts_saved only moves once the floor is really in flash: advancing it
+     * first (and ignoring write errors) meant a failed write left flash on
+     * the old floor while RAM believed the new one was saved, and the next
+     * boot could start below timestamps already sent. A failed write is
+     * retried by the next call. */
+    if (!s_ts_saving && (s_ts_saved == 0 || seconds >= s_ts_saved + WG_TS_SAVE_INTERVAL_S)) {
+        s_ts_saving = true;
         save = true;
     }
     portEXIT_CRITICAL(&s_ts_lock);
 
     if (save) {
-        ts_store_floor(seconds);
+        esp_err_t err = ts_store_floor(seconds);
+        bool log_err = false;
+        portENTER_CRITICAL(&s_ts_lock);
+        if (err == ESP_OK) {
+            if (seconds > s_ts_saved) {
+                s_ts_saved = seconds;
+            }
+            s_ts_save_err_logged = false;
+        } else if (!s_ts_save_err_logged) {
+            s_ts_save_err_logged = true;
+            log_err = true;
+        }
+        s_ts_saving = false;
+        portEXIT_CRITICAL(&s_ts_lock);
+        if (log_err) {
+            ESP_LOGW("wg", "Could not persist the handshake timestamp floor (%s); "
+                     "handshakes may be rejected as replays after a reboot until this succeeds",
+                     esp_err_to_name(err));
+        }
     }
 
     // TAI64 label: 2^62 + 10 + Unix seconds
