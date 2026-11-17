@@ -206,6 +206,8 @@ typedef struct {
 /* Zero-copy state embedded in microlink_s */
 typedef struct {
     struct udp_pcb *pcb;            /* Raw UDP PCB (replaces disco_sock4) */
+    struct udp_pcb *stale_pcb;      /* PCB a failed deinit left registered: never
+                                     * used again, removal retried by the next deinit */
     uint16_t local_port;            /* Bound port */
 
     /* DISCO RX ring buffer (lock-free SPSC) */
@@ -364,6 +366,9 @@ typedef struct {
     uint32_t best_ip;
     uint16_t best_port;
     bool has_direct_path;
+    uint32_t best_rtt_ms;           /* RTT of the last pong on best_ip:best_port */
+    uint64_t best_pong_ms;          /* when best_ip:best_port last answered */
+    uint64_t last_full_ping_ms;     /* last round that pinged every endpoint */
 
     /* WireGuard peer index in wireguard-lwip */
     int wg_peer_index;
@@ -544,6 +549,11 @@ struct microlink_s {
     ml_peer_t peers[ML_MAX_PEERS];
     int peer_count;
 
+    /* VPN IPs of peers with a usable WireGuard session (0 = none), written
+     * only by wg_mgr with atomic stores and read by ml_wg_mgr_peer_is_up()
+     * from any task. Slot i mirrors peers[i]. */
+    uint32_t wg_session_up_ip[ML_MAX_PEERS];
+
     /* Paced CallMeMaybe sweep requested via ML_PEER_REQ_CMM_ALL (wg_mgr only) */
     bool cmm_sweep_active;
     int cmm_sweep_next;
@@ -664,11 +674,13 @@ void ml_coord_task(void *arg);
 
 /* ml_wg_mgr.c */
 void ml_wg_mgr_task(void *arg);
-void ml_wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip);
-esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip);
+/* True if wg_mgr last saw a usable WireGuard session to vpn_ip. Reads the
+ * table wg_mgr publishes (wg_session_up_ip), so it is safe from any task;
+ * the answer may be up to ~100 ms old. */
 bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip);
 /* Queue ML_PEER_REQ_HANDSHAKE / ML_PEER_REQ_CMM_ALL for the wg_mgr task.
- * Non-blocking and safe from any task. */
+ * Non-blocking and safe from any task. Application-facing code must use
+ * this rather than touching peers[] or WireGuard state itself. */
 esp_err_t ml_wg_mgr_post_request(microlink_t *ml, int action, uint32_t vpn_ip);
 void ml_wg_mgr_update_transport(microlink_t *ml);
 
@@ -726,11 +738,19 @@ esp_err_t ml_peer_nvs_save(const ml_peer_t *peer);
 int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers);
 esp_err_t ml_peer_nvs_clear(void);
 esp_err_t ml_peer_nvs_remove(const uint8_t *public_key);
+/* Defer the flash writes of saves/removes until the matching batch_end()
+ * (nestable), so a batch costs at most one write. wg_mgr task only. */
+void ml_peer_nvs_batch_begin(void);
+void ml_peer_nvs_batch_end(void);
 
 #ifdef CONFIG_ML_ZERO_COPY_WG
 /* ml_zerocopy.c */
 esp_err_t ml_zerocopy_init(microlink_t *ml);
-void ml_zerocopy_deinit(microlink_t *ml);
+/* ESP_FAIL if tcpip_thread could not be reached: the PCB is then still
+ * registered (its callback detached from ml, parked in zc.stale_pcb so
+ * nothing sends on it and the BSD socket fallback is used), and the caller
+ * must not free state reachable from it. A later call retries. */
+esp_err_t ml_zerocopy_deinit(microlink_t *ml);
 esp_err_t ml_zerocopy_send(microlink_t *ml, const uint8_t *data, size_t len,
                             uint32_t dest_ip, uint16_t dest_port);
 #endif

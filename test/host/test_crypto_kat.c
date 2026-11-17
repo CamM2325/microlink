@@ -381,6 +381,9 @@ static void test_nacl_box(void)
           "nacl: shared_get (miss) != firstkey");
     CHECK(nacl_box_shared_get(k2, BOB_PK, ALICE_SK) == 0 && memcmp(k2, BOX_FIRSTKEY, 32) == 0,
           "nacl: shared_get (hit) != firstkey");
+    nacl_box_shared_cache_wipe();
+    CHECK(nacl_box_shared_get(k2, BOB_PK, ALICE_SK) == 0 && memcmp(k2, BOX_FIRSTKEY, 32) == 0,
+          "nacl: shared_get after wipe != firstkey");
 
     for (size_t i = 0; i < sizeof(V) / sizeof(V[0]); i++) {
         size_t len = V[i].len;

@@ -8,12 +8,17 @@
  *
  * Storage: single NVS blob containing a packed array of peer entries.
  * Supports up to ML_NVS_MAX_PEERS (64) with LRU eviction when full.
- * The entire table is written as one blob (~5.8KB max) for efficiency.
+ * The entire table is written as one blob (~5.8KB max) for efficiency, so
+ * writes are kept rare (flash wear): a save whose stored fields did not
+ * change only bumps the LRU counter in RAM, and wg_mgr brackets each batch
+ * of peer updates with ml_peer_nvs_batch_begin()/end() so a full netmap or
+ * a stale-peer sweep costs one write, not one per peer.
  *
  * Reference: microlink v1 microlink_peer_registry.c
  */
 
 #include "microlink_internal.h"
+#include "wireguard-filter.h"   /* wg_endpoint_ip4_is_valid_underlay() */
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -54,6 +59,8 @@ typedef struct __attribute__((packed)) {
 static nvs_handle_t s_nvs = 0;
 static bool s_initialized = false;
 static peer_nvs_table_t *s_table = NULL;  /* PSRAM-allocated working copy */
+static int s_batch_depth = 0;             /* >0: flushes are deferred */
+static bool s_dirty = false;              /* stored fields changed since the last flush */
 
 static void load_table(void) {
     if (!s_table) {
@@ -82,16 +89,65 @@ static void load_table(void) {
     }
 }
 
-static esp_err_t flush_table(void) {
-    if (!s_table) return ESP_ERR_INVALID_STATE;
-
+static esp_err_t write_table(void) {
     size_t blob_size = sizeof(uint16_t) * 2 +
                        s_table->count * sizeof(peer_nvs_entry_t);
     esp_err_t err = nvs_set_blob(s_nvs, PEER_NVS_BLOB_KEY, s_table, blob_size);
     if (err == ESP_OK) {
-        nvs_commit(s_nvs);
+        err = nvs_commit(s_nvs);
+    }
+    if (err == ESP_OK) {
+        s_dirty = false;
+    } else {
+        ESP_LOGW(TAG, "Peer cache write failed: %s", esp_err_to_name(err));
     }
     return err;
+}
+
+/* The table changed: write it now, or at the end of the current batch. */
+static esp_err_t flush_table(void) {
+    if (!s_table) return ESP_ERR_INVALID_STATE;
+    s_dirty = true;
+    if (s_batch_depth > 0) return ESP_OK;
+    return write_table();
+}
+
+void ml_peer_nvs_batch_begin(void) {
+    s_batch_depth++;
+}
+
+void ml_peer_nvs_batch_end(void) {
+    if (s_batch_depth > 0) s_batch_depth--;
+    if (s_batch_depth == 0 && s_dirty && s_initialized && s_table) {
+        write_table();
+    }
+}
+
+/* The 16-bit LRU clock would wrap after 65535 saves, after which fresh
+ * entries would look oldest and be evicted first. Renumber the entries
+ * 1..count in their current LRU order and restart the clock above them. */
+static void lru_renormalise(void) {
+    uint16_t n = s_table->count;
+    uint16_t *rank = calloc(n ? n : 1, sizeof(uint16_t));
+    for (int i = 0; i < n; i++) {
+        uint16_t r = 1;
+        for (int j = 0; j < n; j++) {
+            uint16_t cj = s_table->entries[j].lru_counter;
+            uint16_t ci = s_table->entries[i].lru_counter;
+            if (cj < ci || (cj == ci && j < i)) r++;
+        }
+        if (rank) {
+            rank[i] = r;
+        } else {
+            s_table->entries[i].lru_counter = 1;   /* no memory: order lost, not correctness */
+        }
+    }
+    if (rank) {
+        for (int i = 0; i < n; i++) s_table->entries[i].lru_counter = rank[i];
+        free(rank);
+    }
+    s_table->lru_clock = n;
+    ESP_LOGI(TAG, "LRU clock renormalised (%u entries)", (unsigned)n);
 }
 
 esp_err_t ml_peer_nvs_init(void) {
@@ -126,6 +182,9 @@ esp_err_t ml_peer_nvs_save(const ml_peer_t *peer) {
     if (!s_initialized || !peer || !s_table) return ESP_ERR_INVALID_STATE;
 
     /* Advance LRU clock */
+    if (s_table->lru_clock >= UINT16_MAX - 1) {
+        lru_renormalise();
+    }
     s_table->lru_clock++;
 
     /* Build entry */
@@ -163,6 +222,15 @@ esp_err_t ml_peer_nvs_save(const ml_peer_t *peer) {
     }
 
     if (slot >= 0) {
+        /* Nothing that is stored changed (endpoint changes beyond the first
+         * two IPv4 ones, the hostname past 7 characters, online state...):
+         * remember the use in RAM, don't rewrite the blob. */
+        peer_nvs_entry_t cur = s_table->entries[slot];
+        cur.lru_counter = entry.lru_counter;
+        if (memcmp(&cur, &entry, sizeof(entry)) == 0) {
+            s_table->entries[slot].lru_counter = entry.lru_counter;
+            return ESP_OK;
+        }
         /* Update existing entry */
         s_table->entries[slot] = entry;
     } else if (s_table->count < ML_NVS_MAX_PEERS) {
@@ -218,12 +286,18 @@ int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers) {
         memcpy(p->hostname, entry->hostname_short, sizeof(entry->hostname_short));
         p->hostname[sizeof(entry->hostname_short)] = '\0';
 
-        /* Restore endpoints */
-        p->endpoint_count = entry->endpoint_count;
+        /* Restore endpoints. Flash is not trusted: drop anything that is
+         * not a usable underlay address (the same filter CallMeMaybe uses). */
+        p->endpoint_count = 0;
         for (int j = 0; j < entry->endpoint_count && j < 2; j++) {
-            p->endpoints[j].ip = entry->endpoints[j].ip;
-            p->endpoints[j].port = entry->endpoints[j].port;
-            p->endpoints[j].is_ipv6 = false;
+            if (entry->endpoints[j].port == 0 ||
+                !wg_endpoint_ip4_is_valid_underlay(entry->endpoints[j].ip)) {
+                continue;
+            }
+            int k = p->endpoint_count++;
+            p->endpoints[k].ip = entry->endpoints[j].ip;
+            p->endpoints[k].port = entry->endpoints[j].port;
+            p->endpoints[k].is_ipv6 = false;
         }
 
         loaded++;

@@ -418,17 +418,19 @@ void keypair_update(struct wireguard_peer *peer, struct wireguard_keypair *recei
 	}
 }
 
-static void add_new_keypair(struct wireguard_peer *peer, struct wireguard_keypair new_keypair) {
-	if (new_keypair.initiator) {
+// new_keypair by pointer: a by-value copy would leave the session keys in
+// another stack frame nobody wipes.
+static void add_new_keypair(struct wireguard_peer *peer, const struct wireguard_keypair *new_keypair) {
+	if (new_keypair->initiator) {
 		if (peer->next_keypair.valid) {
 			peer->prev_keypair = peer->next_keypair;
 			keypair_destroy(&peer->next_keypair);
 		} else  {
 			peer->prev_keypair = peer->curr_keypair;
 		}
-		peer->curr_keypair = new_keypair;
+		peer->curr_keypair = *new_keypair;
 	} else {
-		peer->next_keypair =  new_keypair;
+		peer->next_keypair = *new_keypair;
 		keypair_destroy(&peer->prev_keypair);
 	}
 }
@@ -471,7 +473,9 @@ void wireguard_start_session(struct wireguard_peer *peer, bool initiator) {
 	handshake->local_index = 0;
 	handshake->valid = false;
 
-	add_new_keypair(peer, new_keypair);
+	add_new_keypair(peer, &new_keypair);
+	// The keys now live only in the peer's keypair slots
+	crypto_zero(&new_keypair, sizeof(new_keypair));
 }
 
 uint8_t wireguard_get_message_type(const uint8_t *data, size_t len) {
@@ -960,11 +964,6 @@ bool wireguard_device_init(struct wireguard_device *device, const uint8_t *priva
 		crypto_zero(device->private_key, WIREGUARD_PRIVATE_KEY_LEN);
 	}
 	return device->valid;
-}
-
-void wireguard_encrypt_packet(uint8_t *dst, const uint8_t *src, size_t src_len, struct wireguard_keypair *keypair) {
-	wireguard_aead_encrypt(dst, src, src_len, NULL, 0, keypair->sending_counter, keypair->sending_key);
-	keypair->sending_counter++;
 }
 
 bool wireguard_decrypt_packet(uint8_t *dst, const uint8_t *src, size_t src_len, uint64_t counter, struct wireguard_keypair *keypair) {

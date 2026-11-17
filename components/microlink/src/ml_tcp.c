@@ -8,6 +8,11 @@
  * lwIP routes 100.64.0.0/10 traffic through the WG netif automatically
  * (set up in ml_wg_mgr.c). This module triggers the WG handshake,
  * waits for tunnel establishment, then lets standard TCP through.
+ *
+ * Runs on the application's task. The peer table and WireGuard handshake
+ * state belong to the wg_mgr task, so the handshake (and CallMeMaybe) is
+ * requested through its queue (ML_PEER_REQ_HANDSHAKE), and the tunnel state
+ * is read from the session table wg_mgr publishes (ml_wg_mgr_peer_is_up).
  */
 
 #include "microlink_internal.h"
@@ -18,6 +23,14 @@
 #include <string.h>
 
 static const char *TAG = "ml_tcp";
+
+/* Ask wg_mgr for a handshake + CallMeMaybe toward dest_ip */
+static void tcp_request_handshake(microlink_t *ml, uint32_t dest_ip) {
+    esp_err_t err = ml_wg_mgr_post_request(ml, ML_PEER_REQ_HANDSHAKE, dest_ip);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Could not queue WG handshake request (%s)", esp_err_to_name(err));
+    }
+}
 
 /* ============================================================================
  * Internal Types
@@ -53,12 +66,12 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
              (unsigned long)timeout_ms);
 
     /* Trigger WG handshake + DISCO to wake up the peer connection.
-     * The tunnel may already be up if there's been recent traffic. */
-    ml_wg_mgr_trigger_handshake(ml, dest_ip);
-    ml_wg_mgr_send_cmm(ml, dest_ip);
+     * The tunnel may already be up if there's been recent traffic (wg_mgr
+     * then leaves the session alone). */
+    tcp_request_handshake(ml, dest_ip);
 
     /* Wait for WG tunnel to establish with this peer.
-     * Poll wireguardif_peer_is_up() — once the WG handshake completes,
+     * Poll ml_wg_mgr_peer_is_up() — once the WG handshake completes,
      * lwIP can route TCP through the tunnel. Without a valid session,
      * connect() will fail with EHOSTUNREACH. */
     uint32_t wait_ms = 0;
@@ -75,8 +88,7 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
         if (!tunnel_up && (wait_ms % 5000) == 0) {
             ESP_LOGI(TAG, "WG tunnel not up after %lums, re-triggering handshake",
                      (unsigned long)wait_ms);
-            ml_wg_mgr_trigger_handshake(ml, dest_ip);
-            ml_wg_mgr_send_cmm(ml, dest_ip);
+            tcp_request_handshake(ml, dest_ip);
         }
     }
 
@@ -156,8 +168,7 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
         if (err == EHOSTUNREACH || err == ENETUNREACH || err == ETIMEDOUT) {
             close(fd);
             ESP_LOGI(TAG, "Retrying after re-triggering WG handshake...");
-            ml_wg_mgr_trigger_handshake(ml, dest_ip);
-            ml_wg_mgr_send_cmm(ml, dest_ip);
+            tcp_request_handshake(ml, dest_ip);
             vTaskDelay(pdMS_TO_TICKS(3000));
 
             fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);

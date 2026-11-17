@@ -467,9 +467,10 @@ static struct {
 static int s_shared_cache_next;
 
 static uint8_t s_shared_cache_owner_sk[32];
-/* disco_send_call_me_maybe() is reachable from app tasks via
- * ml_wg_mgr_send_cmm() (ml_tcp.c / ml_udp.c), not only from ml_wg_mgr, so the
- * cache needs a lock. The X25519 itself runs outside the critical section. */
+/* Every DISCO caller now runs on the wg_mgr task (ml_tcp.c and ml_udp.c post
+ * requests to it instead of calling in), but the lock is kept: it is cheap,
+ * and the cache must not depend on that invariant. The X25519 itself runs
+ * outside the critical section. */
 static portMUX_TYPE s_shared_cache_lock = portMUX_INITIALIZER_UNLOCKED;
 
 int nacl_box_shared_get(uint8_t *shared_key,
@@ -511,6 +512,14 @@ int nacl_box_shared_get(uint8_t *shared_key,
     }
     taskEXIT_CRITICAL(&s_shared_cache_lock);
     return 0;
+}
+
+void nacl_box_shared_cache_wipe(void) {
+    taskENTER_CRITICAL(&s_shared_cache_lock);
+    memset(s_shared_cache, 0, sizeof(s_shared_cache));
+    memset(s_shared_cache_owner_sk, 0, sizeof(s_shared_cache_owner_sk));
+    s_shared_cache_next = 0;
+    taskEXIT_CRITICAL(&s_shared_cache_lock);
 }
 
 int nacl_box_afternm(uint8_t *ciphertext,

@@ -115,4 +115,13 @@ int nacl_box_shared_get(uint8_t *shared_key,
                         const uint8_t *peer_pk,
                         const uint8_t *our_sk);
 
+/**
+ * @brief Forget every cached shared key and the copy of our secret key.
+ *
+ * The cache keeps a copy of the disco private key and up to 24 shared keys
+ * in static RAM; call this when the keys stop being used (wg_mgr does on
+ * exit, i.e. on microlink_stop()/destroy()).
+ */
+void nacl_box_shared_cache_wipe(void);
+
 #endif /* _NACL_BOX_H_ */

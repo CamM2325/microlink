@@ -327,7 +327,6 @@ bool wireguard_check_mac2(struct wireguard_device *device, const uint8_t *data, 
 
 bool wireguard_expired(uint32_t created_millis, uint32_t valid_seconds);
 
-void wireguard_encrypt_packet(uint8_t *dst, const uint8_t *src, size_t src_len, struct wireguard_keypair *keypair);
 bool wireguard_decrypt_packet(uint8_t *dst, const uint8_t *src, size_t src_len, uint64_t counter, struct wireguard_keypair *keypair);
 
 bool wireguard_base64_decode(const char *str, uint8_t *out, size_t *outlen);

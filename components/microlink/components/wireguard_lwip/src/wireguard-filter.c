@@ -62,13 +62,39 @@ int wg_peer_match_len(const struct wireguard_peer *peer, const ip_addr_t *addr) 
 	return best;
 }
 
+struct wireguard_keypair *wg_peer_tx_keypair(struct wireguard_peer *peer) {
+	struct wireguard_keypair *keypair = &peer->curr_keypair;
+	// We may not be able to use the current keypair if we haven't received data, may need to resort to using previous keypair
+	if (keypair->valid && !keypair->initiator && (keypair->last_rx == 0)) {
+		keypair = &peer->prev_keypair;
+	}
+	if (keypair->valid && (keypair->initiator || (keypair->last_rx != 0))) {
+		return keypair;
+	}
+	return NULL;
+}
+
+bool wg_peer_can_send(struct wireguard_peer *peer) {
+	const struct wireguard_keypair *keypair = wg_peer_tx_keypair(peer);
+	return keypair &&
+		!wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME) &&
+		(keypair->sending_counter < REJECT_AFTER_MESSAGES);
+}
+
 /*
  * Cryptokey routing (outbound): longest-prefix match across all peers.
  * A more specific route always wins — e.g. a /32 tailnet peer beats a
  * 0.0.0.0/0 exit node even when the /32 peer has no session yet (in that
  * case the packet is queued/handshake started for the correct peer rather
  * than being encrypted to the wrong one). Having a live session is only
- * used to break ties between equally specific routes.
+ * used to break ties between equally specific routes, and it counts only if
+ * TX can actually use it: a slot whose curr keypair expired keeps a valid
+ * prev that TX never selects, and must not win the tie over a live peer
+ * (e.g. the old and new node key of a peer that rotated keys, both owning
+ * the same /32 until the old one is removed).
+ *
+ * Runs on tcpip_thread without the state lock: the session test is only a
+ * preference, wireguardif_output_to_peer() re-checks under the lock.
  */
 struct wireguard_peer *wg_peer_lookup_by_allowed_ip(struct wireguard_device *device, const ip_addr_t *ipaddr) {
 	struct wireguard_peer *best = NULL;
@@ -83,7 +109,7 @@ struct wireguard_peer *wg_peer_lookup_by_allowed_ip(struct wireguard_device *dev
 		if (len < 0) {
 			continue;
 		}
-		bool has_session = tmp->curr_keypair.valid || tmp->prev_keypair.valid;
+		bool has_session = wg_peer_can_send(tmp);
 		if (len > best_len || (len == best_len && has_session && !best_has_session)) {
 			best = tmp;
 			best_len = len;
@@ -177,9 +203,14 @@ bool wg_endpoint_is_valid_underlay(const ip_addr_t *addr) {
 	if (IP_IS_V6(addr)) {
 		const uint32_t w0 = PP_NTOHL(ip_2_ip6(addr)->addr[0]);
 		const uint32_t w1 = PP_NTOHL(ip_2_ip6(addr)->addr[1]);
+		const uint32_t w2 = PP_NTOHL(ip_2_ip6(addr)->addr[2]);
 		if (w0 == 0xfd7a115cu && (w1 >> 16) == 0xa1e0u) return false;  /* fd7a:115c:a1e0::/48 tailnet */
 		if ((w0 >> 24) == 0xff) return false;                          /* multicast */
-		if (ip6_addr_isany(ip_2_ip6(addr)) || ip6_addr_isloopback(ip_2_ip6(addr))) return false;
+		if ((w0 & 0xffc00000u) == 0xfe800000u) return false;           /* fe80::/10 link-local */
+		/* ::/96 (unspecified, loopback, deprecated IPv4-compatible) and
+		 * ::ffff:0:0/96 (IPv4-mapped): an embedded IPv4 address would bypass
+		 * the IPv4 checks above (e.g. ::ffff:100.64.0.1 or ::ffff:127.0.0.1). */
+		if (w0 == 0 && w1 == 0 && (w2 == 0 || w2 == 0x0000ffffu)) return false;
 		return true;
 	}
 #endif

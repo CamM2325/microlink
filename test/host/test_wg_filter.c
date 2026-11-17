@@ -5,6 +5,7 @@
  *   2. RX: a peer holding 0.0.0.0/0 must not be able to spoof another peer's IP
  *      (and IPv4 rules must never match IPv6 addresses)
  *   3. Anti-replay window (endpoint/state updates are gated on it)
+ *   4. TX keypair selection and the "usable session" route tie-break
  */
 #include <stdio.h>
 #include <string.h>
@@ -15,6 +16,13 @@ static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); failures++; } } while (0)
 
 static struct wireguard_device dev;
+
+/* wireguard_expired() lives in wireguard.c (platform clock); a fake clock is
+ * enough here. Same arithmetic as the real one. */
+static uint32_t fake_now_ms = 1000000;
+bool wireguard_expired(uint32_t created_millis, uint32_t valid_seconds) {
+	return (uint32_t)(fake_now_ms - created_millis) >= valid_seconds * 1000;
+}
 
 static void v4(ip_addr_t *out, int a, int b, int c, int d) {
 	IP_ADDR4(out, a, b, c, d);
@@ -32,6 +40,8 @@ static struct wireguard_peer *add_peer(int idx, const ip_addr_t *ip, const ip_ad
 	p->allowed_source_ips[0].ip = *ip;
 	p->allowed_source_ips[0].mask = *mask;
 	p->curr_keypair.valid = session;
+	p->curr_keypair.initiator = session;
+	p->curr_keypair.keypair_millis = fake_now_ms;
 	return p;
 }
 
@@ -60,6 +70,74 @@ static void test_tx_longest_prefix(void) {
 	ip_addr_t d6;
 	v6(&d6, 0xfd7a115c, 0xa1e00000, 0, 0x1);
 	CHECK(wg_peer_lookup_by_allowed_ip(&dev, &d6) == NULL);
+}
+
+static void test_tx_keypair_selection(void) {
+	struct wireguard_peer p;
+	memset(&p, 0, sizeof(p));
+	CHECK(wg_peer_tx_keypair(&p) == NULL);
+	CHECK(!wg_peer_can_send(&p));
+
+	/* initiator keypair: usable at once */
+	p.curr_keypair.valid = true;
+	p.curr_keypair.initiator = true;
+	p.curr_keypair.keypair_millis = fake_now_ms;
+	CHECK(wg_peer_tx_keypair(&p) == &p.curr_keypair);
+	CHECK(wg_peer_can_send(&p));
+
+	/* expired or exhausted: selected, but not sendable */
+	p.curr_keypair.keypair_millis = fake_now_ms - REJECT_AFTER_TIME * 1000;
+	CHECK(!wg_peer_can_send(&p));
+	p.curr_keypair.keypair_millis = fake_now_ms;
+	p.curr_keypair.sending_counter = REJECT_AFTER_MESSAGES;
+	CHECK(!wg_peer_can_send(&p));
+	p.curr_keypair.sending_counter = 0;
+
+	/* unconfirmed responder keypair in curr: TX falls back to prev */
+	p.curr_keypair.initiator = false;
+	p.curr_keypair.last_rx = 0;
+	CHECK(wg_peer_tx_keypair(&p) == NULL);
+	p.prev_keypair.valid = true;
+	p.prev_keypair.initiator = true;
+	p.prev_keypair.keypair_millis = fake_now_ms;
+	CHECK(wg_peer_tx_keypair(&p) == &p.prev_keypair);
+	/* confirmed by the initiator's first data packet: curr again */
+	p.curr_keypair.last_rx = fake_now_ms;
+	CHECK(wg_peer_tx_keypair(&p) == &p.curr_keypair);
+
+	/* curr destroyed, prev still valid: TX uses curr, so nothing is sendable
+	 * (the state an old, rotated-out node key ends up in) */
+	memset(&p.curr_keypair, 0, sizeof(p.curr_keypair));
+	CHECK(p.prev_keypair.valid);
+	CHECK(wg_peer_tx_keypair(&p) == NULL);
+	CHECK(!wg_peer_can_send(&p));
+}
+
+static void test_tx_tie_break_needs_usable_session(void) {
+	memset(&dev, 0, sizeof(dev));
+	ip_addr_t host, m32, dst;
+	v4(&host, 100, 64, 0, 9);   v4(&m32, 255, 255, 255, 255);
+
+	/* Same /32 twice (old and new node key after a rotation). The old slot
+	 * comes first and only has a stale prev keypair left. */
+	struct wireguard_peer *old_key = add_peer(0, &host, &m32, false);
+	old_key->prev_keypair.valid = true;
+	old_key->prev_keypair.initiator = true;
+	old_key->prev_keypair.keypair_millis = fake_now_ms - 10 * 1000;
+	struct wireguard_peer *new_key = add_peer(1, &host, &m32, true);
+
+	v4(&dst, 100, 64, 0, 9);
+	CHECK(wg_peer_lookup_by_allowed_ip(&dev, &dst) == new_key);   /* was old_key */
+
+	/* neither usable: first match, as before */
+	memset(&new_key->curr_keypair, 0, sizeof(new_key->curr_keypair));
+	CHECK(wg_peer_lookup_by_allowed_ip(&dev, &dst) == old_key);
+
+	/* an expired session does not win the tie either */
+	new_key->curr_keypair.valid = true;
+	new_key->curr_keypair.initiator = true;
+	new_key->curr_keypair.keypair_millis = fake_now_ms - REJECT_AFTER_TIME * 1000;
+	CHECK(wg_peer_lookup_by_allowed_ip(&dev, &dst) == old_key);
 }
 
 static void test_rx_source_validation(void) {
@@ -135,10 +213,20 @@ static void test_underlay_endpoints(void) {
 	v6(&a, 0xfd7a115c, 0xa1e00000, 0, 1);  CHECK(!wg_endpoint_is_valid_underlay(&a));
 	v6(&a, 0x20010db8, 0, 0, 1);           CHECK(wg_endpoint_is_valid_underlay(&a));
 	v6(&a, 0, 0, 0, 1);                    CHECK(!wg_endpoint_is_valid_underlay(&a));   /* ::1 */
+	v6(&a, 0xfe800000, 0, 0, 1);           CHECK(!wg_endpoint_is_valid_underlay(&a));   /* fe80::1 link-local */
+	v6(&a, 0xfebfffff, 0, 0, 1);           CHECK(!wg_endpoint_is_valid_underlay(&a));   /* top of fe80::/10 */
+	v6(&a, 0xfec00000, 0, 0, 1);           CHECK(wg_endpoint_is_valid_underlay(&a));    /* just above it */
+	v6(&a, 0, 0, 0x0000ffff, 0x64400001);  CHECK(!wg_endpoint_is_valid_underlay(&a));   /* ::ffff:100.64.0.1 */
+	v6(&a, 0, 0, 0x0000ffff, 0x7f000001);  CHECK(!wg_endpoint_is_valid_underlay(&a));   /* ::ffff:127.0.0.1 */
+	v6(&a, 0, 0, 0x0000ffff, 0xcb007105);  CHECK(!wg_endpoint_is_valid_underlay(&a));   /* ::ffff:203.0.113.5 too */
+	v6(&a, 0, 0, 0, 0x64400001);           CHECK(!wg_endpoint_is_valid_underlay(&a));   /* ::100.64.0.1 (compat) */
+	v6(&a, 0x00640000, 0xff9b0000, 0, 0x08080808); CHECK(wg_endpoint_is_valid_underlay(&a)); /* NAT64 64:ff9b::/96 */
 }
 
 int main(void) {
 	test_tx_longest_prefix();
+	test_tx_keypair_selection();
+	test_tx_tie_break_needs_usable_session();
 	test_rx_source_validation();
 	test_replay_window();
 	test_underlay_endpoints();

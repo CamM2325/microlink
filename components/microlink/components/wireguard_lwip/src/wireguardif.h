@@ -122,10 +122,19 @@ err_t wireguardif_remove_peer(struct netif *netif, u8_t peer_index);
 // Update the "connect" IP of the given peer
 err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port);
 
+// Update the "connect" IP and also move the live endpoint to it now, without
+// a handshake (roaming an established session). ip_addr_any = via DERP.
+err_t wireguardif_set_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port);
+
+// Clear the DERP / UDP output callbacks and their contexts. Output then
+// fails with ERR_RTE/ERR_CONN instead of calling back into the owner. For a
+// netif that has to be leaked while lwIP may still route through it.
+void wireguardif_detach_outputs(struct netif *netif);
+
 // Try and connect to the given peer
 err_t wireguardif_connect(struct netif *netif, u8_t peer_index);
 
-// Is the given peer "up"? A peer is up if it has a valid session key it can communicate with
+// Is the given peer "up"? A peer is up if it has a session keypair transport data can be sent with now (wg_peer_can_send)
 err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *current_ip, u16_t *current_port);
 
 // Register a DERP relay output callback for peers without direct endpoints
