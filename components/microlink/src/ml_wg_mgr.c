@@ -753,11 +753,10 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
                 microlink_ip_to_str(ml->peers[evict_idx].vpn_ip, evict_ip);
                 ESP_LOGW(TAG, "Evicting LRU peer %s (%s) for priority peer %s",
                          ml->peers[evict_idx].hostname, evict_ip, update->hostname);
-                if (ml->peers[evict_idx].wg_peer_index >= 0 && ml->wg_netif) {
-                    wireguardif_remove_peer((struct netif *)ml->wg_netif,
-                                            ml->peers[evict_idx].wg_peer_index);
-                }
-                ml->peers[evict_idx].active = false;
+                /* Full removal like every other path: WireGuard peer, NVS
+                 * entry and pending probes (a late pong must not be matched
+                 * against the slot's next owner). */
+                remove_peer_idx(ml, evict_idx);
                 idx = evict_idx;
             }
         }
