@@ -84,6 +84,31 @@ jobs:
             examples/${{ matrix.example }}/build/flash_args
           retention-days: 14
 
+  # Configurations no example enables by default: the config web UI
+  # (ml_config_httpd.c is otherwise never compiled) and the size profile.
+  firmware-variants:
+    name: ${{ matrix.example }} + ${{ matrix.overlay }} / IDF ${{ matrix.idf }}
+    runs-on: ubuntu-latest
+    container: espressif/idf:${{ matrix.idf }}
+    strategy:
+      fail-fast: false
+      matrix:
+        idf: [v5.3.6, v6.1.1]
+        example: [basic_connect, cellular_connect]
+        overlay: [sdkconfig.httpd.defaults, sdkconfig.size.defaults]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        shell: bash
+        working-directory: examples/${{ matrix.example }}
+        run: |
+          . "$IDF_PATH/export.sh" >/dev/null
+          defaults="sdkconfig.defaults;../${{ matrix.overlay }}"
+          idf.py -D SDKCONFIG_DEFAULTS="$defaults" set-target esp32s3
+          idf.py -D SDKCONFIG_DEFAULTS="$defaults" build
+
   static-analysis:
     name: cppcheck
     runs-on: ubuntu-latest
