@@ -116,15 +116,50 @@ static bool parse_key32(const char *hex, uint8_t key[32]) {
  * TCP I/O helpers for coord socket (owned exclusively by this task)
  * ========================================================================== */
 
-/* Single read from the coord transport (recv() semantics).
- * With CONFIG_ML_CTRL_TLS the Noise byte stream runs inside TLS records;
- * timeouts still surface as -1/EAGAIN via the TLS BIO. */
+/* SO_RCVTIMEO on the coord socket is never longer than this slice; the
+ * timeout a read should honour is kept in ml->coord_st.rcv_timeout_ms and
+ * coord_raw_recv() repeats the recv until it expires, checking for shutdown
+ * in between. microlink_stop() can shutdown() an lwIP socket to unblock a
+ * read, but not an AT-socket fd, where a 60 s recv outlasted the stop
+ * timeout and left the coord task (and its context) orphaned. */
+#define COORD_RECV_SLICE_MS  1000
+
+/* Set the receive timeout for the coord reads that follow. */
+static void coord_set_rcv_timeout(microlink_t *ml, uint32_t ms) {
+    if (ms == 0) ms = 1;  /* SO_RCVTIMEO 0 would mean "block forever" */
+    ml->coord_st.rcv_timeout_ms = ms;
+    uint32_t slice = ms < COORD_RECV_SLICE_MS ? ms : COORD_RECV_SLICE_MS;
+    struct timeval tv = { .tv_sec = slice / 1000, .tv_usec = (slice % 1000) * 1000 };
+    ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
+/* Single read from the coord transport (recv() semantics), waiting up to
+ * ml->coord_st.rcv_timeout_ms. With CONFIG_ML_CTRL_TLS the Noise byte stream
+ * runs inside TLS records; timeouts still surface as -1/EAGAIN via the TLS
+ * BIO. Returns -1/ECANCELED once shutdown has been requested. */
 static int coord_raw_recv(microlink_t *ml, uint8_t *buf, size_t len) {
+    uint64_t start_ms = ml_get_time_ms();
+    for (;;) {
+        uint64_t try_ms = ml_get_time_ms();
 #ifdef CONFIG_ML_CTRL_TLS
-    return ml_coord_tls_recv(ml, buf, len);
+        int n = ml_coord_tls_recv(ml, buf, len);
 #else
-    return ml_recv(ml->coord_sock, buf, len, 0);
+        int n = ml_recv(ml->coord_sock, buf, len, 0);
 #endif
+        if (n >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) return n;
+        if (ml_shutdown_requested(ml)) {
+            errno = ECANCELED;
+            return -1;
+        }
+        uint64_t now = ml_get_time_ms();
+        if (now - start_ms >= ml->coord_st.rcv_timeout_ms) {
+            errno = EAGAIN;
+            return -1;
+        }
+        if (now - try_ms < 5) {
+            vTaskDelay(pdMS_TO_TICKS(10));  /* recv didn't block: don't spin */
+        }
+    }
 }
 
 /* Close the coord connection (TLS session first, then the socket) */
@@ -165,11 +200,11 @@ static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
 }
 
 /* Limits for finishing a read that has started. They are wall-clock times:
- * each retry can block for a full SO_RCVTIMEO (2-60 s), so a retry count
+ * each retry could block for a full receive timeout (2-60 s), so a retry count
  * gave anything from seconds to hours. STALL bounds the time without any
  * progress, TOTAL the whole read (a 4 KB Noise frame over the ~450 B/s AT
  * socket bridge takes ~10 s). A check runs after each recv returns, so a
- * read can overrun either limit by one SO_RCVTIMEO, and a frame's header
+ * read can overrun either limit by one receive timeout, and a frame's header
  * and payload reads have separate budgets. The coord watchdog runs on the
  * same task and only sees the result once the read returns. */
 #define COORD_RECV_STALL_MS   30000
@@ -420,6 +455,7 @@ static int do_tcp_connect(microlink_t *ml) {
              (long)((t_tcp - t_dns) / 1000), (long)((t_tcp - t_start) / 1000));
 
     ml->coord_sock = sock;
+    coord_set_rcv_timeout(ml, 10000);  /* same 10 s, now in slices */
 
 #ifdef CONFIG_ML_CTRL_TLS
     if (ml_coord_tls_handshake(ml, CTRL_HOST(ml)) < 0) {
@@ -695,8 +731,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
          * Server sends EarlyNoise immediately after msg2, so they should
          * arrive within a few hundred ms even on slow cellular links. */
         ESP_LOGI(TAG, "No extra data in initial buffer, reading proactive frames from socket...");
-        struct timeval short_tv = { .tv_sec = 2, .tv_usec = 0 };
-        ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &short_tv, sizeof(short_tv));
+        coord_set_rcv_timeout(ml, 2000);
 
         extra_data = ml_psram_malloc(1024);
         if (extra_data) {
@@ -713,8 +748,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
         }
 
         /* Restore normal recv timeout */
-        struct timeval normal_tv = { .tv_sec = 60, .tv_usec = 0 };
-        ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &normal_tv, sizeof(normal_tv));
+        coord_set_rcv_timeout(ml, 60000);
     }
 
     if (extra_data && extra_len > 0 &&
@@ -1938,8 +1972,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     size_t json_total = 0;
 
     /* Set extended recv timeout for large MapResponse (60 seconds) */
-    struct timeval rcv_tv = { .tv_sec = 60, .tv_usec = 0 };
-    ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
+    coord_set_rcv_timeout(ml, 60000);
 
     uint64_t recv_start_ms = ml_get_time_ms();
     uint64_t last_progress_ms = recv_start_ms;
@@ -2021,8 +2054,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     }
 
     /* Restore normal recv timeout (5 seconds for long-poll) */
-    rcv_tv.tv_sec = 5;
-    ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
+    coord_set_rcv_timeout(ml, 5000);
 
     ESP_LOGI(TAG, "Accumulated %dKB of H2 data from Noise frames (%lums)",
              (int)(h2_total / 1024),
@@ -2552,8 +2584,7 @@ static int do_read_initial_netmap(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_map_start = esp_timer_get_time();
 
     /* The initial netmap can be large, so wait up to 60 seconds (same as do_fetch_peers) */
-    struct timeval rcv_tv = { .tv_sec = 60, .tv_usec = 0 };
-    ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
+    coord_set_rcv_timeout(ml, 60000);
 
     uint64_t recv_start_ms = ml_get_time_ms();
     uint64_t last_progress_ms = recv_start_ms;
@@ -2627,8 +2658,7 @@ static int do_read_initial_netmap(microlink_t *ml, ml_noise_state_t *noise) {
     }
 
     /* Restore the normal recv timeout (5 seconds) */
-    rcv_tv.tv_sec = 5;
-    ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
+    coord_set_rcv_timeout(ml, 5000);
 
     /* Replenish the remaining flow control. Stream 5 stays open (the
      * long-poll continues), so always replenish the stream level as well,
@@ -2820,8 +2850,7 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
     }
 
     /* Data available — set short recv timeout for partial frame safety */
-    struct timeval tv_recv = { .tv_sec = 2, .tv_usec = 0 };
-    ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &tv_recv, sizeof(tv_recv));
+    coord_set_rcv_timeout(ml, 2000);
 
     int rf = lp_read_frame(ml, noise);
     if (rf <= 0) return rf;  /* 0 = no data yet, -1 = error / connection closed */

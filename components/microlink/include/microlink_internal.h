@@ -468,6 +468,9 @@ typedef struct {
     /* NodeKeyChallenge from EarlyNoise (kept between handshake and register) */
     uint8_t node_key_challenge[32];
     bool has_node_key_challenge;
+    /* Receive timeout the coord reads honour; SO_RCVTIMEO is only a slice
+     * of it (see coord_set_rcv_timeout) */
+    uint32_t rcv_timeout_ms;
 } ml_coord_state_t;
 
 /* ============================================================================

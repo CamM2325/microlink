@@ -108,8 +108,8 @@ int ml_coord_tls_handshake(microlink_t *ml, const char *hostname) {
     const int64_t hs_deadline_us = esp_timer_get_time() + 20LL * 1000 * 1000;
     while ((ret = mbedtls_ssl_handshake(&t->ssl)) != 0) {
         if ((ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) &&
-            esp_timer_get_time() < hs_deadline_us) {
-            continue;  /* each socket timeout is 10s; the deadline bounds the total */
+            esp_timer_get_time() < hs_deadline_us && !ml_shutdown_requested(ml)) {
+            continue;  /* each socket timeout is a 1 s slice; the deadline bounds the total */
         }
         goto fail;
     }
