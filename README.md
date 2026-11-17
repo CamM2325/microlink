@@ -24,6 +24,8 @@ before you rely on it.
 - **Sockets over the tunnel**: a UDP API and an outbound TCP API that are bound to the VPN address.
 - **4G/LTE** through SIMCom modems: PPP (real lwIP sockets, direct UDP possible) or an AT-command
   socket bridge, with optional WiFi ⇄ cellular failover and fast network rebinding.
+- **Subnet router / exit node** (opt-in): advertise LAN routes or `0.0.0.0/0` and forward
+  tailnet traffic to them, masqueraded with lwIP NAPT.
 - **Peer cache in NVS**, so known peers are usable right after a reboot.
 - **Optional on-device web UI** for settings (password-protected, tailnet-only by default).
 
@@ -39,7 +41,8 @@ WireGuard path, ICMP and UDP echo with a real Tailscale client against
 | Headscale v0.29.7 (plain HTTP, Tailscale DERP map) | WiFi | direct path, 0% loss |
 | Ionscale 0.18.0 (plain HTTP, Tailscale DERP map) | WiFi | direct path, 0% loss |
 
-Also tested: repeated stop/start (no memory growth), reconnect after reboot.
+Also tested: repeated stop/start (no memory growth), reconnect after reboot, and (Headscale, WiFi)
+the device as subnet router for its LAN and as exit node for a Tailscale client.
 
 **Tested by contributors:** ESP32-C3 without PSRAM (small tailnet, see PR #43); a Headscale-based
 control plane over TLS (PR #22).
@@ -47,7 +50,9 @@ control plane over TLS (PR #22).
 **Not supported (yet):**
 
 - IPv4 tunnel addresses only (no `fd7a:…` IPv6 inside the tunnel).
-- No subnet routes, exit nodes or `--advertise-routes` (issue #6).
+- Subnet routes work in one direction only: the device can *be* a subnet router or exit node,
+  but it does not use other nodes' subnet routes or exit nodes (no `--accept-routes` /
+  `--exit-node`).
 - No interactive / QR-code login; an auth key is required (issue #8).
 - No Tailscale SSH, Taildrop, MagicDNS server or HTTPS certificates.
   (`microlink_resolve()` looks a peer name up in the local peer list.)
@@ -192,6 +197,7 @@ Notes:
 | `disco_heartbeat_ms`, `stun_interval_ms`, `ctrl_watchdog_ms` | Defaults 3000 / 23000 / 120000. |
 | `wifi_tx_power_dbm` | 0 = leave the driver default. |
 | `ctrl_host`, `ctrl_noise_pubkey`, `streaming_map_fetch` | Custom control servers (see below). |
+| `advertise_routes` | Subnet routes / exit node, NULL = `CONFIG_ML_ADVERTISE_ROUTES` (see below). |
 
 ## Configuration (menuconfig)
 
@@ -208,6 +214,7 @@ override the Kconfig defaults at runtime.
 | `ML_H2_BUFFER_SIZE_KB` / `ML_JSON_BUFFER_SIZE_KB` | 512 / 512 | Map-response buffers (PSRAM if present). Lower on boards without PSRAM. |
 | `ML_ZERO_COPY_WG` | n | High-throughput receive path on a raw lwIP PCB (contributed by dj-oyu). |
 | `ML_UDP_RX_TASK_PRIO` | 7 | UDP callback task priority. |
+| `ML_SUBNET_ROUTER` / `ML_ADVERTISE_ROUTES` | n / "" | Subnet router and exit node; turns on lwIP IP forwarding and NAPT. |
 | `ML_STOP_TIMEOUT_MS` | 30000 | How long `microlink_stop()` waits. |
 | MicroLink log verbosity | Same as ESP-IDF | Compile-time level for MicroLink's own logs (`ML_LOG_LEVEL_WARN` / `_INFO` / `_DEBUG` / `_VERBOSE`). Warning saves about 17–23 KB of flash. Debug/Verbose messages also need `esp_log_level_set("<tag>", ...)` at run time. |
 | **Credentials** | | `ML_WIFI_SSID`, `ML_WIFI_PASSWORD`, `ML_TAILSCALE_AUTH_KEY`, `ML_DEVICE_NAME` (compiled into the image). |
@@ -292,6 +299,28 @@ to a streaming fetch automatically (or set `CONFIG_ML_CTRL_STREAMING_MAP_FETCH` 
 `parttool.py erase_partition --partition-name=nvs`) when moving a board between control servers. If your DERP or HTTPS
 endpoint uses a private CA, add it to the certificate bundle (`CONFIG_MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE`)
 or turn off `ML_DERP_VERIFY_CERT` / `ML_CTRL_TLS_VERIFY_CERT`.
+
+## Subnet router and exit node
+
+With `CONFIG_ML_SUBNET_ROUTER=y` the device gives tailnet peers access to the network on its other
+interface (WiFi station or Ethernet), like `tailscale up --advertise-routes`:
+
+```
+CONFIG_ML_SUBNET_ROUTER=y
+CONFIG_ML_ADVERTISE_ROUTES="192.168.1.0/24"    # add 0.0.0.0/0 to offer the device as an exit node
+```
+
+(or `advertise_routes` in `microlink_config_t`; `examples/sdkconfig.router.defaults` is a ready-made
+overlay). Approve the routes in the admin console (or with `autoApprovers`), then enable them on the
+clients: `tailscale set --accept-routes`, or select the device as exit node.
+
+- Forwarded traffic leaves with the device's LAN address as source (lwIP NAPT), as with Tailscale's
+  default `--snat-subnet-routes`, so LAN hosts need no route back to the tailnet.
+- From the tunnel, the device accepts only packets addressed to its tailnet IP or to an advertised
+  route, whatever the ACL setting. ACLs (`ML_PACKET_FILTER`) apply to routed traffic too.
+- IPv4 only. An exit node also advertises `::/0`, because Tailscale requires both default routes,
+  but IPv6 traffic sent to it is dropped.
+- Measured on an ESP32-S3 over WiFi: about 4 Mbit/s of downloads through the device as exit node.
 
 ## Config web UI
 

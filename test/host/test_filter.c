@@ -134,6 +134,73 @@ int main(void) {
     ml_filter_init(ML_FILTER_MODE_ENFORCE);
     CHECK(in(17, "100.64.0.6", 1, 53, 0, 0));
 
+    /* Advertised routes: parsing. */
+    {
+        ml_route_t r[ML_MAX_ROUTES];
+        char s[20];
+        CHECK(ml_routes_parse(NULL, r, ML_MAX_ROUTES) == 0);
+        CHECK(ml_routes_parse(" ,\n", r, ML_MAX_ROUTES) == 0);
+        CHECK(ml_routes_parse("192.168.1.5/24, 10.0.0.0/8;10.0.0.0/8\n172.16.0.1", r, ML_MAX_ROUTES) == 3);
+        CHECK(r[0].net == ip("192.168.1.0") && r[0].len == 24);   /* host bits cleared */
+        CHECK(r[1].net == ip("10.0.0.0") && r[1].len == 8);       /* duplicate dropped */
+        CHECK(r[2].net == ip("172.16.0.1") && r[2].len == 32);    /* bare address */
+        ml_routes_format(&r[0], s, sizeof(s));
+        CHECK(strcmp(s, "192.168.1.0/24") == 0);
+        CHECK(!ml_routes_is_exit_node(r, 3));
+        CHECK(ml_routes_contain(r, 3, ip("10.200.0.1")));
+        CHECK(!ml_routes_contain(r, 3, ip("172.16.0.2")));
+        CHECK(ml_routes_parse("0.0.0.0/0 ::/0", r, ML_MAX_ROUTES) == 1);
+        CHECK(ml_routes_is_exit_node(r, 1));
+        CHECK(ml_routes_contain(r, 1, ip("8.8.8.8")));
+        ml_routes_format(&r[0], s, sizeof(s));
+        CHECK(strcmp(s, "0.0.0.0/0") == 0);
+        CHECK(ml_routes_parse("192.168.1.0/33", r, ML_MAX_ROUTES) == -1);
+        CHECK(ml_routes_parse("256.1.1.1/8", r, ML_MAX_ROUTES) == -1);
+        CHECK(ml_routes_parse("1.2.3/24", r, ML_MAX_ROUTES) == -1);
+        CHECK(ml_routes_parse("1.2.3.4/", r, ML_MAX_ROUTES) == -1);
+        CHECK(ml_routes_parse("1.2.3.4/24x", r, ML_MAX_ROUTES) == -1);
+        CHECK(ml_routes_parse("1111.2.3.4", r, ML_MAX_ROUTES) == -1);
+        CHECK(ml_routes_parse("fd00::/8", r, ML_MAX_ROUTES) == -1);
+        CHECK(ml_routes_parse("1.0.0.0/8,2.0.0.0/8,3.0.0.0/8", r, 2) == -1);
+    }
+
+    /* Destination check: tailnet IP and advertised routes only, in every
+     * mode, before any rule or bypass. */
+    {
+        ml_route_t r[1];
+        uint8_t b[64];
+        size_t n;
+        CHECK(ml_routes_parse("192.168.1.0/24", r, 1) == 1);
+        ml_filter_set_local(ip(ME), r, 1);
+        n = pkt(b, 17, "100.64.0.6", "192.168.1.20", 1, 53, 0, 0);
+        CHECK(ml_filter_check_inbound(b, n, 1000));        /* inside the route */
+        n = pkt(b, 17, "100.64.0.6", "192.168.2.20", 1, 53, 0, 0);
+        CHECK(!ml_filter_check_inbound(b, n, 1000));       /* outside */
+        n = pkt(b, 6, "100.64.0.6", "10.0.0.1", 1, 22, ACK, 0);
+        CHECK(!ml_filter_check_inbound(b, n, 1000));       /* non-SYN TCP is no way round it */
+        n = pkt(b, 1, "100.64.0.6", "10.0.0.1", 0, 0, 0, 0);
+        CHECK(!ml_filter_check_inbound(b, n, 1000));       /* nor an ICMP reply */
+        ml_filter_init(ML_FILTER_MODE_OFF);
+        CHECK(!ml_filter_check_inbound(b, n, 1000));       /* nor ACLs off */
+        CHECK(in(17, "100.64.0.6", 1, 53, 0, 0));          /* own IP unaffected */
+        ml_filter_init(ML_FILTER_MODE_ENFORCE);
+
+        /* A UDP flow the device opened admits replies to the device only,
+         * not to a LAN host on the same ports. */
+        apply("{\"PacketFilter\":[]}");
+        n = pkt(b, 17, ME, "100.64.0.7", 5000, 7000, 0, 0);
+        ml_filter_note_outbound(b, n, 1000);
+        CHECK(in(17, "100.64.0.7", 7000, 5000, 0, 0));
+        n = pkt(b, 17, "100.64.0.7", "192.168.1.20", 7000, 5000, 0, 0);
+        CHECK(!ml_filter_check_inbound(b, n, 1000));
+
+        /* Self IP unknown: no destination check yet. */
+        ml_filter_set_local(0, NULL, 0);
+        apply("{\"PacketFilter\":[{\"SrcIPs\":[\"*\"],\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":0,\"Last\":65535}}]}]}");
+        n = pkt(b, 17, "100.64.0.6", "192.168.2.20", 1, 53, 0, 0);
+        CHECK(ml_filter_check_inbound(b, n, 1000));
+    }
+
     if (failures) { fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
     printf("all packet filter tests passed\n");
     return 0;

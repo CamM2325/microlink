@@ -973,6 +973,50 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
 /* do_register: the control plane rejected our auth (vs. -1 = I/O error) */
 #define ML_REG_AUTH_FAILED (-2)
 
+/* Hostinfo, sent in RegisterRequest and every MapRequest. The control plane
+ * reads NetInfo.PreferredDERP from inside it to set Node.HomeDERP for the
+ * other peers, and RoutableIPs for subnet routes / exit node. */
+static void add_hostinfo(microlink_t *ml, cJSON *root) {
+    cJSON *hostinfo = cJSON_CreateObject();
+    if (!hostinfo) return;
+    const char *dev_name = (ml->config.device_name && ml->config.device_name[0])
+                               ? ml->config.device_name : microlink_default_device_name();
+    cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
+    cJSON_AddStringToObject(hostinfo, "OS", ML_HOSTINFO_OS);
+    cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
+    cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
+
+    cJSON *netinfo = cJSON_CreateObject();
+    if (netinfo) {
+        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
+        if (ml->stun_nat_checked) {
+            cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
+        }
+        cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
+    }
+
+    if (ml->route_count > 0) {
+        cJSON *routes = cJSON_CreateArray();
+        if (routes) {
+            for (int i = 0; i < ml->route_count; i++) {
+                char cidr[20];
+                ml_routes_format(&ml->routes[i], cidr, sizeof(cidr));
+                cJSON_AddItemToArray(routes, cJSON_CreateString(cidr));
+            }
+            /* Tailscale treats a node as an exit node only when it
+             * advertises both default routes (tsaddr.ContainsExitRoutes),
+             * as `tailscale up --advertise-exit-node` does. The tunnel is
+             * IPv4-only, so IPv6 sent to it is dropped. */
+            if (ml_routes_is_exit_node(ml->routes, ml->route_count)) {
+                cJSON_AddItemToArray(routes, cJSON_CreateString("::/0"));
+            }
+            cJSON_AddItemToObject(hostinfo, "RoutableIPs", routes);
+        }
+    }
+
+    cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
+}
+
 static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_reg_start = esp_timer_get_time();
 
@@ -996,25 +1040,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
         cJSON_AddItemToObject(root, "Auth", auth);
     }
 
-    /* Hostinfo */
-    cJSON *hostinfo = cJSON_CreateObject();
-    const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
-    cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-    cJSON_AddStringToObject(hostinfo, "OS", ML_HOSTINFO_OS);
-    cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
-    cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
-
-    /* NetInfo inside Hostinfo — control plane reads PreferredDERP from here
-     * to populate Node.HomeDERP for other peers */
-    {
-        cJSON *netinfo = cJSON_CreateObject();
-        if (netinfo) {
-            cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
-            cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
-        }
-    }
-
-    cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
+    add_hostinfo(ml, root);
 
     /* NodeKeyChallengeResponse - prove we own the WireGuard private key
      * Server sends challenge public key in EarlyNoise; we respond with
@@ -1907,26 +1933,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON_AddBoolToObject(root, "KeepAlive", true);
     cJSON_AddStringToObject(root, "Compress", "");  /* Disable compression */
 
-    /* Hostinfo */
-    cJSON *hostinfo = cJSON_CreateObject();
-    const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
-    cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-    cJSON_AddStringToObject(hostinfo, "OS", ML_HOSTINFO_OS);
-    cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
-    cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
-    cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
-
-    /* NetInfo: tell control plane our preferred DERP region and NAT type.
-     * MUST be inside Hostinfo — the control plane reads Hostinfo.NetInfo.PreferredDERP
-     * to populate Node.HomeDERP for other peers. */
-    cJSON *netinfo = cJSON_CreateObject();
-    if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
-        if (ml->stun_nat_checked) {
-            cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
-        }
-        cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
-    }
+    add_hostinfo(ml, root);
 
     /* Include endpoints if STUN has already completed (Stream=false →
      * control plane processes these, unlike Stream=true with Version >= 68) */
@@ -2247,27 +2254,7 @@ static int do_start_long_poll(microlink_t *ml, ml_noise_state_t *noise, bool omi
 
     /* Hostinfo - REQUIRED by control plane even for Stream=true.
      * V1 includes this; without it, server may not keep us "online". */
-    cJSON *hostinfo = cJSON_CreateObject();
-    if (hostinfo) {
-        const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
-        cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-        cJSON_AddStringToObject(hostinfo, "OS", ML_HOSTINFO_OS);
-        cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
-        cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
-        cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
-    }
-
-    /* NetInfo: tell control plane our preferred DERP region and NAT type.
-     * MUST be inside Hostinfo — the control plane reads Hostinfo.NetInfo.PreferredDERP
-     * to populate Node.HomeDERP for other peers. */
-    cJSON *netinfo = cJSON_CreateObject();
-    if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
-        if (ml->stun_nat_checked) {
-            cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
-        }
-        cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
-    }
+    add_hostinfo(ml, root);
 
     /* Stream=true for long-poll, KeepAlive=true so server sends keepalives
      * (which marks us as "online" on the control plane) */
@@ -2779,24 +2766,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON_AddStringToObject(root, "Compress", "");
 
     /* Hostinfo (required — control plane reads NetInfo from here) */
-    cJSON *hostinfo = cJSON_CreateObject();
-    if (hostinfo) {
-        const char *dev_name = (ml->config.device_name && ml->config.device_name[0]) ? ml->config.device_name : microlink_default_device_name();
-        cJSON_AddStringToObject(hostinfo, "Hostname", dev_name);
-        cJSON_AddStringToObject(hostinfo, "OS", ML_HOSTINFO_OS);
-        cJSON_AddStringToObject(hostinfo, "OSVersion", "ESP-IDF");
-        cJSON_AddStringToObject(hostinfo, "GoArch", "arm");
-        cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
-
-        cJSON *netinfo = cJSON_CreateObject();
-        if (netinfo) {
-            cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
-            if (ml->stun_nat_checked) {
-                cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
-            }
-            cJSON_AddItemToObject(hostinfo, "NetInfo", netinfo);
-        }
-    }
+    add_hostinfo(ml, root);
 
     /* Endpoints + EndpointTypes */
     int ep_count = add_endpoints_to_json(ml, root);

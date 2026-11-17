@@ -64,6 +64,16 @@ typedef struct {
      * OmitPeers=false and take Peers + DERPMap from the first MapResponse).
      * false (default) keeps the existing Stream=false one-shot fetch. */
     bool streaming_map_fetch;
+
+    /* Subnet router / exit node (needs CONFIG_ML_SUBNET_ROUTER). IPv4
+     * CIDRs, separated by commas or spaces, that this device offers to the
+     * tailnet, e.g. "192.168.1.0/24". "0.0.0.0/0" offers it as an exit node.
+     * Routes take effect once approved in the admin console (or by an
+     * autoApprovers policy). Traffic to them is forwarded out of the
+     * device's other interface with its address as source (SNAT), like
+     * Tailscale's default. NULL = CONFIG_ML_ADVERTISE_ROUTES. The string
+     * must stay valid until microlink_init() returns. */
+    const char *advertise_routes;
 } microlink_config_t;
 
 /* Peer info (read-only snapshot) */

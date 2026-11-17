@@ -460,6 +460,34 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         ml->ctrl_noise_pubkey_set = true;
     }
 
+    /* Advertised subnet routes / exit node */
+    const char *routes = config->advertise_routes;
+#ifdef CONFIG_ML_ADVERTISE_ROUTES
+    if (!routes) routes = CONFIG_ML_ADVERTISE_ROUTES;
+#endif
+    int nroutes = ml_routes_parse(routes, ml->routes, ML_MAX_ROUTES);
+    if (nroutes < 0) {
+        ESP_LOGE(TAG, "Invalid advertise_routes \"%s\": expected up to %d IPv4 CIDRs "
+                 "such as 192.168.1.0/24", routes, ML_MAX_ROUTES);
+        free(ml);
+        return NULL;
+    }
+#ifndef CONFIG_ML_SUBNET_ROUTER
+    if (nroutes > 0) {
+        ESP_LOGE(TAG, "advertise_routes is set but CONFIG_ML_SUBNET_ROUTER is off "
+                 "(the device could not forward the traffic)");
+        free(ml);
+        return NULL;
+    }
+#endif
+    ml->route_count = (uint8_t)nroutes;
+    for (int i = 0; i < nroutes; i++) {
+        char cidr[20];
+        ml_routes_format(&ml->routes[i], cidr, sizeof(cidr));
+        ESP_LOGI(TAG, "Advertising route %s%s", cidr,
+                 ml->routes[i].len == 0 ? " (exit node)" : "");
+    }
+
     ml->state = ML_STATE_IDLE;
     ml->coord_sock = -1;
     ml->disco_sock4 = -1;

@@ -56,7 +56,7 @@ typedef struct {
 } policy_t;
 typedef struct { char name[24]; policy_t *pol; } set_t;
 typedef struct {
-    uint32_t peer_ip, ts;
+    uint32_t peer_ip, local_ip, ts;
     uint16_t peer_port, local_port;
     bool     used;
 } flow_t;
@@ -66,6 +66,9 @@ static set_t   s_sets[MAX_SETS];
 static bool    s_configured;
 static flow_t  s_flows[FLOW_SLOTS];
 static ml_filter_stats_t s_stats;
+static uint32_t   s_self_ip;                    /* 0 = not known yet */
+static ml_route_t s_local_routes[ML_MAX_ROUTES];
+static int        s_nlocal_routes;
 
 /* ------------------------------------------------------------------------ */
 
@@ -261,6 +264,18 @@ void ml_filter_reset(void) {
     memset(s_flows, 0, sizeof(s_flows));
     memset(&s_stats, 0, sizeof(s_stats));
     s_configured = false;
+    s_self_ip = 0;
+    s_nlocal_routes = 0;
+    F_UNLOCK();
+}
+
+void ml_filter_set_local(uint32_t self_ip, const ml_route_t *routes, int n) {
+    if (n < 0 || !routes) n = 0;
+    if (n > ML_MAX_ROUTES) n = ML_MAX_ROUTES;
+    F_LOCK();
+    s_self_ip = self_ip;
+    if (n) memcpy(s_local_routes, routes, (size_t)n * sizeof(ml_route_t));
+    s_nlocal_routes = n;
     F_UNLOCK();
 }
 
@@ -335,11 +350,13 @@ static bool policy_allows_locked(uint32_t src, uint32_t dst, uint8_t proto, bool
     return false;
 }
 
-static bool flow_match_locked(uint32_t peer, uint16_t peer_port, uint16_t local_port, uint32_t now) {
+static bool flow_match_locked(uint32_t peer, uint16_t peer_port, uint32_t local,
+                              uint16_t local_port, uint32_t now) {
     for (int i = 0; i < FLOW_SLOTS; i++) {
         flow_t *f = &s_flows[i];
         if (f->used && f->peer_ip == peer && f->peer_port == peer_port &&
-            f->local_port == local_port && (uint32_t)(now - f->ts) < FLOW_TIMEOUT_MS) {
+            f->local_ip == local && f->local_port == local_port &&
+            (uint32_t)(now - f->ts) < FLOW_TIMEOUT_MS) {
             return true;
         }
     }
@@ -354,32 +371,50 @@ void ml_filter_note_outbound(const uint8_t *pkt, size_t len, uint32_t now) {
     size_t ihl = (size_t)(pkt[0] & 0x0F) * 4;
     if (pkt[9] != PROTO_UDP || ihl < 20 || len < ihl + 4) return;
     if (rd16(pkt + 6) & 0x1FFF) return;                /* non-first fragment */
-    uint32_t peer = rd32(pkt + 16);
+    uint32_t local = rd32(pkt + 12), peer = rd32(pkt + 16);
     uint16_t local_port = rd16(pkt + ihl), peer_port = rd16(pkt + ihl + 2);
     F_LOCK();
     flow_t *slot = NULL, *oldest = &s_flows[0];
     for (int i = 0; i < FLOW_SLOTS; i++) {
         flow_t *f = &s_flows[i];
-        if (f->used && f->peer_ip == peer && f->peer_port == peer_port && f->local_port == local_port) { slot = f; break; }
+        if (f->used && f->peer_ip == peer && f->peer_port == peer_port &&
+            f->local_ip == local && f->local_port == local_port) { slot = f; break; }
         if (!f->used && !slot) slot = f;
         if (f->used && (uint32_t)(now - f->ts) > (uint32_t)(now - oldest->ts)) oldest = f;
     }
     if (!slot) slot = oldest;
     slot->used = true;
     slot->peer_ip = peer;
+    slot->local_ip = local;
     slot->peer_port = peer_port;
     slot->local_port = local_port;
     slot->ts = now;
     F_UNLOCK();
 }
 
+/* Destination check, done in every mode: see ml_filter.h. */
+static bool dst_is_local(uint32_t dst) {
+    F_LOCK();
+    bool ok = s_self_ip == 0 || dst == s_self_ip ||
+              ml_routes_contain(s_local_routes, s_nlocal_routes, dst);
+    if (!ok) s_stats.dropped++;
+    F_UNLOCK();
+    return ok;
+}
+
 bool ml_filter_check_inbound(const uint8_t *pkt, size_t len, uint32_t now) {
-    if (s_mode == ML_FILTER_MODE_OFF) return true;
     if (!pkt || len < 20 || (pkt[0] >> 4) != 4) return true;   /* non-IPv4 is handled by cryptokey routing */
     size_t ihl = (size_t)(pkt[0] & 0x0F) * 4;
     if (ihl < 20 || ihl > len) return false;
     uint8_t proto = pkt[9];
     uint32_t src = rd32(pkt + 12), dst = rd32(pkt + 16);
+    if (!dst_is_local(dst)) {
+        F_LOGD("drop proto=%u to %u.%u.%u.%u: destination not local", proto,
+               (unsigned)(dst >> 24), (unsigned)((dst >> 16) & 0xFF),
+               (unsigned)((dst >> 8) & 0xFF), (unsigned)(dst & 0xFF));
+        return false;
+    }
+    if (s_mode == ML_FILTER_MODE_OFF) return true;
     bool first_frag = (rd16(pkt + 6) & 0x1FFF) == 0;
     bool has_port = false;
     uint16_t dport = 0;
@@ -405,7 +440,7 @@ bool ml_filter_check_inbound(const uint8_t *pkt, size_t len, uint32_t now) {
     }
 
     F_LOCK();
-    if (!accept && proto == PROTO_UDP && flow_match_locked(src, rd16(pkt + ihl), dport, now)) {
+    if (!accept && proto == PROTO_UDP && flow_match_locked(src, rd16(pkt + ihl), dst, dport, now)) {
         accept = true; why = "udp reply";
     }
     if (!accept && !s_configured) { accept = true; why = "no policy yet"; }

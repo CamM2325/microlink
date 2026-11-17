@@ -17,6 +17,7 @@
 
 #include "microlink.h"
 #include "ml_config_httpd.h"
+#include "ml_routes.h"
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -622,6 +623,10 @@ struct microlink_s {
      * or the built-in Tailscale key) */
     uint8_t ctrl_noise_pubkey[32];
     bool ctrl_noise_pubkey_set;
+
+    /* Advertised subnet routes (Hostinfo.RoutableIPs), parsed at init */
+    ml_route_t routes[ML_MAX_ROUTES];
+    uint8_t route_count;
 
     /* Debug flags (bitmask from NVS, checked at runtime for verbose logging) */
     uint8_t debug_flags;  /* bit 0: DISCO, bit 1: WG, bit 2: DERP, bit 3: coord */

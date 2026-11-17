@@ -102,6 +102,9 @@ jobs:
           # net_switch + cellular + config UI together
           - { idf: v5.3.6, example: failover_connect, overlay: sdkconfig.httpd.defaults }
           - { idf: v6.1.1, example: failover_connect, overlay: sdkconfig.httpd.defaults }
+          # subnet router / exit node (lwIP forwarding + NAPT)
+          - { idf: v5.3.6, example: basic_connect, overlay: sdkconfig.router.defaults }
+          - { idf: v6.1.1, example: basic_connect, overlay: sdkconfig.router.defaults }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

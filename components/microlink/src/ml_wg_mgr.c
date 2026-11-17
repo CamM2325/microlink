@@ -26,6 +26,9 @@
 #include "lwip/ip.h"
 #include "lwip/tcpip.h"
 #include "lwip/mem.h"
+#if IP_NAPT
+#include "lwip/lwip_napt.h"
+#endif
 #include "arch/sys_arch.h" /* sys_thread_tcpip() - detects whether we're already on tcpip_thread */
 #include "nacl_box.h"
 #include "wireguardif.h"
@@ -327,6 +330,7 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
 typedef struct {
     struct netif *netif;
     SemaphoreHandle_t done;
+    bool napt;          /* subnet router: masquerade forwarded traffic */
 } wg_netif_up_ctx_t;
 
 static void wg_netif_bring_up_in_tcpip(void *arg) {
@@ -335,6 +339,15 @@ static void wg_netif_bring_up_in_tcpip(void *arg) {
     netif_list = ctx->netif;
     netif_set_up(ctx->netif);
     netif_set_link_up(ctx->netif);
+#if IP_NAPT
+    /* lwIP translates forwarded packets whose *input* netif has NAPT on:
+     * tailnet traffic for an advertised route leaves the LAN interface
+     * with that interface's address as source, and replies arriving there
+     * are mapped back and routed into the tunnel. Needs the netif up. */
+    if (ctx->napt && !ip_napt_enable_netif(ctx->netif, 1)) {
+        ESP_LOGE(TAG, "Could not enable NAPT on the WireGuard netif");
+    }
+#endif
     xSemaphoreGive(ctx->done);
 }
 
@@ -374,6 +387,10 @@ typedef struct {
 static void wg_netif_remove_in_tcpip(void *arg) {
     wg_netif_down_ctx_t *ctx = (wg_netif_down_ctx_t *)arg;
     struct netif *netif = ctx->netif;
+#if IP_NAPT
+    /* Frees the NAPT table if no other netif uses it; needs the netif up */
+    if (netif->napt) ip_napt_enable_netif(netif, 0);
+#endif
     netif_set_link_down(netif);
     netif_set_down(netif);
     netif_remove(netif);
@@ -466,7 +483,18 @@ static void wg_free_unlinked_device(struct netif *netif) {
 
 /* Tailnet packet filter hooks (run on the RX task / tcpip_thread). */
 static bool wg_filter_rx_cb(void *ctx, const uint8_t *pkt, size_t len) {
-    (void)ctx;
+    /* Keep the filter's local addresses (tailnet IP + advertised routes)
+     * in step with ml->vpn_ip, which the coord task can change at any
+     * time. The cache only saves taking the filter lock per packet; if two
+     * receive paths (wg_mgr, zero-copy on tcpip_thread) race on it, both
+     * just push the same values. */
+    static uint32_t s_local_ip;
+    microlink_t *ml = (microlink_t *)ctx;
+    uint32_t self = ml->vpn_ip;
+    if (self != s_local_ip) {
+        ml_filter_set_local(self, ml->routes, ml->route_count);
+        s_local_ip = self;
+    }
     return ml_filter_check_inbound(pkt, len, (uint32_t)ml_get_time_ms());
 }
 
@@ -527,7 +555,8 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
     /* Add to lwIP netif list and bring up on tcpip_thread (bypass netif_add
      * which wants init callback) - see wg_netif_bring_up_in_tcpip() above. */
     {
-        wg_netif_up_ctx_t ctx = { .netif = netif, .done = xSemaphoreCreateBinary() };
+        wg_netif_up_ctx_t ctx = { .netif = netif, .done = xSemaphoreCreateBinary(),
+                                  .napt = ml->route_count > 0 };
         if (!ctx.done) {
             ESP_LOGE(TAG, "Failed to allocate netif-up semaphore");
             wg_free_unlinked_device(netif);
@@ -569,7 +598,11 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
 
     /* Register output callbacks for magicsock mode */
     wireguardif_set_derp_output(netif, wg_derp_output_cb, ml);
-#if defined(CONFIG_ML_PACKET_FILTER_ENFORCE) || defined(CONFIG_ML_PACKET_FILTER_LOG)
+#if defined(CONFIG_ML_PACKET_FILTER_ENFORCE) || defined(CONFIG_ML_PACKET_FILTER_LOG) || \
+    defined(CONFIG_ML_SUBNET_ROUTER)
+    /* With forwarding on, the destination check in ml_filter is what stops
+     * a peer from reaching addresses outside the advertised routes, so the
+     * hook is needed even when ACL enforcement is off. */
     wireguardif_set_ip_filter(netif, wg_filter_rx_cb, wg_filter_tx_cb, ml);
 #endif
     wireguardif_set_udp_output(netif, wg_udp_output_cb, ml);

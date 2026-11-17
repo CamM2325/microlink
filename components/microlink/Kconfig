@@ -161,6 +161,32 @@ menu "MicroLink V2 Configuration"
             Upper bound on source + destination entries in one rule set.
             A larger policy is rejected and the previous one kept.
 
+    config ML_SUBNET_ROUTER
+        bool "Subnet router / exit node"
+        default n
+        select LWIP_IP_FORWARD
+        select LWIP_IPV4_NAPT
+        help
+            Let the device advertise subnet routes (or 0.0.0.0/0, as an
+            exit node) and forward tailnet traffic for them out of its other
+            interface (Wi-Fi station or Ethernet). Forwarded traffic leaves
+            with the device's own address as source (SNAT/NAPT), so hosts on
+            the LAN need no route back to the tailnet. Enables lwIP IP
+            forwarding and NAPT.
+
+            The routes come from microlink_config_t.advertise_routes or,
+            when that is NULL, ML_ADVERTISE_ROUTES below. They must be
+            approved in the admin console (or by autoApprovers) before
+            peers use them.
+
+    config ML_ADVERTISE_ROUTES
+        string "Advertised routes"
+        depends on ML_SUBNET_ROUTER
+        default ""
+        help
+            IPv4 CIDRs separated by commas, e.g. "192.168.1.0/24". Add
+            "0.0.0.0/0" to offer the device as an exit node. Up to 8.
+
     config ML_UDP_RX_TASK_PRIO
         int "UDP socket receive task priority"
         default 7

@@ -1,0 +1,11 @@
+# MicroLink overlay: subnet router / exit node. Used by the firmware-variants
+# CI job, and usable as-is:
+#
+#   cd examples/basic_connect
+#   idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;../sdkconfig.router.defaults" build
+#
+# Edit the routes to match your LAN; approve them in the admin console
+# (Machines > the device > Edit route settings) or with autoApprovers.
+# Add 0.0.0.0/0 to offer the device as an exit node.
+CONFIG_ML_SUBNET_ROUTER=y
+CONFIG_ML_ADVERTISE_ROUTES="192.168.1.0/24"

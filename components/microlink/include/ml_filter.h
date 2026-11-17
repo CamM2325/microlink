@@ -11,6 +11,12 @@
  *   - ICMP: echo replies and errors are accepted; other ICMP needs a rule.
  * Before the first filter arrives everything is accepted.
  *
+ * Independently of the policy (in every mode, including OFF), inbound
+ * packets must be addressed to the device's tailnet IP or to one of its
+ * advertised subnet routes; anything else is dropped, like Tailscale's
+ * "destination not allowed". This keeps a peer from using a subnet router
+ * to reach addresses it does not advertise.
+ *
  * The core is pure C (plus cJSON) so it can be unit-tested on a PC.
  */
 #ifndef ML_FILTER_H
@@ -19,6 +25,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "ml_routes.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,6 +59,13 @@ void ml_filter_reset(void);
  * parsed or exceeds limits leaves the previous one in place.
  */
 bool ml_filter_update_from_map(const struct cJSON *map_response);
+
+/*
+ * Addresses the device accepts traffic for: its tailnet IP (host byte
+ * order) and its advertised routes. Until self_ip is set (non-zero) no
+ * destination check is made. The routes are copied.
+ */
+void ml_filter_set_local(uint32_t self_ip, const ml_route_t *routes, int n);
 
 /*
  * Inbound IPv4 packet from the tunnel (full IP packet, len bytes).
