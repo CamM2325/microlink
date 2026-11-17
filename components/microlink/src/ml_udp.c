@@ -23,8 +23,12 @@
  *   call holds an in-flight reference (api_refs) and refuses to start once
  *   closing is set. close() waits for the references to drain, waking a
  *   receiver blocked in rx_q with a NULL sentinel, before it removes the PCB
- *   or deletes the queues. Calls made after close() returned are still
- *   invalid (the handle is freed).
+ *   or deletes the queues. If a call is stuck for UDP_CLOSE_JOIN_MS, the
+ *   socket is still shut down (PCB removed, no further callbacks) and only
+ *   its memory is leaked. set_rx_callback() waiting for cb_lock gives up as
+ *   soon as closing is set, so close() from inside the callback can't
+ *   deadlock with it. Calls made after close() returned are still invalid
+ *   (the handle is freed).
  * - Peer-table work (handshake trigger, CallMeMaybe) is posted to the wg_mgr
  *   task, which owns ml->peers[].
  *
@@ -76,6 +80,7 @@ enum {
     UDP_OWNER_SHARED = 0,   /* RX task running, close() not finished */
     UDP_OWNER_CLOSER,       /* RX task exited; close() frees */
     UDP_OWNER_RX_TASK,      /* close() gave up waiting / ran on RX task; RX task frees */
+    UDP_OWNER_LEAKED,       /* an API call was stuck in close(): nobody frees */
 };
 
 struct microlink_udp_socket {
@@ -260,10 +265,11 @@ static void udp_rx_task(void *arg) {
     if (__atomic_compare_exchange_n(&sock->owner, &expected, UDP_OWNER_CLOSER,
                                     false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         xSemaphoreGive(sock->rx_exited);
-    } else {
+    } else if (expected == UDP_OWNER_RX_TASK) {
         udp_sock_free(sock);
         ESP_LOGI(TAG, "UDP socket freed by RX task");
     }
+    /* UDP_OWNER_LEAKED: a stuck API call may still touch sock; leave it. */
     vTaskDelete(NULL);
 }
 
@@ -459,9 +465,26 @@ void microlink_udp_close(microlink_udp_socket_t *sock) {
         }
         if (xTaskGetTickCount() - drain_start > pdMS_TO_TICKS(UDP_CLOSE_JOIN_MS)) {
             /* A call is stuck (tcpip_thread not answering?). Freeing now
-             * would be a use-after-free for it; leak the socket instead. */
-            ESP_LOGE(TAG, "UDP close: API call still in flight after %d ms, leaking the socket",
-                     UDP_CLOSE_JOIN_MS);
+             * would be a use-after-free for it, so only the memory is
+             * leaked: the socket itself is still shut down, so no packet is
+             * queued and no callback runs once close() returns. */
+            ESP_LOGE(TAG, "UDP close: API call still in flight after %d ms; "
+                     "closing the socket but leaking its memory", UDP_CLOSE_JOIN_MS);
+            __atomic_store_n(&sock->owner, UDP_OWNER_LEAKED, __ATOMIC_RELEASE);
+            sock->rx_stop = true;   /* the RX loop checks it before every callback */
+            udp_tcpip_call(udp_remove_in_tcpip, sock);
+            /* Wait out a callback already running (recursive: fine if we
+             * are that callback), then make sure it can't be called again. */
+            if (xSemaphoreTakeRecursive(sock->cb_lock, pdMS_TO_TICKS(UDP_CLOSE_JOIN_MS)) == pdTRUE) {
+                sock->rx_cb = NULL;
+                sock->rx_cb_data = NULL;
+                xSemaphoreGiveRecursive(sock->cb_lock);
+            } else {
+                ESP_LOGE(TAG, "UDP close: RX callback still running after %d ms", UDP_CLOSE_JOIN_MS);
+            }
+            if (xTaskGetCurrentTaskHandle() != sock->rx_task) {
+                xTaskNotifyGive(sock->rx_task);
+            }
             return;
         }
         vTaskDelay(1);
@@ -573,8 +596,22 @@ esp_err_t microlink_udp_set_rx_callback(microlink_udp_socket_t *sock,
     if (!sock) return ESP_ERR_INVALID_ARG;
     if (!udp_api_enter(sock)) return ESP_ERR_INVALID_STATE;
 
-    /* Blocks while the previous callback is running (unless called from it) */
-    xSemaphoreTakeRecursive(sock->cb_lock, portMAX_DELAY);
+    /* Blocks while the previous callback is running (unless called from
+     * it). That callback may itself be in close(), waiting for our
+     * reference to drain, so don't wait for cb_lock blindly: give up as
+     * soon as closing is set. (The reference is taken first so cb_lock
+     * can't be deleted under us while we wait for it.) */
+    while (xSemaphoreTakeRecursive(sock->cb_lock, pdMS_TO_TICKS(10)) != pdTRUE) {
+        if (__atomic_load_n(&sock->closing, __ATOMIC_SEQ_CST)) {
+            udp_api_leave(sock);
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+    if (__atomic_load_n(&sock->closing, __ATOMIC_SEQ_CST)) {
+        xSemaphoreGiveRecursive(sock->cb_lock);
+        udp_api_leave(sock);
+        return ESP_ERR_INVALID_STATE;
+    }
     sock->rx_cb = cb;
     sock->rx_cb_data = user_data;
     xSemaphoreGiveRecursive(sock->cb_lock);
