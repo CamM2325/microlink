@@ -194,7 +194,15 @@ static int coord_recv_ex(microlink_t *ml, uint8_t *buf, size_t len, bool must_co
     uint64_t progress_ms = start_ms;
     while (recvd < len) {
         int n = coord_raw_recv(ml, buf + recvd, len - recvd);
-        if (n <= 0) {
+        if (n == 0) {
+            /* Orderly close. recv() leaves errno alone here, and a stale
+             * EAGAIN would make callers read this as "no data yet". */
+            ESP_LOGW(TAG, "coord_recv: connection closed by peer (recvd %d/%d)",
+                     (int)recvd, (int)len);
+            errno = ECONNRESET;
+            return -1;
+        }
+        if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 if (recvd == 0 && !must_complete) {
                     /* No data consumed yet — timeout is fine, caller can retry */
@@ -264,7 +272,9 @@ static int noise_send(microlink_t *ml, ml_noise_state_t *noise,
     return ret;
 }
 
-/* Receive and decrypt a Noise transport frame, returns plaintext length */
+/* Receive and decrypt a Noise transport frame, returns plaintext length.
+ * On -1, errno is EAGAIN only when nothing was consumed (no data yet); every
+ * protocol error sets a different errno, since the stream is unusable then. */
 static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
                         uint8_t *plaintext, size_t max_len) {
     /* Read 3-byte frame header */
@@ -273,19 +283,28 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
 
     if (hdr[0] != 0x04) {
         ESP_LOGE(TAG, "Unexpected Noise frame type: 0x%02x", hdr[0]);
+        errno = EBADMSG;
         return -1;
     }
 
     uint16_t ct_len = (hdr[1] << 8) | hdr[2];
-    if (ct_len < 16) return -1;
+    if (ct_len < 16) {
+        ESP_LOGE(TAG, "Noise frame shorter than its MAC: %d", ct_len);
+        errno = EBADMSG;
+        return -1;
+    }
     size_t pt_len = ct_len - 16;
     if (pt_len > max_len) {
         ESP_LOGE(TAG, "Noise frame too large: %d > %d", (int)pt_len, (int)max_len);
+        errno = EMSGSIZE;
         return -1;
     }
 
     uint8_t *ciphertext = ml_psram_malloc(ct_len);
-    if (!ciphertext) return -1;
+    if (!ciphertext) {
+        errno = ENOMEM;
+        return -1;
+    }
 
     /* Header already consumed — the payload read must complete, in one
      * bounded read. Restarting it from byte 0 after a partial read would
@@ -302,6 +321,7 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
                           plaintext) != ESP_OK) {
         ESP_LOGE(TAG, "Noise decrypt failed (nonce=%lu)", (unsigned long)noise->rx_nonce);
         free(ciphertext);
+        errno = EBADMSG;
         return -1;
     }
     noise->rx_nonce++;
