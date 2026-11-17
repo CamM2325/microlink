@@ -581,6 +581,12 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
     return ESP_OK;
 }
 
+/* Known gaps (release audit I1, not fixed here): this writes netif->ip_addr
+ * from the wg_mgr task rather than on tcpip_thread (it runs once, before any
+ * traffic, so it has not mattered in practice), and it is only called at
+ * WG init: a VPN IP change received later on the long-poll is never applied
+ * to the WG netif. Fixing it means dispatching netif_set_ipaddr() to
+ * tcpip_thread and calling this when coord reports a new address. */
 static void wg_update_vpn_ip(microlink_t *ml) {
     if (ml->wg_netif && ml->vpn_ip != 0) {
         struct netif *netif = (struct netif *)ml->wg_netif;
@@ -891,6 +897,12 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
 
         wg_peer.keep_alive = 25;
 
+        /* greatest_timestamp starts at zero on every (re-)install (VPN IP
+         * change, key rotation, eviction, sweep and re-add), so one captured
+         * initiation from this peer could be replayed once per re-install to
+         * move the endpoint until real traffic or DISCO moves it back
+         * (release audit I2). That is inherent to WireGuard (a reboot does
+         * the same) and is accepted. */
         u8_t wg_peer_idx = WIREGUARDIF_INVALID_INDEX;
         err_t wg_err = wireguardif_add_peer(netif, &wg_peer, &wg_peer_idx);
 
