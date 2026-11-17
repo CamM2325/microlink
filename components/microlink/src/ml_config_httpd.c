@@ -403,7 +403,8 @@ const char *ml_config_get_device_name_full(const ml_config_ctx_t *ctx) {
  *   2. HTTP Basic auth with the admin password (CONFIG_ML_CONFIG_HTTPD_PASSWORD,
  *      or a random one generated on first start, stored in NVS and printed
  *      once on the serial console).
- *   3. a Host header that is an IP literal (blocks DNS rebinding).
+ *   3. a Host header that is an IP literal naming the local address the
+ *      request arrived on (blocks DNS rebinding).
  *   4. for state-changing requests, Content-Type: application/json
  *      (cross-site pages can't send it without a CORS preflight, which this
  *      server never approves -> blocks CSRF).
@@ -537,18 +538,55 @@ static bool local_addr_allowed(httpd_req_t *req, const microlink_t *ml, uint32_t
 #endif
 }
 
-static bool host_is_ip_literal(httpd_req_t *req) {
+/* Optional ":port" suffix of a Host header: 1-5 digits, <= 65535. */
+static bool host_port_ok(const char *p) {
+    if (!p) return true;
+    unsigned long v = 0;
+    int n = 0;
+    for (; *p; p++, n++) {
+        if (*p < '0' || *p > '9' || n >= 5) return false;
+        v = v * 10 + (unsigned long)(*p - '0');
+    }
+    return n > 0 && v <= 65535;
+}
+
+/* DNS-rebinding defence: the Host header must be an IP literal (IPv4, or
+ * "[...]" IPv6), with an optional port, naming the address the request
+ * arrived on (@p local_ip, host byte order). A character-class check is
+ * not enough: names such as "deadbeef.cafe" are made of hex digits only. */
+static bool host_is_local_ip_literal(httpd_req_t *req, uint32_t local_ip) {
     char host[64];
     if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
         return false;
     }
-    for (const char *c = host; *c; c++) {
-        if (!((*c >= '0' && *c <= '9') || *c == '.' || *c == ':' || *c == '[' || *c == ']' ||
-              (*c >= 'a' && *c <= 'f') || (*c >= 'A' && *c <= 'F'))) {
-            return false;
-        }
+    if (host[0] == '[') {
+#if LWIP_IPV6
+        char *close = strchr(host, ']');
+        if (!close) return false;
+        *close = '\0';
+        if (close[1] != '\0' && close[1] != ':') return false;
+        if (!host_port_ok(close[1] == ':' ? close + 2 : NULL)) return false;
+        struct in6_addr a6;
+        if (inet_pton(AF_INET6, host + 1, &a6) != 1) return false;
+        /* Only an IPv4-mapped form of the local address can match */
+        static const uint8_t v4mapped_prefix[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+        const uint8_t *b6 = a6.un.u8_addr;
+        if (memcmp(b6, v4mapped_prefix, sizeof(v4mapped_prefix)) != 0) return false;
+        uint32_t ip = ((uint32_t)b6[12] << 24) | ((uint32_t)b6[13] << 16) |
+                      ((uint32_t)b6[14] << 8) | (uint32_t)b6[15];
+        return ip == local_ip;
+#else
+        return false;
+#endif
     }
-    return true;
+    char *colon = strchr(host, ':');
+    if (colon) {
+        *colon = '\0';
+        if (!host_port_ok(colon + 1)) return false;
+    }
+    struct in_addr a4;
+    if (inet_pton(AF_INET, host, &a4) != 1) return false;
+    return ntohl(a4.s_addr) == local_ip;
 }
 
 static bool basic_auth_ok(httpd_req_t *req) {
@@ -579,7 +617,7 @@ static bool http_guard(httpd_req_t *req, bool mutating) {
         httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Not available on this interface");
         return false;
     }
-    if (!host_is_ip_literal(req)) {
+    if (!host_is_local_ip_literal(req, local_ip)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Use the device IP address");
         return false;
     }
