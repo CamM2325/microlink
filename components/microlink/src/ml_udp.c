@@ -19,6 +19,12 @@
  *   PCB, then joins the RX task; if close() runs on the RX task itself (from
  *   the callback) or the callback outlives the join timeout, the RX task
  *   frees the socket when it exits.
+ * - send()/recv()/set_rx_callback() racing close() on another task: each
+ *   call holds an in-flight reference (api_refs) and refuses to start once
+ *   closing is set. close() waits for the references to drain, waking a
+ *   receiver blocked in rx_q with a NULL sentinel, before it removes the PCB
+ *   or deletes the queues. Calls made after close() returned are still
+ *   invalid (the handle is freed).
  * - Peer-table work (handshake trigger, CallMeMaybe) is posted to the wg_mgr
  *   task, which owns ml->peers[].
  *
@@ -96,6 +102,7 @@ struct microlink_udp_socket {
     volatile bool closing;          /* close() started: API calls are refused */
     volatile bool rx_stop;          /* PCB gone: RX task exits, no more callbacks */
     int owner;                      /* UDP_OWNER_*, accessed atomically */
+    int api_refs;                   /* API calls in flight, accessed atomically */
 
     /* Per-socket, per-destination handshake retrigger limiter */
     portMUX_TYPE hs_mux;
@@ -149,6 +156,22 @@ static err_t udp_tcpip_call(err_t (*fn)(void *arg), void *arg) {
     return tcpip_api_call(udp_tcpip_trampoline, &c.call);
 }
 
+/* In-flight reference for an API call. Sequentially consistent with the
+ * closing flag in close(): either the call sees closing, or close() sees the
+ * reference and waits for it. */
+static bool udp_api_enter(microlink_udp_socket_t *sock) {
+    __atomic_add_fetch(&sock->api_refs, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&sock->closing, __ATOMIC_SEQ_CST)) {
+        __atomic_sub_fetch(&sock->api_refs, 1, __ATOMIC_SEQ_CST);
+        return false;
+    }
+    return true;
+}
+
+static void udp_api_leave(microlink_udp_socket_t *sock) {
+    __atomic_sub_fetch(&sock->api_refs, 1, __ATOMIC_SEQ_CST);
+}
+
 static void udp_sock_free(microlink_udp_socket_t *sock) {
     if (sock->rx_q) vQueueDelete(sock->rx_q);
     if (sock->free_q) vQueueDelete(sock->free_q);
@@ -183,9 +206,13 @@ static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     pbuf_copy_partial(p, pkt->data, pkt->len, 0);
     pbuf_free(p);
 
-    /* Cannot fail: rx_q and free_q together hold exactly UDP_RX_QUEUE_SIZE
-     * slot pointers. */
-    xQueueSend(sock->rx_q, &pkt, 0);
+    /* rx_q and free_q together hold exactly UDP_RX_QUEUE_SIZE slot
+     * pointers, so this only fails while close() has a wake-up sentinel
+     * queued: give the slot back and drop the packet. */
+    if (xQueueSend(sock->rx_q, &pkt, 0) != pdTRUE) {
+        xQueueSend(sock->free_q, &pkt, 0);
+        return;
+    }
     xTaskNotifyGive(sock->rx_task);
 }
 
@@ -212,6 +239,11 @@ static void udp_rx_task(void *arg) {
             if (xQueueReceive(sock->rx_q, &pkt, 0) != pdTRUE) {
                 xSemaphoreGiveRecursive(sock->cb_lock);
                 break;
+            }
+            if (!pkt) {
+                /* close()'s wake-up sentinel for blocked receivers */
+                xSemaphoreGiveRecursive(sock->cb_lock);
+                continue;
             }
             sock->rx_cb(sock, pkt->src_ip, pkt->src_port,
                         pkt->data, pkt->len, sock->rx_cb_data);
@@ -273,13 +305,19 @@ static err_t udp_open_in_tcpip(void *arg) {
 }
 
 static err_t udp_remove_in_tcpip(void *arg) {
-    /* Unlinks the PCB from udp_pcbs, so udp_recv_cb can no longer run for it */
-    udp_remove((struct udp_pcb *)arg);
+    /* Unlinks the PCB from udp_pcbs, so udp_recv_cb can no longer run for it.
+     * sock->pcb is cleared here, on tcpip_thread, so a send serialised after
+     * this sees NULL instead of a freed PCB. */
+    microlink_udp_socket_t *sock = (microlink_udp_socket_t *)arg;
+    if (sock->pcb) {
+        udp_remove(sock->pcb);
+        sock->pcb = NULL;
+    }
     return ERR_OK;
 }
 
 typedef struct {
-    struct udp_pcb *pcb;
+    microlink_udp_socket_t *sock;
     ip_addr_t dest;
     uint16_t dest_port;
     const void *data;
@@ -288,10 +326,13 @@ typedef struct {
 
 static err_t udp_send_in_tcpip(void *arg) {
     udp_send_args_t *a = (udp_send_args_t *)arg;
+    /* Read the PCB here, serialised with udp_remove_in_tcpip() */
+    struct udp_pcb *pcb = a->sock->pcb;
+    if (!pcb) return ERR_CLSD;
     struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, a->len, PBUF_RAM);
     if (!p) return ERR_MEM;
     memcpy(p->payload, a->data, a->len);
-    err_t err = udp_sendto(a->pcb, p, &a->dest, a->dest_port);
+    err_t err = udp_sendto(pcb, p, &a->dest, a->dest_port);
     pbuf_free(p);
     return err;
 }
@@ -401,18 +442,35 @@ microlink_udp_socket_t *microlink_udp_create(microlink_t *ml, uint16_t local_por
 
 void microlink_udp_close(microlink_udp_socket_t *sock) {
     if (!sock) return;
-    if (__atomic_exchange_n(&sock->closing, true, __ATOMIC_ACQ_REL)) {
+    if (__atomic_exchange_n(&sock->closing, true, __ATOMIC_SEQ_CST)) {
         ESP_LOGW(TAG, "UDP socket already closing");
         return;
     }
 
-    /* Remove the PCB first: once this returns, udp_recv_cb cannot run for
+    /* Let API calls that started before closing was set finish. A receiver
+     * blocked on an empty rx_q is woken with a NULL sentinel (re-posted
+     * while anyone is still in), so recv() returns instead of waiting on a
+     * queue that is about to be deleted. */
+    TickType_t drain_start = xTaskGetTickCount();
+    while (__atomic_load_n(&sock->api_refs, __ATOMIC_SEQ_CST) > 0) {
+        if (uxQueueMessagesWaiting(sock->rx_q) == 0) {
+            udp_rx_pkt_t *wake = NULL;
+            xQueueSendToFront(sock->rx_q, &wake, 0);
+        }
+        if (xTaskGetTickCount() - drain_start > pdMS_TO_TICKS(UDP_CLOSE_JOIN_MS)) {
+            /* A call is stuck (tcpip_thread not answering?). Freeing now
+             * would be a use-after-free for it; leak the socket instead. */
+            ESP_LOGE(TAG, "UDP close: API call still in flight after %d ms, leaking the socket",
+                     UDP_CLOSE_JOIN_MS);
+            return;
+        }
+        vTaskDelay(1);
+    }
+
+    /* Remove the PCB: once this returns, udp_recv_cb cannot run for
      * this socket again (it only runs on tcpip_thread, which has now
      * unlinked the PCB). */
-    if (sock->pcb) {
-        udp_tcpip_call(udp_remove_in_tcpip, sock->pcb);
-        sock->pcb = NULL;
-    }
+    udp_tcpip_call(udp_remove_in_tcpip, sock);
     /* Only now may the RX task exit: udp_recv_cb notifies it by handle. */
     sock->rx_stop = true;
 
@@ -453,17 +511,20 @@ esp_err_t microlink_udp_send(microlink_udp_socket_t *sock, uint32_t dest_ip,
                               uint16_t dest_port, const void *data, size_t len) {
     if (!sock || !data || len == 0) return ESP_ERR_INVALID_ARG;
     if (len > UDP_MAX_PKT_SIZE) return ESP_ERR_INVALID_SIZE;
-    if (sock->closing || !sock->pcb) return ESP_ERR_INVALID_STATE;
+    if (!udp_api_enter(sock)) return ESP_ERR_INVALID_STATE;
 
     udp_send_args_t send_args = {
-        .pcb = sock->pcb, .dest_port = dest_port, .data = data, .len = len,
+        .sock = sock, .dest_port = dest_port, .data = data, .len = len,
     };
     ip_to_lwip(dest_ip, &send_args.dest);
 
+    esp_err_t ret = ESP_OK;
     err_t err = udp_tcpip_call(udp_send_in_tcpip, &send_args);
-    if (err == ERR_MEM) return ESP_ERR_NO_MEM;
-
-    if (err != ERR_OK) {
+    if (err == ERR_MEM) {
+        ret = ESP_ERR_NO_MEM;
+    } else if (err == ERR_CLSD) {
+        ret = ESP_ERR_INVALID_STATE;
+    } else if (err != ERR_OK) {
         /* Typically no WG session to this peer yet. Rate-limited per socket
          * and destination: without this, high-frequency heartbeats each
          * trigger a full WG handshake initiation + CallMeMaybe, flooding the
@@ -471,23 +532,30 @@ esp_err_t microlink_udp_send(microlink_udp_socket_t *sock, uint32_t dest_ip,
         if (sock->ml && udp_hs_retrigger_due(sock, dest_ip)) {
             ml_wg_mgr_post_request(sock->ml, ML_PEER_REQ_HANDSHAKE, dest_ip);
         }
-        return ESP_FAIL;
+        ret = ESP_FAIL;
     }
 
-    return ESP_OK;
+    udp_api_leave(sock);
+    return ret;
 }
 
 esp_err_t microlink_udp_recv(microlink_udp_socket_t *sock, uint32_t *src_ip,
                               uint16_t *src_port, void *buffer, size_t *len,
                               uint32_t timeout_ms) {
     if (!sock || !buffer || !len || *len == 0) return ESP_ERR_INVALID_ARG;
-    if (sock->closing) return ESP_ERR_INVALID_STATE;
+    if (!udp_api_enter(sock)) return ESP_ERR_INVALID_STATE;
 
     udp_rx_pkt_t *pkt;
     TickType_t ticks = (timeout_ms == 0) ? 0 : pdMS_TO_TICKS(timeout_ms);
     if (timeout_ms > 0 && ticks == 0) ticks = 1;
     if (xQueueReceive(sock->rx_q, &pkt, ticks) != pdTRUE) {
+        udp_api_leave(sock);
         return ESP_ERR_TIMEOUT;
+    }
+    if (!pkt) {
+        /* close() woke us: the socket is going away */
+        udp_api_leave(sock);
+        return ESP_ERR_INVALID_STATE;
     }
 
     size_t copy = (pkt->len < *len) ? pkt->len : *len;
@@ -496,13 +564,14 @@ esp_err_t microlink_udp_recv(microlink_udp_socket_t *sock, uint32_t *src_ip,
     if (src_ip) *src_ip = pkt->src_ip;
     if (src_port) *src_port = pkt->src_port;
     xQueueSend(sock->free_q, &pkt, 0);
+    udp_api_leave(sock);
     return ESP_OK;
 }
 
 esp_err_t microlink_udp_set_rx_callback(microlink_udp_socket_t *sock,
                                          microlink_udp_rx_cb_t cb, void *user_data) {
     if (!sock) return ESP_ERR_INVALID_ARG;
-    if (sock->closing) return ESP_ERR_INVALID_STATE;
+    if (!udp_api_enter(sock)) return ESP_ERR_INVALID_STATE;
 
     /* Blocks while the previous callback is running (unless called from it) */
     xSemaphoreTakeRecursive(sock->cb_lock, portMAX_DELAY);
@@ -512,6 +581,7 @@ esp_err_t microlink_udp_set_rx_callback(microlink_udp_socket_t *sock,
 
     /* Deliver anything that queued up while there was no callback */
     if (cb) xTaskNotifyGive(sock->rx_task);
+    udp_api_leave(sock);
     return ESP_OK;
 }
 
