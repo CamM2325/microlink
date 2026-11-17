@@ -9,7 +9,9 @@
  *     packets belong to connections that had to start with a checked SYN.
  *   - UDP: replies to flows this device started are accepted (flow table).
  *   - ICMP: echo replies and errors are accepted; other ICMP needs a rule.
- * Before the first filter arrives everything is accepted.
+ * Until the first policy arrives nothing new is accepted (replies and ICMP
+ * errors are), like Tailscale's initial allow-nothing filter. A rule set
+ * that cannot be applied (malformed, too large) allows nothing.
  *
  * Independently of the policy (in every mode, including OFF), inbound
  * packets must be addressed to the device's tailnet IP or to one of its

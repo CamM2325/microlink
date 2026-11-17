@@ -501,6 +501,8 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->stun_sock = -1;
     ml->stun_sock6 = -1;
     ml->derp.sockfd = -1;
+    ml->derp_wake_fd = -1;   /* created by the DERP task (eventfd); before any
+                              * error path, so ml_release() never closes fd 0 */
 
     /* Resolve timing (0 = use defaults from #defines) */
     ml->t_disco_heartbeat_ms = ml->config.disco_heartbeat_ms ? ml->config.disco_heartbeat_ms : ML_DISCO_HEARTBEAT_MS;
@@ -608,7 +610,6 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->coord_cmd_queue = xQueueCreate(ML_COORD_CMD_QUEUE_DEPTH, sizeof(ml_coord_cmd_t));
     ml->peer_update_queue = xQueueCreate(ML_PEER_UPDATE_QUEUE_DEPTH, sizeof(ml_peer_update_t *));
     ml->wg_wake = xSemaphoreCreateBinary();
-    ml->derp_wake_fd = -1;   /* created by the DERP task (eventfd) */
 
     if (!ml->derp_tx_queue || !ml->disco_rx_queue || !ml->wg_rx_queue ||
         !ml->stun_rx_queue || !ml->coord_cmd_queue || !ml->peer_update_queue ||

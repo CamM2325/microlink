@@ -638,6 +638,10 @@ struct microlink_s {
     /* Advertised subnet routes (Hostinfo.RoutableIPs), parsed at init */
     ml_route_t routes[ML_MAX_ROUTES];
     uint8_t route_count;
+    /* VPN IP last pushed to ml_filter_set_local() (0 = not yet). Per
+     * context, so a re-created instance always pushes it again (ml_filter
+     * is reset in microlink_destroy). */
+    uint32_t filter_local_ip;
 
     /* Debug flags (bitmask from NVS, checked at runtime for verbose logging) */
     uint8_t debug_flags;  /* bit 0: DISCO, bit 1: WG, bit 2: DERP, bit 3: coord */

@@ -1584,6 +1584,7 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
                  update->hostname, ip_str, update->derp_region, update->endpoint_count);
 
         /* Send to wg_mgr task via queue */
+        ml_wg_mgr_wake(ml);   /* drain while we parse: the queue can fill on big maps */
         if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
             ESP_LOGW(TAG, "Peer update queue full, dropping %s", update->hostname);
             free(update);
@@ -1602,6 +1603,7 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
             if (done) {
                 done->action = ML_PEER_SYNC_DONE;
                 done->netmap_gen = gen;
+                ml_wg_mgr_wake(ml);   /* drain while we parse: the queue can fill on big maps */
                 if (xQueueSend(ml->peer_update_queue, &done, pdMS_TO_TICKS(500)) != pdTRUE) {
                     free(done);
                 }
@@ -1647,6 +1649,7 @@ check_removed:
                          update->public_key[2], update->public_key[3]);
             }
 
+            ml_wg_mgr_wake(ml);   /* drain while we parse: the queue can fill on big maps */
             if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
                 free(update);
             }
@@ -1738,6 +1741,7 @@ check_removed:
                              i64_to_str(id_str, update->node_id), update->endpoint_count,
                              update->key_valid, update->disco_valid);
 
+                    ml_wg_mgr_wake(ml);   /* drain while we parse: the queue can fill on big maps */
                     if (xQueueSend(ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
                         free(update);
                     }
@@ -1996,6 +2000,25 @@ static void parse_derp_map_from_map(microlink_t *ml, cJSON *map_json) {
     ESP_LOGI(TAG, "DERPMap: parsed %d regions", ml->derp_region_count);
 }
 
+/* MapResponse bodies are a 4-byte length (little-endian; big-endian also
+ * accepted) followed by JSON. Never detect the JSON by looking for '{':
+ * the length's low byte is itself '{' (0x7B) whenever length % 256 == 123,
+ * which made a netmap of such a size unreadable. The prefix is trusted when
+ * it is plausible and the JSON starts right after it; otherwise a body that
+ * starts with '{' is taken as JSON without a prefix.
+ * Returns the JSON offset (4 or 0) and sets *json_len (0 = unknown, use
+ * what is there), or -1 if it is neither. */
+static int map_json_offset(const uint8_t *b, size_t have, size_t *json_len) {
+    if (have >= 5 && b[4] == '{') {
+        size_t le = (size_t)b[0] | ((size_t)b[1] << 8) | ((size_t)b[2] << 16) | ((size_t)b[3] << 24);
+        size_t be = ((size_t)b[0] << 24) | ((size_t)b[1] << 16) | ((size_t)b[2] << 8) | (size_t)b[3];
+        if (le > 0 && le < ML_JSON_BUFFER_SIZE) { *json_len = le; return 4; }
+        if (be > 0 && be < ML_JSON_BUFFER_SIZE) { *json_len = be; return 4; }
+    }
+    if (have >= 1 && b[0] == '{') { *json_len = 0; return 0; }
+    return -1;
+}
+
 static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_map_start = esp_timer_get_time();
 
@@ -2232,24 +2255,18 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
         ESP_LOGI(TAG, "MapResponse first %d bytes (hex): %s", dump, hexbuf);
     }
 
-    /* Check for length prefix (Tailscale binary framing: 4-byte big-endian length before JSON) */
+    /* Length prefix (4 bytes, little-endian) before the JSON: see map_json_offset */
     char *parse_start = (char *)resp_buf;
     size_t parse_len = json_total;
-
-    /* Find the start of JSON - look for '{' in first 8 bytes */
-    int json_offset = -1;
-    for (int i = 0; i < 8 && i < (int)json_total; i++) {
-        if (resp_buf[i] == '{') {
-            json_offset = i;
-            break;
-        }
-    }
+    size_t prefixed_len = 0;
+    int json_offset = map_json_offset(resp_buf, json_total, &prefixed_len);
     if (json_offset > 0) {
         ESP_LOGI(TAG, "JSON starts at offset %d (skipping %d-byte prefix)", json_offset, json_offset);
         parse_start += json_offset;
         parse_len -= json_offset;
+        if (prefixed_len > 0 && prefixed_len < parse_len) parse_len = prefixed_len;  /* this message only */
     } else if (json_offset < 0) {
-        ESP_LOGW(TAG, "No '{' found in first 8 bytes of MapResponse!");
+        ESP_LOGW(TAG, "MapResponse is neither length-prefixed nor plain JSON");
     }
 
     /* Null-terminate */
@@ -2703,16 +2720,10 @@ static int do_read_initial_netmap(microlink_t *ml, ml_noise_state_t *noise) {
          * considered complete once it parses fully. */
         const uint8_t *mb = ml->coord_st.lp.msg;
         size_t have = ml->coord_st.lp.msg_len;
-        if (have >= 4 && msg_len == 0 && mb[0] != '{') {
-            size_t le = (size_t)mb[0] | ((size_t)mb[1] << 8) |
-                        ((size_t)mb[2] << 16) | ((size_t)mb[3] << 24);
-            size_t be = ((size_t)mb[0] << 24) | ((size_t)mb[1] << 16) |
-                        ((size_t)mb[2] << 8) | (size_t)mb[3];
-            if (le > 0 && le < ML_JSON_BUFFER_SIZE) {
-                msg_len = le;
-                msg_off = 4;
-            } else if (be > 0 && be < ML_JSON_BUFFER_SIZE) {
-                msg_len = be;
+        if (msg_len == 0 && have >= 5) {
+            size_t plen = 0;
+            if (map_json_offset(mb, have, &plen) == 4) {
+                msg_len = plen;
                 msg_off = 4;
             }
         }
@@ -2734,8 +2745,8 @@ static int do_read_initial_netmap(microlink_t *ml, ml_noise_state_t *noise) {
 
         uint64_t now = ml_get_time_ms();
         if (!msg_complete && now - last_progress_ms > 5000) {
-            ESP_LOGI(TAG, "Initial netmap: received %dKB so far (%lums elapsed)",
-                     (int)(have / 1024), (unsigned long)(now - recv_start_ms));
+            ESP_LOGI(TAG, "Initial netmap: %d of %d bytes so far (%lums elapsed)",
+                     (int)have, (int)(msg_off + msg_len), (unsigned long)(now - recv_start_ms));
             last_progress_ms = now;
         }
 
@@ -3082,6 +3093,7 @@ void ml_coord_task(void *arg) {
         case COORD_REGISTER:
             ESP_LOGI(TAG, "Registering...");
             {
+                uint64_t reg_start_ms = ml_get_time_ms();
                 int reg_rc = do_register(ml, &noise);
                 if (reg_rc == ML_REG_NEEDS_LOGIN || reg_rc == ML_REG_PENDING) {
                     /* Reconnect at once and send the Followup (register uses
@@ -3095,7 +3107,14 @@ void ml_coord_task(void *arg) {
                             ml->state_cb(ml, ML_STATE_NEEDS_LOGIN, ml->state_cb_data);
                         }
                     }
-                    reconnect_attempts = 0;
+                    /* Retry at once after a new URL or a Followup the server
+                     * held open (a real wait for the user). One it answered
+                     * straight away (e.g. waiting for device approval) backs
+                     * off like any other retry instead of looping every 1 s. */
+                    if (reg_rc == ML_REG_NEEDS_LOGIN ||
+                        ml_get_time_ms() - reg_start_ms >= 10000) {
+                        reconnect_attempts = 0;
+                    }
                     coord_close_conn(ml);
                     state = COORD_RECONNECTING;
                     break;
@@ -3381,22 +3400,17 @@ void ml_coord_task(void *arg) {
                     if (now - last_expiry_check_ms > 60000) {
                         last_expiry_check_ms = now;
                         if (ml->key_expired) {
-                            /* init requires a non-NULL auth_key; "" means the
-                             * device was provisioned without one. */
+                            /* With an auth key, register again with it. Without
+                             * one (interactive login), register without: the
+                             * server answers with a new login URL and the
+                             * device goes to NEEDS_LOGIN. */
                             if (ml->config.auth_key && ml->config.auth_key[0]) {
                                 ESP_LOGW(TAG, "Key expired, re-registering with auth_key...");
-                                state = COORD_RECONNECTING;
-                                break;
                             } else {
-                                /* Checked every 60 s: notify the host once. */
-                                if (ml->state != ML_STATE_AUTH_FAILED) {
-                                    ESP_LOGE(TAG, "Key expired but no auth_key — manual re-provisioning needed!");
-                                    ml->state = ML_STATE_AUTH_FAILED;
-                                    if (ml->state_cb) {
-                                        ml->state_cb(ml, ML_STATE_AUTH_FAILED, ml->state_cb_data);
-                                    }
-                                }
+                                ESP_LOGW(TAG, "Key expired, asking for a new login...");
                             }
+                            state = COORD_RECONNECTING;
+                            break;
                         }
                         /* Warn 1 hour before expiry (rough uptime-based check) */
                         /* Note: key_expiry_epoch is absolute Unix time, we compare with

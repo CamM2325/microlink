@@ -17,10 +17,15 @@ static size_t pkt(uint8_t *b, uint8_t proto, const char *src, const char *dst,
     b[0] = 0x45; b[9] = proto;
     uint32_t s = ip(src), d = ip(dst);
     for (int i = 0; i < 4; i++) { b[12 + i] = (uint8_t)(s >> (24 - 8 * i)); b[16 + i] = (uint8_t)(d >> (24 - 8 * i)); }
-    if (proto == 1) { b[20] = icmp_type; return 28; }
-    b[20] = (uint8_t)(sport >> 8); b[21] = (uint8_t)sport; b[22] = (uint8_t)(dport >> 8); b[23] = (uint8_t)dport;
-    if (proto == 6) { b[33] = tcp_flags; return 40; }
-    return 28;
+    size_t n = 28;
+    if (proto == 1) {
+        b[20] = icmp_type;
+    } else {
+        b[20] = (uint8_t)(sport >> 8); b[21] = (uint8_t)sport; b[22] = (uint8_t)(dport >> 8); b[23] = (uint8_t)dport;
+        if (proto == 6) { b[33] = tcp_flags; n = 40; }
+    }
+    b[2] = (uint8_t)(n >> 8); b[3] = (uint8_t)n;   /* IP total length */
+    return n;
 }
 
 static void apply(const char *json) {
@@ -42,8 +47,11 @@ static bool in(uint8_t proto, const char *src, uint16_t sport, uint16_t dport, u
 int main(void) {
     ml_filter_init(ML_FILTER_MODE_ENFORCE);
 
-    /* Before any policy: accept. */
-    CHECK(in(17, "100.64.0.9", 1234, 22, 0, 0));
+    /* Before any policy: nothing new gets in (as in Tailscale); replies and
+     * errors do. */
+    CHECK(!in(17, "100.64.0.9", 1234, 22, 0, 0));
+    CHECK(!in(6, "100.64.0.9", 1234, 22, SYN, 0));
+    CHECK(in(1, "100.64.0.9", 0, 0, 0, 0));
 
     /* Tailscale's default allow-all policy. */
     apply("{\"PacketFilter\":[{\"SrcIPs\":[\"*\"],\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":0,\"Last\":65535}}]}]}");
@@ -129,10 +137,54 @@ int main(void) {
     ml_filter_get_stats(&st1);
     CHECK(st1.dropped == st0.dropped + 1);
 
-    /* Reset clears policy. */
+    /* Reset clears the policy: back to allowing nothing new. */
     ml_filter_reset();
     ml_filter_init(ML_FILTER_MODE_ENFORCE);
-    CHECK(in(17, "100.64.0.6", 1, 53, 0, 0));
+    CHECK(!in(17, "100.64.0.6", 1, 53, 0, 0));
+
+#define ALLOW_ALL "[{\"SrcIPs\":[\"*\"],\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":0,\"Last\":65535}}]}]"
+    /* PacketFilters "*" clears every earlier set, including base. */
+    apply("{\"PacketFilter\":" ALLOW_ALL "}");
+    apply("{\"PacketFilters\":{\"a-set-name-that-is-longer-than-twenty-four-chars\":" ALLOW_ALL "}}");
+    CHECK(in(6, "100.64.0.6", 1, 22, SYN, 0));
+    apply("{\"PacketFilters\":{\"*\":null,\"web\":[{\"SrcIPs\":[\"*\"],\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":80,\"Last\":80}}]}]}}");
+    CHECK(!in(6, "100.64.0.6", 1, 22, SYN, 0));        /* allow-all sets gone */
+    CHECK(in(6, "100.64.0.6", 1, 80, SYN, 0));
+
+    /* A long set name can be deleted again. */
+    apply("{\"PacketFilters\":{\"a-set-name-that-is-longer-than-twenty-four-chars\":" ALLOW_ALL "}}");
+    CHECK(in(6, "100.64.0.6", 1, 22, SYN, 0));
+    apply("{\"PacketFilters\":{\"a-set-name-that-is-longer-than-twenty-four-chars\":null}}");
+    CHECK(!in(6, "100.64.0.6", 1, 22, SYN, 0));
+
+    /* A policy too large to apply allows nothing (not the previous rules). */
+    {
+        apply("{\"PacketFilter\":" ALLOW_ALL "}");
+        CHECK(in(6, "100.64.0.6", 1, 22, SYN, 0));
+        static char big[5000 * 20 + 256];
+        size_t o = (size_t)sprintf(big, "{\"PacketFilter\":[{\"SrcIPs\":[");
+        for (int i = 0; i < 5000; i++) o += (size_t)sprintf(big + o, "%s\"10.%d.%d.1\"", i ? "," : "", i / 250, i % 250);
+        sprintf(big + o, "],\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":81,\"Last\":81}}]}]}");
+        apply(big);
+        CHECK(!in(6, "100.64.0.6", 1, 22, SYN, 0));
+        CHECK(!in(6, "10.0.0.1", 1, 81, SYN, 0));
+        apply("{\"PacketFilter\":" ALLOW_ALL "}");
+    }
+
+    /* Header fields come from within the IP length, not tunnel padding,
+     * and short first fragments are dropped. */
+    {
+        uint8_t b[128];
+        apply("{\"PacketFilter\":[{\"SrcIPs\":[\"*\"],\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":80,\"Last\":80}}]}]}");
+        size_t n = pkt(b, 6, "100.64.0.6", ME, 1, 22, SYN, 0);
+        b[2] = 0; b[3] = 28;                              /* IP length ends inside the TCP header */
+        b[33] = 0x10;                                     /* "ACK" only in the padding */
+        CHECK(!ml_filter_check_inbound(b, n, 1000));
+        n = pkt(b, 6, "100.64.0.6", ME, 1, 22, ACK, 0);
+        b[6] = 0x20;                                      /* MF, offset 0: 40-byte first fragment */
+        CHECK(!ml_filter_check_inbound(b, n, 1000));
+        apply("{\"PacketFilter\":" ALLOW_ALL "}");
+    }
 
     /* Advertised routes: parsing. */
     {

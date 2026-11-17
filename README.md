@@ -399,7 +399,8 @@ and lets you change the auth key, WiFi list, cellular settings, control host and
 - **Tailnet ACLs are enforced on the device** (`ML_PACKET_FILTER`, default *Enforce*), like Tailscale
   clients: the policy from the control server (`PacketFilter` / `PacketFilters`) decides which peers
   may open TCP connections or send UDP/ICMP to the device; replies to traffic the device started are
-  always allowed. Until the first policy arrives, inbound traffic is accepted. Set *Log only* to see
+  always allowed. Until the first policy arrives no new inbound connections are accepted, and a policy
+  too large to apply (`ML_FILTER_MAX_ENTRIES`) allows nothing rather than everything. Set *Log only* to see
   what a policy would block without dropping it. Tested with Tailscale's default policy and a
   restrictive Headscale policy (only UDP 9000 allowed: ICMP and new TCP connections were dropped).
 

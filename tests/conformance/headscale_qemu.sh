@@ -96,7 +96,9 @@ CONFIG_ML_CTRL_NOISE_PUBKEY_HEX="$NOISE"
 CONFIG_ML_TAILSCALE_AUTH_KEY="$KEY"
 CONFIG_ML_DEVICE_NAME="conformance-esp32"
 EOF
-rm -rf "$OUT/build"
+# sdkconfig defaults only apply when sdkconfig is created: start fresh, or a
+# previous run's server key and auth key would be reused
+rm -rf "$OUT/build" "$OUT/sdkconfig"
 docker run --rm -v "$REPO:/src" -v "$OUT:/out" -w /src/examples/ethernet_connect "$IDF_IMAGE" bash -c '
     set -e
     . "$IDF_PATH/export.sh" > /dev/null 2>&1
@@ -105,7 +107,9 @@ docker run --rm -v "$REPO:/src" -v "$OUT:/out" -w /src/examples/ethernet_connect
         build > /out/build.log 2>&1 || { tail -40 /out/build.log; exit 1; }
     cd /out/build
     python -m esptool --chip esp32 merge_bin --fill-flash-size 4MB -o flash.bin @flash_args > /dev/null
-    chown -R '"$(id -u):$(id -g)"' /out'
+    chown -R '"$(id -u):$(id -g)"' /out
+    cd /src/examples/ethernet_connect   # files the component manager writes next to the project
+    chown -R '"$(id -u):$(id -g)"' dependencies.lock managed_components 2> /dev/null || true'
 
 log "Boot in QEMU"
 docker run -d --name "$P-qemu" -v "$OUT:/out" "$IDF_IMAGE" bash -c '

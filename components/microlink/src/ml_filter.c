@@ -16,12 +16,14 @@ static const char *TAG = "ml_filter";
 static SemaphoreHandle_t s_lock;
 #define F_LOCK()   do { if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY); } while (0)
 #define F_UNLOCK() do { if (s_lock) xSemaphoreGive(s_lock); } while (0)
+#define F_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
 #define F_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
 #define F_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
 #define F_LOGD(...) ESP_LOGD(TAG, __VA_ARGS__)
 #else
 #define F_LOCK()   do { } while (0)
 #define F_UNLOCK() do { } while (0)
+#define F_LOGE(...) do { } while (0)
 #define F_LOGW(...) do { } while (0)
 #define F_LOGI(...) do { } while (0)
 #define F_LOGD(...) do { } while (0)
@@ -54,7 +56,7 @@ typedef struct {
     range_t *src;    uint32_t nsrc;
     dst_t   *dst;    uint32_t ndst;
 } policy_t;
-typedef struct { char name[24]; policy_t *pol; } set_t;
+typedef struct { char name[64]; policy_t *pol; } set_t;   /* longer names compare by prefix */
 typedef struct {
     uint32_t peer_ip, local_ip, ts;
     uint16_t peer_port, local_port;
@@ -218,7 +220,7 @@ static set_t *set_find(const char *name, bool create) {
     set_t *free_slot = NULL;
     for (int i = 0; i < MAX_SETS; i++) {
         if (s_sets[i].pol || s_sets[i].name[0]) {
-            if (strcmp(s_sets[i].name, name) == 0) return &s_sets[i];
+            if (strncmp(s_sets[i].name, name, sizeof(s_sets[i].name) - 1) == 0) return &s_sets[i];
         } else if (!free_slot) {
             free_slot = &s_sets[i];
         }
@@ -234,7 +236,11 @@ static set_t *set_find(const char *name, bool create) {
 /* Replace (or with pol == NULL, delete) a named set. Caller holds the lock. */
 static void set_replace_locked(const char *name, policy_t *pol) {
     set_t *s = set_find(name, pol != NULL);
-    if (!s) { policy_free(pol); return; }
+    if (!s) {
+        if (pol) F_LOGW("Too many packet filter sets; \"%s\" ignored", name);
+        policy_free(pol);
+        return;
+    }
     policy_free(s->pol);
     s->pol = pol;
     if (!pol) memset(s, 0, sizeof(*s));
@@ -279,6 +285,21 @@ void ml_filter_set_local(uint32_t self_ip, const ml_route_t *routes, int n) {
     F_UNLOCK();
 }
 
+/* Parse one rule set. One that cannot be used (malformed, over
+ * ML_FILTER_MAX_ENTRIES, out of memory) becomes an empty set, which allows
+ * no new inbound traffic: keeping the previous rules could keep access the
+ * update was meant to remove, and with no previous rules the device would
+ * stay open. */
+static policy_t *policy_parse_or_deny(const cJSON *rules, const char *name) {
+    policy_t *pol = policy_parse(rules);
+    if (!pol) {
+        F_LOGE("Packet filter set \"%s\" rejected (invalid or more than %d entries): "
+               "it allows nothing", name, MAX_ENTRIES);
+        pol = calloc(1, sizeof(policy_t));
+    }
+    return pol;
+}
+
 bool ml_filter_update_from_map(const cJSON *map) {
     if (!map || s_mode == ML_FILTER_MODE_OFF) return false;
     const cJSON *single = cJSON_GetObjectItemCaseSensitive(map, "PacketFilter");
@@ -286,30 +307,35 @@ bool ml_filter_update_from_map(const cJSON *map) {
     bool changed = false;
 
     if (cJSON_IsObject(multi)) {
+        /* tailcfg: the key "*" clears all earlier sets (including "base")
+         * before the other keys of this update are applied. */
+        if (cJSON_GetObjectItemCaseSensitive(multi, "*")) {
+            F_LOCK();
+            for (int i = 0; i < MAX_SETS; i++) {
+                policy_free(s_sets[i].pol);
+                memset(&s_sets[i], 0, sizeof(s_sets[i]));
+            }
+            s_configured = true;
+            F_UNLOCK();
+            changed = true;
+        }
         const cJSON *e;
         cJSON_ArrayForEach(e, multi) {
-            if (!e->string) continue;
+            if (!e->string || strcmp(e->string, "*") == 0) continue;
             if (cJSON_IsNull(e)) {
                 F_LOCK(); set_replace_locked(e->string, NULL); F_UNLOCK();
                 changed = true;
                 continue;
             }
-            policy_t *pol = policy_parse(e);
-            if (!pol) { F_LOGW("PacketFilters[%s] rejected (invalid or too large); keeping previous", e->string); continue; }
+            policy_t *pol = policy_parse_or_deny(e, e->string);
             F_LOCK(); set_replace_locked(e->string, pol); s_configured = true; F_UNLOCK();
             changed = true;
         }
-    } else if (cJSON_IsArray(single) || cJSON_IsNull(single)) {
-        /* JSON null is treated like absent (unchanged). */
-        if (cJSON_IsArray(single)) {
-            policy_t *pol = policy_parse(single);
-            if (!pol) {
-                F_LOGW("PacketFilter rejected (invalid or too large); keeping previous");
-            } else {
-                F_LOCK(); set_replace_locked("base", pol); s_configured = true; F_UNLOCK();
-                changed = true;
-            }
-        }
+    } else if (cJSON_IsArray(single)) {
+        /* JSON null or absent: unchanged. */
+        policy_t *pol = policy_parse_or_deny(single, "base");
+        F_LOCK(); set_replace_locked("base", pol); s_configured = true; F_UNLOCK();
+        changed = true;
     }
     if (changed) {
         F_LOCK(); s_stats.rules = count_rules_locked(); s_stats.configured = s_configured; F_UNLOCK();
@@ -406,8 +432,19 @@ bool ml_filter_check_inbound(const uint8_t *pkt, size_t len, uint32_t now) {
     if (!pkt || len < 20 || (pkt[0] >> 4) != 4) return true;   /* non-IPv4 is handled by cryptokey routing */
     size_t ihl = (size_t)(pkt[0] & 0x0F) * 4;
     if (ihl < 20 || ihl > len) return false;
+    /* Parse within the IP packet, not the (padded) tunnel payload: header
+     * fields past the IP length would come from WireGuard padding. */
+    size_t ip_len = rd16(pkt + 2);
+    if (ip_len < ihl || ip_len > len) return false;
+    len = ip_len;
     uint8_t proto = pkt[9];
     uint32_t src = rd32(pkt + 12), dst = rd32(pkt + 16);
+    /* A first fragment too short to hold the whole transport header could
+     * have its TCP flags or ports completed by a later fragment that is
+     * never checked (tiny-fragment attack). Tailscale drops first fragments
+     * under 80 bytes; do the same. */
+    bool more_frags = (rd16(pkt + 6) & 0x2000) != 0;
+    if (more_frags && (rd16(pkt + 6) & 0x1FFF) == 0 && len < 80) return false;
     if (!dst_is_local(dst)) {
         F_LOGD("drop proto=%u to %u.%u.%u.%u: destination not local", proto,
                (unsigned)(dst >> 24), (unsigned)((dst >> 16) & 0xFF),
@@ -443,7 +480,8 @@ bool ml_filter_check_inbound(const uint8_t *pkt, size_t len, uint32_t now) {
     if (!accept && proto == PROTO_UDP && flow_match_locked(src, rd16(pkt + ihl), dst, dport, now)) {
         accept = true; why = "udp reply";
     }
-    if (!accept && !s_configured) { accept = true; why = "no policy yet"; }
+    /* Before the first policy nothing new gets in (Tailscale starts with an
+     * allow-nothing filter too); replies and ICMP errors above still do. */
     if (!accept && policy_allows_locked(src, dst, proto, has_port, dport)) { accept = true; why = "rule"; }
     if (accept) s_stats.accepted++; else s_stats.dropped++;
     F_UNLOCK();

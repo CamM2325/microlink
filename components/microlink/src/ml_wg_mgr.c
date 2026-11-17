@@ -335,6 +335,7 @@ typedef struct {
     struct netif *netif;
     SemaphoreHandle_t done;
     bool napt;          /* subnet router: masquerade forwarded traffic */
+    bool napt_failed;
 } wg_netif_up_ctx_t;
 
 static void wg_netif_bring_up_in_tcpip(void *arg) {
@@ -348,9 +349,7 @@ static void wg_netif_bring_up_in_tcpip(void *arg) {
      * tailnet traffic for an advertised route leaves the LAN interface
      * with that interface's address as source, and replies arriving there
      * are mapped back and routed into the tunnel. Needs the netif up. */
-    if (ctx->napt && !ip_napt_enable_netif(ctx->netif, 1)) {
-        ESP_LOGE(TAG, "Could not enable NAPT on the WireGuard netif");
-    }
+    if (ctx->napt && !ip_napt_enable_netif(ctx->netif, 1)) ctx->napt_failed = true;
 #endif
     xSemaphoreGive(ctx->done);
 }
@@ -489,15 +488,15 @@ static void wg_free_unlinked_device(struct netif *netif) {
 static bool wg_filter_rx_cb(void *ctx, const uint8_t *pkt, size_t len) {
     /* Keep the filter's local addresses (tailnet IP + advertised routes)
      * in step with ml->vpn_ip, which the coord task can change at any
-     * time. The cache only saves taking the filter lock per packet; if two
-     * receive paths (wg_mgr, zero-copy on tcpip_thread) race on it, both
-     * just push the same values. */
-    static uint32_t s_local_ip;
+     * time. The cache (per context: ml_filter is reset by destroy, so a
+     * new instance must push again) only saves taking the filter lock per
+     * packet; if two receive paths (wg_mgr, zero-copy on tcpip_thread)
+     * race on it, both just push the same values. */
     microlink_t *ml = (microlink_t *)ctx;
     uint32_t self = ml->vpn_ip;
-    if (self != s_local_ip) {
+    if (self != ml->filter_local_ip) {
         ml_filter_set_local(self, ml->routes, ml->route_count);
-        s_local_ip = self;
+        ml->filter_local_ip = self;
     }
     return ml_filter_check_inbound(pkt, len, (uint32_t)ml_get_time_ms());
 }
@@ -560,7 +559,7 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
      * which wants init callback) - see wg_netif_bring_up_in_tcpip() above. */
     {
         wg_netif_up_ctx_t ctx = { .netif = netif, .done = xSemaphoreCreateBinary(),
-                                  .napt = ml->route_count > 0 };
+                                  .napt = ml->route_count > 0, .napt_failed = false };
         if (!ctx.done) {
             ESP_LOGE(TAG, "Failed to allocate netif-up semaphore");
             wg_free_unlinked_device(netif);
@@ -577,6 +576,14 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
         }
         xSemaphoreTake(ctx.done, portMAX_DELAY);
         vSemaphoreDelete(ctx.done);
+        if (ctx.napt_failed) {
+            /* Forwarding without SNAT would send tailnet source addresses
+             * onto the LAN: stop advertising the routes instead, which also
+             * makes the packet filter drop traffic for them. */
+            ESP_LOGE(TAG, "Could not enable NAPT on the WireGuard netif; "
+                          "advertised routes disabled");
+            ml->route_count = 0;
+        }
     }
 
     /* Create raw UDP PCB for WG output (avoids BSD sendto deadlock on TCPIP
