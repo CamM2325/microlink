@@ -2450,6 +2450,11 @@ static int lp_consume_h2(microlink_t *ml, ml_noise_state_t *noise, lp_h2_result_
                 ESP_LOGD(TAG, "H2 stream %lu DATA: %lu bytes (discarded)",
                          (unsigned long)f_stream, (unsigned long)f_len);
             }
+        } else if (f_type == 0x01 && f_stream == 5 && (f_flags & 0x01)) {
+            /* HEADERS with END_STREAM on 5: a response without a body (an
+             * error status) or trailers. Either way the stream is over. */
+            ESP_LOGW(TAG, "Long-poll stream ended by server (HEADERS END_STREAM)");
+            r->stream5_closed = true;
         } else if (f_type == 0x06 && f_len == 8 && !(f_flags & 0x01)) {
             /* PING from server: answer with PONG (same payload, ACK flag) */
             uint8_t pong[17] = {0x00, 0x00, 0x08, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00};
