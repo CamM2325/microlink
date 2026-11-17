@@ -65,6 +65,10 @@ static inline bool is_lan_ip(uint32_t ip) {
            (((ip >> 16) & 0xFFF0) == 0xAC10);          /* 172.16-31.x.x */
 }
 
+/* Longest wg_mgr sleep while idle: bounds the granularity of its periodic
+ * work (WG timers every 400 ms, DISCO heartbeats, request pacing). */
+#define ML_WG_IDLE_TICK_MS 100
+
 /* Pending DISCO probe tracking */
 typedef struct {
     uint8_t txid[DISCO_TXID_LEN];
@@ -1184,6 +1188,7 @@ esp_err_t ml_wg_mgr_post_request(microlink_t *ml, int action, uint32_t vpn_ip) {
         free(req);
         return ESP_ERR_TIMEOUT;
     }
+    ml_wg_mgr_wake(ml);
     return ESP_OK;
 }
 
@@ -2429,15 +2434,26 @@ void ml_wg_mgr_task(void *arg) {
             free(disco_pkt.data);
         }
 
-        /* Process WireGuard packets.
-         * The first receive blocks briefly so the task wakes as soon as a
-         * packet lands rather than on the next fixed tick. Polling added up to
-         * 10 ms of latency to every packet and let the queue overflow between
-         * wakeups. When the queue is empty this blocks for the same 10 ms the
-         * trailing vTaskDelay used to, so the idle cost is unchanged. */
+        /* Idle wait: block until a producer signals work (WG/DISCO packet,
+         * peer update or request; see ml_wg_mgr_wake) or the periodic tick.
+         * This replaces a fixed 10 ms poll (100 wakeups/s while idle). A give
+         * between the emptiness check and the take is not lost: the binary
+         * semaphore stays given. */
+        if (uxQueueMessagesWaiting(ml->wg_rx_queue) == 0 &&
+            uxQueueMessagesWaiting(ml->disco_rx_queue) == 0 &&
+            uxQueueMessagesWaiting(ml->peer_update_queue) == 0
+#ifdef CONFIG_ML_ZERO_COPY_WG
+            && __atomic_load_n(&ml->zc.rx_tail, __ATOMIC_RELAXED) ==
+               __atomic_load_n(&ml->zc.rx_head, __ATOMIC_ACQUIRE)
+#endif
+            ) {
+            xSemaphoreTake(ml->wg_wake, pdMS_TO_TICKS(ML_WG_IDLE_TICK_MS));
+        }
+
+        /* Process WireGuard packets */
         ml_rx_packet_t wg_pkt;
         bool wg_rx = false;
-        if (xQueueReceive(ml->wg_rx_queue, &wg_pkt, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
             wg_rx = true;
             process_wg_packet(ml, &wg_pkt);
             while (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {

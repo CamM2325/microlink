@@ -33,6 +33,7 @@ set(REQUIRES
     esp_driver_gpio
     esp_driver_tsens
     esp_http_server
+    vfs
 )
 
 # ESP-IDF 6 no longer ships cJSON as the built-in `json` component; it comes

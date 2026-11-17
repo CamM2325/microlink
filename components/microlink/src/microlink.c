@@ -334,6 +334,8 @@ static void ml_release(microlink_t *ml) {
     if (ml->stun_rx_queue)     { vQueueDelete(ml->stun_rx_queue);     ml->stun_rx_queue = NULL; }
     if (ml->coord_cmd_queue)   { vQueueDelete(ml->coord_cmd_queue);   ml->coord_cmd_queue = NULL; }
     if (ml->peer_update_queue) { vQueueDelete(ml->peer_update_queue); ml->peer_update_queue = NULL; }
+    if (ml->wg_wake)           { vSemaphoreDelete(ml->wg_wake);       ml->wg_wake = NULL; }
+    if (ml->derp_wake_fd >= 0) { close(ml->derp_wake_fd);             ml->derp_wake_fd = -1; }
     if (ml->events)            { vEventGroupDelete(ml->events);       ml->events = NULL; }
 
     /* Clear keys from memory */
@@ -563,9 +565,12 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->stun_rx_queue = xQueueCreate(ML_STUN_RX_QUEUE_DEPTH, sizeof(ml_rx_packet_t));
     ml->coord_cmd_queue = xQueueCreate(ML_COORD_CMD_QUEUE_DEPTH, sizeof(ml_coord_cmd_t));
     ml->peer_update_queue = xQueueCreate(ML_PEER_UPDATE_QUEUE_DEPTH, sizeof(ml_peer_update_t *));
+    ml->wg_wake = xSemaphoreCreateBinary();
+    ml->derp_wake_fd = -1;   /* created by the DERP task (eventfd) */
 
     if (!ml->derp_tx_queue || !ml->disco_rx_queue || !ml->wg_rx_queue ||
-        !ml->stun_rx_queue || !ml->coord_cmd_queue || !ml->peer_update_queue) {
+        !ml->stun_rx_queue || !ml->coord_cmd_queue || !ml->peer_update_queue ||
+        !ml->wg_wake) {
         ESP_LOGE(TAG, "Failed to create queues");
         ml_release(ml);
         return NULL;

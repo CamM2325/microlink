@@ -516,6 +516,13 @@ struct microlink_s {
     QueueHandle_t coord_cmd_queue;      /* any -> coord */
     QueueHandle_t peer_update_queue;    /* coord -> wg_mgr */
 
+    /* Idle wakeups (event-driven tasks instead of fixed polling):
+     * wg_wake is given by every producer of wg_mgr's queues; derp_wake_fd is
+     * an eventfd signalled by ml_derp_queue_send() (-1 if unavailable). Both
+     * live as long as the context, so producers can signal them safely. */
+    SemaphoreHandle_t wg_wake;
+    int derp_wake_fd;
+
     /* Keys (loaded at init, read-only after) */
     uint8_t machine_private_key[32];    /* Noise machine key */
     uint8_t machine_public_key[32];
@@ -674,6 +681,11 @@ void ml_coord_task(void *arg);
 
 /* ml_wg_mgr.c */
 void ml_wg_mgr_task(void *arg);
+
+/* Wake the wg_mgr task after queueing work for it (safe from any task). */
+static inline void ml_wg_mgr_wake(microlink_t *ml) {
+    if (ml && ml->wg_wake) xSemaphoreGive(ml->wg_wake);
+}
 /* True if wg_mgr last saw a usable WireGuard session to vpn_ip. Reads the
  * table wg_mgr publishes (wg_session_up_ip), so it is safe from any task;
  * the answer may be up to ~100 ms old. */
