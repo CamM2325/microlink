@@ -1072,6 +1072,9 @@ static void sweep_stale_peers(microlink_t *ml, uint32_t gen) {
 
 static void process_peer_updates(microlink_t *ml) {
     ml_peer_update_t *update;
+    /* One flash write for everything this drain changes in the peer cache
+     * (a full netmap of adds, a stale-peer sweep), not one per peer. */
+    ml_peer_nvs_batch_begin();
     while (xQueueReceive(ml->peer_update_queue, &update, 0) == pdTRUE) {
         if (!update) continue;
         switch (update->action) {
@@ -1099,6 +1102,7 @@ static void process_peer_updates(microlink_t *ml) {
         }
         free(update);
     }
+    ml_peer_nvs_batch_end();
 }
 
 /* Paced CallMeMaybe sweep for ML_PEER_REQ_CMM_ALL: one peer per 50 ms so a

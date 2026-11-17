@@ -710,6 +710,10 @@ esp_err_t ml_peer_nvs_save(const ml_peer_t *peer);
 int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers);
 esp_err_t ml_peer_nvs_clear(void);
 esp_err_t ml_peer_nvs_remove(const uint8_t *public_key);
+/* Defer the flash writes of saves/removes until the matching batch_end()
+ * (nestable), so a batch costs at most one write. wg_mgr task only. */
+void ml_peer_nvs_batch_begin(void);
+void ml_peer_nvs_batch_end(void);
 
 #ifdef CONFIG_ML_ZERO_COPY_WG
 /* ml_zerocopy.c */
