@@ -109,8 +109,39 @@ static const char *check_ctrl_host(const char *v) {
         "ctrl_host: host name of letters, digits, '-' and '.' (max 63)";
 }
 
-/* Settings blobs from older firmware were stored without validation (and a
- * blob is not guaranteed to be NUL-terminated): clear any invalid field. */
+/* NVS blobs from older firmware (or corrupt ones) are not guaranteed to be
+ * NUL-terminated: force a terminator on every string field after loading,
+ * before anything prints or copies them. */
+#define TERMINATE(field) ((field)[sizeof(field) - 1] = '\0')
+
+static void terminate_settings_strings(ml_config_settings_t *st) {
+    TERMINATE(st->wifi_ssid);
+    TERMINATE(st->wifi_pass);
+    TERMINATE(st->auth_key);
+    TERMINATE(st->device_prefix);
+    TERMINATE(st->cellular_apn);
+    TERMINATE(st->cellular_sim_pin);
+    TERMINATE(st->ctrl_host);
+    TERMINATE(st->device_name_full);
+    TERMINATE(st->ppp_user);
+    TERMINATE(st->ppp_pass);
+}
+
+static void terminate_wifi_list_strings(ml_config_wifi_list_t *list) {
+    for (int i = 0; i < ML_CONFIG_MAX_WIFI_ENTRIES; i++) {
+        TERMINATE(list->entries[i].ssid);
+        TERMINATE(list->entries[i].pass);
+    }
+}
+
+static void terminate_peer_labels(ml_config_peer_list_t *list) {
+    for (int i = 0; i < ML_CONFIG_MAX_ALLOWED_PEERS; i++) {
+        TERMINATE(list->entries[i].label);
+    }
+}
+
+/* Settings blobs from older firmware were stored without validation:
+ * clear any invalid field. */
 static void config_sanitize_settings(ml_config_settings_t *st) {
     #define SANITIZE(field, check) do { \
         (field)[sizeof(field) - 1] = '\0'; \
@@ -132,6 +163,7 @@ static void config_load_settings(ml_config_ctx_t *ctx) {
     memset(&ctx->settings, 0, sizeof(ml_config_settings_t));
     size_t len = sizeof(ml_config_settings_t);
     esp_err_t err = nvs_get_blob(ctx->nvs, NVS_KEY_SETTINGS, &ctx->settings, &len);
+    terminate_settings_strings(&ctx->settings);
 
     if (err == ESP_OK && ctx->settings.version >= 1) {
         /* v1 blob is smaller — v2 fields will be zero (defaults) */
@@ -241,6 +273,7 @@ static void config_load_peers(ml_config_ctx_t *ctx) {
             }
         }
 
+        terminate_peer_labels(&ctx->peer_list);
         ctx->filter_enabled = (ctx->peer_list.count > 0);
         ESP_LOGI(TAG, "Peer allowlist loaded: %d peers (filter %s)",
                  ctx->peer_list.count, ctx->filter_enabled ? "ON" : "OFF");
@@ -283,6 +316,7 @@ static void config_load_wifi_list(ml_config_ctx_t *ctx) {
             memset(&ctx->wifi_list, 0, sizeof(ctx->wifi_list));
             ctx->wifi_list.active_idx = 0xFF;
         }
+        terminate_wifi_list_strings(&ctx->wifi_list);
         ESP_LOGI(TAG, "WiFi list loaded: %d entries", ctx->wifi_list.count);
     } else {
         /* No wifi_list key — migrate from settings blob if it has WiFi creds */
@@ -1252,6 +1286,7 @@ bool ml_config_get_wifi_list(ml_config_wifi_list_t *list) {
         if (read_len > sizeof(ml_config_wifi_list_t)) read_len = sizeof(ml_config_wifi_list_t);
         err = nvs_get_blob(nvs, NVS_KEY_WIFI, list, &read_len);
         if (err == ESP_OK && list->count > 0 && list->count <= ML_CONFIG_MAX_WIFI_ENTRIES) {
+            terminate_wifi_list_strings(list);
             nvs_close(nvs);
             return true;
         }
@@ -1267,6 +1302,7 @@ bool ml_config_get_wifi_list(ml_config_wifi_list_t *list) {
     size_t slen = sizeof(*settings);
     err = nvs_get_blob(nvs, NVS_KEY_SETTINGS, settings, &slen);
     nvs_close(nvs);
+    terminate_settings_strings(settings);
 
     if (err == ESP_OK && settings->wifi_ssid[0] != '\0') {
         list->count = 1;
@@ -1315,6 +1351,7 @@ bool ml_config_get_nvs_wifi(char *ssid, size_t ssid_len,
     size_t len = sizeof(*settings);
     err = nvs_get_blob(nvs, NVS_KEY_SETTINGS, settings, &len);
     nvs_close(nvs);
+    terminate_settings_strings(settings);
 
     if (err != ESP_OK || len < 1 || settings->version < 1 || settings->wifi_ssid[0] == '\0') {
         free(settings);
@@ -1347,6 +1384,7 @@ bool ml_config_get_nvs_ppp(char *user, size_t user_len,
     size_t len = sizeof(*settings);
     err = nvs_get_blob(nvs, NVS_KEY_SETTINGS, settings, &len);
     nvs_close(nvs);
+    terminate_settings_strings(settings);
 
     if (err != ESP_OK || len < 1 || settings->version < 3 || settings->ppp_user[0] == '\0') {
         free(settings);
@@ -1387,6 +1425,7 @@ bool ml_config_get_nvs_apn(char *apn, size_t apn_len) {
     size_t len = sizeof(*settings);
     err = nvs_get_blob(nvs, NVS_KEY_SETTINGS, settings, &len);
     nvs_close(nvs);
+    terminate_settings_strings(settings);
 
     if (err != ESP_OK || len < 1 || settings->cellular_apn[0] == '\0') {
         free(settings);
