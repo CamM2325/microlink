@@ -83,11 +83,15 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
     case PKT_DISCO:
         if (xQueueSend(ml->disco_rx_queue, &pkt, 0) != pdTRUE) {
             free(data);
+        } else {
+            ml_wg_mgr_wake(ml);
         }
         break;
     case PKT_WIREGUARD:
         if (xQueueSend(ml->wg_rx_queue, &pkt, 0) != pdTRUE) {
             free(data);
+        } else {
+            ml_wg_mgr_wake(ml);
         }
         break;
     default:
@@ -106,7 +110,9 @@ void ml_net_io_task(void *arg) {
 
         /* ---- UDP sockets via select() ---- */
         fd_set read_fds;
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };  /* 50ms select timeout */
+        /* Data wakes select() immediately; the timeout only bounds how
+         * quickly a stop request or a newly created socket is noticed. */
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
         int max_fd = -1;
 
         FD_ZERO(&read_fds);

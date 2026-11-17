@@ -27,6 +27,9 @@
 #include "lwip/netdb.h"
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/error.h"
+#include "esp_vfs_eventfd.h"
+#include <sys/select.h>
+#include <unistd.h>
 #if CONFIG_ML_DERP_VERIFY_CERT
 #include "esp_crt_bundle.h"
 #elif !defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
@@ -324,6 +327,8 @@ static void route_derp_packet(microlink_t *ml, uint8_t *data, size_t len,
     QueueHandle_t target = (type == PKT_DISCO) ? ml->disco_rx_queue : ml->wg_rx_queue;
     if (xQueueSend(target, &pkt, 0) != pdTRUE) {
         free(data);
+    } else {
+        ml_wg_mgr_wake(ml);
     }
 }
 
@@ -482,6 +487,70 @@ static int poll_derp_read(microlink_t *ml) {
  * DERP TX Queue Processing
  * ========================================================================== */
 
+/* ============================================================================
+ * Idle waiting (no fixed-interval polling)
+ *
+ * The DERP I/O task used to spin with vTaskDelay(1) (~1000 wakeups/s while
+ * idle), which also kept the chip out of light sleep. It now blocks in
+ * select() on the DERP socket plus an eventfd that ml_derp_queue_send()
+ * signals, so it wakes for incoming data, outgoing packets, or a periodic
+ * timeout. The AT-socket bridge has no real fd: there it waits on the TX
+ * queue with a short timeout (incoming data is polled at that rate).
+ * Approach after TailTiny's idle work (Asimmimx/tailtiny 6335e77, bfa95f3).
+ * ========================================================================== */
+
+#define DERP_IDLE_WAIT_MS     250   /* upper bound: keepalives/reconnects are slower */
+#define DERP_AT_POLL_MS       20
+
+static void derp_wake(microlink_t *ml) {
+    int fd = ml->derp_wake_fd;
+    if (fd >= 0) {
+        uint64_t one = 1;
+        (void)write(fd, &one, sizeof(one));
+    }
+}
+
+static void derp_wake_init(microlink_t *ml) {
+    if (ml->derp_wake_fd >= 0) return;
+    esp_vfs_eventfd_config_t cfg = ESP_VFS_EVENTD_CONFIG_DEFAULT();
+    esp_err_t err = esp_vfs_eventfd_register(&cfg);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {   /* INVALID_STATE: already registered */
+        ESP_LOGW(TAG, "eventfd unavailable (%s); DERP task will poll", esp_err_to_name(err));
+        return;
+    }
+    int fd = eventfd(0, 0);
+    if (fd < 0) {
+        ESP_LOGW(TAG, "eventfd() failed (errno %d); DERP task will poll", errno);
+        return;
+    }
+    ml->derp_wake_fd = fd;
+}
+
+static void derp_idle_wait(microlink_t *ml) {
+    if (uxQueueMessagesWaiting(ml->derp_tx_queue) > 0) return;
+    if (ml->derp.connected && mbedtls_ssl_get_bytes_avail(&ml->derp.ssl) > 0) return;
+
+    int sock = ml->derp.sockfd;
+    int wfd = ml->derp_wake_fd;
+    if (sock >= 0 && wfd >= 0 && !ml_at_socket_is_at_fd(sock)) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(sock, &rfds);
+        FD_SET(wfd, &rfds);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = DERP_IDLE_WAIT_MS * 1000 };
+        int n = select((sock > wfd ? sock : wfd) + 1, &rfds, NULL, NULL, &tv);
+        if (n > 0 && FD_ISSET(wfd, &rfds)) {
+            uint64_t v;
+            (void)read(wfd, &v, sizeof(v));
+        } else if (n < 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));   /* never spin on a select error */
+        }
+    } else {
+        ml_derp_tx_item_t peek;
+        (void)xQueuePeek(ml->derp_tx_queue, &peek, pdMS_TO_TICKS(DERP_AT_POLL_MS));
+    }
+}
+
 /* Queue a packet for DERP TX with backpressure */
 esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
                               const uint8_t *data, size_t len) {
@@ -505,6 +574,7 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
     /* Try to send to queue */
     if ((is_wg_handshake ? xQueueSendToFront(ml->derp_tx_queue, &item, 0)
                          : xQueueSend(ml->derp_tx_queue, &item, 0)) == pdTRUE) {
+        derp_wake(ml);
         return ESP_OK;
     }
 
@@ -515,6 +585,7 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
             free(dropped.data);  /* Drop oldest */
         }
         if (xQueueSend(ml->derp_tx_queue, &item, 0) == pdTRUE) {
+            derp_wake(ml);
             return ESP_OK;
         }
     }
@@ -531,6 +602,7 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
 void ml_derp_tx_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     ESP_LOGI(TAG, "DERP I/O task started (Core %d)", xPortGetCoreID());
+    derp_wake_init(ml);
 
     uint32_t frames_rx = 0;
     uint32_t frames_tx = 0;
@@ -685,8 +757,8 @@ void ml_derp_tx_task(void *arg) {
             }
         }
 
-        /* Yield briefly */
-        vTaskDelay(pdMS_TO_TICKS(1));
+        /* Block until there is work (incoming data, queued TX) or a timeout */
+        derp_idle_wait(ml);
     }
 
     /* Release the TLS session, the socket and any packets still queued for

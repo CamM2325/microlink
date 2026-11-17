@@ -94,6 +94,7 @@ static void zc_pcb_recv_cb(void *arg, struct udp_pcb *pcb,
             entry->src_ip_nbo = ip_addr_get_ip4_u32(addr);
             entry->src_port = port;
             __atomic_store_n(&ml->zc.rx_head, next, __ATOMIC_RELEASE);
+            ml_wg_mgr_wake(ml);
         }
         /* else: ring full, drop (DISCO is retried by design) */
         pbuf_free(p);

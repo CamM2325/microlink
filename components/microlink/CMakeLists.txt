@@ -59,6 +59,7 @@ set(REQUIRES
     esp_http_server
     app_update
     esp_app_format
+    vfs
 )
 
 # ESP-IDF 6 no longer ships cJSON as the built-in `json` component; it comes

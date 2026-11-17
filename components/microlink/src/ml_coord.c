@@ -2299,6 +2299,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     /* Parse peers */
     parse_peers_from_map_response(ml, map_json);
     ml_filter_update_from_map(map_json);
+    ml_wg_mgr_wake(ml);
 
     /* Extract DERPMap if present — parse all regions and nodes */
     parse_derp_map_from_map(ml, map_json);
@@ -2479,6 +2480,7 @@ static void lp_handle_message(microlink_t *ml, const char *json, size_t len) {
 
     parse_peers_from_map_response(ml, update_json);
     ml_filter_update_from_map(update_json);
+    ml_wg_mgr_wake(ml);
 
     /* With streaming_map_fetch, DERPMap updates also arrive on this stream. */
     if (ml->config.streaming_map_fetch) {
@@ -2798,6 +2800,7 @@ static int do_read_initial_netmap(microlink_t *ml, ml_noise_state_t *noise) {
     parse_self_node_from_map(ml, map_json);
     parse_peers_from_map_response(ml, map_json);
     ml_filter_update_from_map(map_json);
+    ml_wg_mgr_wake(ml);
     parse_derp_map_from_map(ml, map_json);
     cJSON_Delete(map_json);
 
@@ -2917,7 +2920,9 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(ml->coord_sock, &readfds);
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };  /* 50ms */
+        /* Data wakes select() at once; the timeout only paces the loop's
+         * periodic work (PINGs every 5 s, STUN, watchdog) and stop checks. */
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
         int sel = ml_select_fds(ml->coord_sock + 1, &readfds, NULL, NULL, &tv);
         if (sel <= 0) return 0;  /* No data available or error */
     }
@@ -3445,7 +3450,7 @@ void ml_coord_task(void *arg) {
                     break;
                 }
 
-                vTaskDelay(pdMS_TO_TICKS(50));
+                /* No extra sleep: poll_map_update() already blocked in select() */
             }
             break;
 
