@@ -714,6 +714,18 @@ static char *read_post_body(httpd_req_t *req) {
     return buf;
 }
 
+/* Transport MicroLink's traffic uses: "cellular" over the AT socket bridge
+ * or when the PPP netif is the default interface, else "wifi". (Checking
+ * only the AT bridge reported "wifi" while on cellular PPP.) */
+static const char *active_connection(void) {
+#ifdef CONFIG_ML_ENABLE_CELLULAR
+    if (ml_at_socket_is_ready()) return "cellular";
+#endif
+    esp_netif_t *def = esp_netif_get_default_netif();
+    if (def && (esp_netif_get_flags(def) & ESP_NETIF_FLAG_IS_PPP)) return "cellular";
+    return "wifi";
+}
+
 /* GET / — serve HTML config page */
 static esp_err_t handler_root(httpd_req_t *req) {
     if (!http_guard(req, false)) return ESP_OK;
@@ -749,12 +761,7 @@ static esp_err_t handler_status(httpd_req_t *req) {
         heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     cJSON_AddBoolToObject(json, "filter_enabled", ctx->filter_enabled);
 
-#ifdef CONFIG_ML_ENABLE_CELLULAR
-    cJSON_AddStringToObject(json, "connection",
-        ml_at_socket_is_ready() ? "cellular" : "wifi");
-#else
-    cJSON_AddStringToObject(json, "connection", "wifi");
-#endif
+    cJSON_AddStringToObject(json, "connection", active_connection());
 
     return send_json(req, json);
 }
@@ -1128,15 +1135,7 @@ static esp_err_t handler_monitor(httpd_req_t *req) {
     }
 
     /* Connection type */
-#ifdef CONFIG_ML_ENABLE_CELLULAR
-    if (ml_at_socket_is_ready()) {
-        cJSON_AddStringToObject(json, "connection", "cellular");
-    } else {
-        cJSON_AddStringToObject(json, "connection", "wifi");
-    }
-#else
-    cJSON_AddStringToObject(json, "connection", "wifi");
-#endif
+    cJSON_AddStringToObject(json, "connection", active_connection());
 
     return send_json(req, json);
 }
