@@ -393,8 +393,13 @@ static int poll_derp_read(microlink_t *ml) {
         return n;
     }
     if (n < 5) {
-        ESP_LOGW(TAG, "DERP partial header: got %d of 5 bytes", n);
-        return -1;
+        /* ssl_read returns at most the rest of the current TLS record, and
+         * a relay may split a frame header across records. Finish it; the
+         * stream is only misaligned if the rest never arrives. */
+        if (derp_tls_read_all(ml, header + n, 5 - n, 2000) < 0) {
+            ESP_LOGW(TAG, "DERP partial header: got %d of 5 bytes", n);
+            return -1;
+        }
     }
 
     uint8_t frame_type = header[0];
