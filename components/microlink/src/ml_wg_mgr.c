@@ -631,6 +631,8 @@ static bool merge_endpoints(ml_peer_t *p, const ml_peer_update_t *update) {
     return changed;
 }
 
+static void remove_peer_idx(microlink_t *ml, int idx);
+
 static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     /* Peer allowlist filter: don't waste WG slots on non-allowed peers.
      * Still process updates for existing peers (they may become allowed later). */
@@ -720,6 +722,29 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
                 }
                 ml->peers[evict_idx].active = false;
                 idx = evict_idx;
+            }
+        }
+
+        /* Table full: an ONLINE peer may replace an OFFLINE one that has no
+         * WireGuard session (e.g. expired or long-gone nodes), so stale
+         * entries can't lock out live devices. */
+        if (idx < 0 && update->online_valid && update->online) {
+            struct wireguard_device *dev = ml->wg_netif ?
+                (struct wireguard_device *)((struct netif *)ml->wg_netif)->state : NULL;
+            for (int i = 0; i < ML_MAX_PEERS; i++) {
+                ml_peer_t *c = &ml->peers[i];
+                if (!c->active || c->online) continue;
+                if (ml->config.priority_peer_ip != 0 && c->vpn_ip == ml->config.priority_peer_ip) continue;
+                bool has_session = dev && c->wg_peer_index >= 0 && c->wg_peer_index < WIREGUARD_MAX_PEERS &&
+                                   (dev->peers[c->wg_peer_index].curr_keypair.valid ||
+                                    dev->peers[c->wg_peer_index].prev_keypair.valid);
+                if (has_session) continue;
+                ESP_LOGW(TAG, "Peer table full: replacing offline %s with online %s",
+                         c->hostname, update->hostname);
+                remove_peer_idx(ml, i);
+                idx = i;
+                if (idx >= ml->peer_count) ml->peer_count = idx + 1;
+                break;
             }
         }
 

@@ -51,7 +51,7 @@ static microlink_t *ml = NULL;
 static microlink_udp_socket_t *udp_sock = NULL;
 
 /* TCP socket (used in TCP mode) */
-static microlink_tcp_socket_t *tcp_sock = NULL;
+static microlink_tcp_socket_t *tcp_sock __attribute__((unused)) = NULL;  /* unused in UDP mode */
 
 /* Message counters */
 static uint32_t msg_tx_count = 0;
