@@ -92,10 +92,6 @@ static const char *check_cellular_apn(const char *v) {
     return ml_at_param_valid(ML_AT_PARAM_APN, v, FIELD_MAX(cellular_apn)) ? NULL :
         "cellular_apn: letters, digits, '-' and '.' only (max 31)";
 }
-static const char *check_sim_pin(const char *v) {
-    return (v[0] == '\0' || ml_at_param_valid(ML_AT_PARAM_PIN, v, FIELD_MAX(cellular_sim_pin))) ? NULL :
-        "cellular_sim_pin: 4-8 digits";
-}
 static const char *check_ppp_user(const char *v) {
     return ml_at_param_valid(ML_AT_PARAM_CREDENTIAL, v, FIELD_MAX(ppp_user)) ? NULL :
         "ppp_user: printable ASCII without '\"' or '\\' (max 31)";
@@ -151,7 +147,9 @@ static void config_sanitize_settings(ml_config_settings_t *st) {
         } \
     } while (0)
     SANITIZE(st->cellular_apn, check_cellular_apn);
-    SANITIZE(st->cellular_sim_pin, check_sim_pin);
+    /* cellular_sim_pin is no longer used (nothing ever read it): drop any
+     * PIN an older firmware stored, so it is wiped on the next save. */
+    memset(st->cellular_sim_pin, 0, sizeof(st->cellular_sim_pin));
     SANITIZE(st->ppp_user, check_ppp_user);
     SANITIZE(st->ppp_pass, check_ppp_pass);
     SANITIZE(st->ctrl_host, check_ctrl_host);
@@ -782,8 +780,6 @@ static esp_err_t handler_get_settings(httpd_req_t *req) {
         ctx->settings.auth_key[0] ? "********" : "");
     cJSON_AddStringToObject(json, "device_prefix", ctx->settings.device_prefix);
     cJSON_AddStringToObject(json, "cellular_apn", ctx->settings.cellular_apn);
-    cJSON_AddStringToObject(json, "cellular_sim_pin",
-        ctx->settings.cellular_sim_pin[0] ? "****" : "");
     cJSON_AddStringToObject(json, "ppp_user", ctx->settings.ppp_user);
     cJSON_AddStringToObject(json, "ppp_pass",
         ctx->settings.ppp_pass[0] ? "********" : "");
@@ -832,7 +828,6 @@ static esp_err_t handler_post_settings(httpd_req_t *req) {
                                 ? it->valuestring : NULL)
         const char *v;
         if (!bad && (v = STR_ITEM("cellular_apn"))) bad = check_cellular_apn(v);
-        if (!bad && (v = STR_ITEM("cellular_sim_pin")) && strcmp(v, "****") != 0) bad = check_sim_pin(v);
         if (!bad && (v = STR_ITEM("ppp_user"))) bad = check_ppp_user(v);
         if (!bad && (v = STR_ITEM("ppp_pass")) && strcmp(v, "********") != 0) bad = check_ppp_pass(v);
         if (!bad && (v = STR_ITEM("ctrl_host"))) bad = check_ctrl_host(v);
@@ -874,12 +869,6 @@ static esp_err_t handler_post_settings(httpd_req_t *req) {
     }
     if ((item = cJSON_GetObjectItem(json, "cellular_apn")) && cJSON_IsString(item)) {
         COPY_STR_FIELD(ctx->settings.cellular_apn, item->valuestring);
-    }
-    if ((item = cJSON_GetObjectItem(json, "cellular_sim_pin")) && cJSON_IsString(item)) {
-        const char *v = item->valuestring;
-        if (v[0] != '\0' && strcmp(v, "****") != 0) {
-            COPY_STR_FIELD(ctx->settings.cellular_sim_pin, v);
-        }
     }
     if ((item = cJSON_GetObjectItem(json, "ppp_user")) && cJSON_IsString(item)) {
         COPY_STR_FIELD(ctx->settings.ppp_user, item->valuestring);
