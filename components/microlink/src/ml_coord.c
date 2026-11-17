@@ -260,8 +260,12 @@ static int coord_recv_ex(microlink_t *ml, uint8_t *buf, size_t len, bool must_co
                 continue;
             }
             int err = errno;  /* logging may clobber it; callers test it */
-            ESP_LOGE(TAG, "coord_recv failed: %d (errno %d, recvd %d/%d)",
-                     n, err, (int)recvd, (int)len);
+            if (err == ECANCELED) {
+                ESP_LOGI(TAG, "coord_recv: stopping (shutdown requested)");
+            } else {
+                ESP_LOGE(TAG, "coord_recv failed: %d (errno %d, recvd %d/%d)",
+                         n, err, (int)recvd, (int)len);
+            }
             errno = err;
             return -1;
         }
@@ -525,6 +529,8 @@ static int complete_proactive_frames(microlink_t *ml, uint8_t **buf, int *len) {
 
 static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_noise_start = esp_timer_get_time();
+    /* A challenge belongs to one connection: never answer a previous one. */
+    ml->coord_st.has_node_key_challenge = false;
 
     /* Initialize Noise state with our machine key and the control plane's
      * server key. Priority: config-struct key (runtime, e.g. fetched from
