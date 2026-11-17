@@ -558,8 +558,16 @@ void ml_derp_tx_task(void *arg) {
         /* ---- Handle DERP connect request from coord task ---- */
         {
             EventBits_t bits = xEventGroupGetBits(ml->events);
-            if ((bits & ML_EVT_DERP_CONNECT_REQ) && !ml->derp.connected) {
+            /* Always consume a connect request. One that arrives while we
+             * are connected (or reconnecting) is already satisfied; left
+             * set, it would fire after the next read/write error and run a
+             * connect over the failed, not yet freed session. A pending
+             * RECONNECT does the full disconnect + connect itself. */
+            if (bits & ML_EVT_DERP_CONNECT_REQ) {
                 xEventGroupClearBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
+            }
+            if ((bits & ML_EVT_DERP_CONNECT_REQ) && !ml->derp.connected &&
+                !(bits & ML_EVT_DERP_RECONNECT)) {
                 /* Retry up to 3 times with 2s backoff */
                 for (int attempt = 0; attempt < 3 && !ml->derp.connected; attempt++) {
                     if (attempt > 0) {
@@ -686,6 +694,15 @@ void ml_derp_tx_task(void *arg) {
  * ========================================================================== */
 
 esp_err_t ml_derp_connect(microlink_t *ml) {
+    /* A failed session is only marked (connected=false) by the read/write
+     * error paths. Free it before the TLS contexts and sockfd below are
+     * re-initialised, or its TLS buffers and lwIP socket leak. */
+    if (ml->derp.sockfd >= 0) {
+        ESP_LOGW(TAG, "DERP connect over an open session (fd=%d); closing it first",
+                 ml->derp.sockfd);
+        ml_derp_disconnect(ml);
+    }
+
     /* Determine DERP host/port from DERPMap with node failover.
      * Always start from node 0 (the first/preferred node in the DERPMap).
      * Only rotate to a different node after a SUCCESSFUL connection drops,
