@@ -311,19 +311,36 @@ static esp_err_t modem_wait_ready(void)
                     char ipr[32];
                     snprintf(ipr, sizeof(ipr), "AT+IPR=%d", want);
                     if (at_cmd_ok(ipr, AT_SHORT_TIMEOUT_MS)) {
-                        /* The modem acknowledged: it IS at `want` now. Give the
-                         * UART time to settle and retry the check a few times
-                         * rather than flipping back (which strands it). */
+                        /* The modem acknowledged: it should be at `want` now.
+                         * Give the UART time to settle and retry the check a
+                         * few times. */
                         vTaskDelay(pdMS_TO_TICKS(300));
                         uart_set_baudrate(UART_NUM, want);
-                        for (int v = 0; v < 4; v++) {
+                        bool restored = false;
+                        for (int v = 0; v < 4 && !restored; v++) {
                             vTaskDelay(pdMS_TO_TICKS(300));
                             uart_flush_input(UART_NUM);
-                            if (at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) break;
+                            restored = at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS);
                         }
-                        ESP_LOGI(TAG, "Modem baud restored to %d", want);
-                        s_cell.state = ML_CELL_STATE_AT_OK;
-                        return ESP_OK;
+                        if (restored) {
+                            ESP_LOGI(TAG, "Modem baud restored to %d", want);
+                            s_cell.state = ML_CELL_STATE_AT_OK;
+                            return ESP_OK;
+                        }
+                        /* The switch did not take (or the reply was lost):
+                         * go back to the rate that worked a moment ago. */
+                        ESP_LOGW(TAG, "No answer at %d after AT+IPR; trying %d again",
+                                 want, try_bauds[b]);
+                        uart_set_baudrate(UART_NUM, try_bauds[b]);
+                        vTaskDelay(pdMS_TO_TICKS(300));
+                        uart_flush_input(UART_NUM);
+                        if (at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) {
+                            ESP_LOGW(TAG, "Modem stays at %d baud", try_bauds[b]);
+                            s_cell.config.baud_rate = try_bauds[b];
+                            s_cell.state = ML_CELL_STATE_AT_OK;
+                            return ESP_OK;
+                        }
+                        continue;   /* lost at both rates: keep probing */
                     }
                     s_cell.config.baud_rate = try_bauds[b];
                     s_cell.state = ML_CELL_STATE_AT_OK;
