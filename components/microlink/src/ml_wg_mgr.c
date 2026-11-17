@@ -74,7 +74,12 @@ typedef struct {
     bool active;
 } disco_probe_t;
 
-#define MAX_PENDING_PROBES 64  /* one probe per destination (see disco_ping_round) */
+/* One probe per destination (see disco_ping_round). Heartbeats on a trusted
+ * path use one slot per peer; discovery rounds use one per endpoint plus one
+ * via DERP, and an unanswered probe holds its slot for
+ * ML_DISCO_PING_TIMEOUT_MS. When the table is full the oldest probe is
+ * evicted (see disco_probe_register). */
+#define MAX_PENDING_PROBES ((ML_MAX_PEERS * 4) > 64 ? (ML_MAX_PEERS * 4) : 64)
 static disco_probe_t pending_probes[MAX_PENDING_PROBES];
 static uint32_t s_disco_round;
 
@@ -87,6 +92,11 @@ static uint32_t disco_new_round(void) {
  * measured here includes up to one wg_mgr loop (10 ms) of scheduling delay
  * on each side. */
 #define DISCO_RTT_NOISE_MS 10
+
+/* While a direct path is trusted, heartbeats ping only the best path; every
+ * endpoint is pinged again at this interval to find a better one (Tailscale:
+ * upgradeUDPDirectInterval). */
+#define DISCO_FULL_PING_INTERVAL_MS 60000
 
 /* ============================================================================
  * Base64 Key Encoding (wireguard-lwip API requires base64 keys)
@@ -817,6 +827,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->best_port = 0;
     p->best_rtt_ms = 0;
     p->best_pong_ms = 0;
+    p->last_full_ping_ms = 0;
     p->wg_peer_index = -1;
     p->last_hs_kick_ms = 0;
 
@@ -1177,27 +1188,35 @@ static void disco_build_ping(microlink_t *ml, int peer_idx, uint32_t round,
     memcpy(out + pos, ciphertext, sizeof(ciphertext)); pos += sizeof(ciphertext);
     *out_len = pos;
 
-    /* Track pending probe */
-    bool registered = false;
+    /* Track pending probe. A full table evicts the oldest probe rather than
+     * dropping this one: dropping the new probe left a heartbeat pong
+     * unmatched, trust expired and the peer flapped to DERP and back, while
+     * the oldest probe is the one least likely to still be answered. */
+    int slot = -1;
+    int oldest = 0;
     for (int i = 0; i < MAX_PENDING_PROBES; i++) {
         if (!pending_probes[i].active) {
-            memcpy(pending_probes[i].txid, txid, DISCO_TXID_LEN);
-            pending_probes[i].peer_index = peer_idx;
-            pending_probes[i].dest_ip = dest_ip;
-            pending_probes[i].dest_port = dest_port;
-            pending_probes[i].sent_ms = ml_get_time_ms();
-            pending_probes[i].round = round;
-            pending_probes[i].active = true;
-            registered = true;
-            ESP_LOGD(TAG, "Probe registered slot=%d peer=%s txid=%02x%02x%02x%02x",
-                     i, p->hostname, txid[0], txid[1], txid[2], txid[3]);
+            slot = i;
             break;
         }
+        if (pending_probes[i].sent_ms < pending_probes[oldest].sent_ms) {
+            oldest = i;
+        }
     }
-    if (!registered) {
-        ESP_LOGW(TAG, "DISCO probe table full (%d slots), pong will be unmatched",
+    if (slot < 0) {
+        slot = oldest;
+        ESP_LOGD(TAG, "DISCO probe table full (%d slots), evicting the oldest probe",
                  MAX_PENDING_PROBES);
     }
+    memcpy(pending_probes[slot].txid, txid, DISCO_TXID_LEN);
+    pending_probes[slot].peer_index = peer_idx;
+    pending_probes[slot].dest_ip = dest_ip;
+    pending_probes[slot].dest_port = dest_port;
+    pending_probes[slot].sent_ms = ml_get_time_ms();
+    pending_probes[slot].round = round;
+    pending_probes[slot].active = true;
+    ESP_LOGD(TAG, "Probe registered slot=%d peer=%s txid=%02x%02x%02x%02x",
+             slot, p->hostname, txid[0], txid[1], txid[2], txid[3]);
 }
 
 static void disco_build_pong(microlink_t *ml, int peer_idx,
@@ -1309,6 +1328,7 @@ static void disco_ping_round(microlink_t *ml, int peer_idx, bool force) {
             disco_udp_sendto(ml, pkt, pkt_len, p->best_ip, p->best_port);
             direct_sent = true;
         }
+        p->last_full_ping_ms = now;
         for (int i = 0; i < p->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
             if (p->endpoints[i].is_ipv6 || p->endpoints[i].ip == 0 || !eligible[i]) continue;
             disco_build_ping(ml, peer_idx, round, p->endpoints[i].ip, p->endpoints[i].port, pkt, &pkt_len);
@@ -1345,6 +1365,34 @@ static void disco_ping_round(microlink_t *ml, int peer_idx, bool force) {
     }
 
     p->last_ping_sent_ms = now;
+}
+
+/* Heartbeat on a trusted direct path: ping only the best path, like
+ * Tailscale's heartbeat. Fanning out to every endpoint each heartbeat filled
+ * the probe table (unreachable endpoints hold a slot for the full timeout). */
+static void disco_ping_best(microlink_t *ml, int peer_idx) {
+    ml_peer_t *p = &ml->peers[peer_idx];
+    if (!disco_has_udp_path(ml) || p->best_ip == 0 || p->best_port == 0) {
+        disco_ping_round(ml, peer_idx, true);
+        return;
+    }
+    uint64_t now = ml_get_time_ms();
+    uint8_t pkt[256];
+    size_t pkt_len = 0;
+    disco_build_ping(ml, peer_idx, disco_new_round(), p->best_ip, p->best_port, pkt, &pkt_len);
+    disco_udp_sendto(ml, pkt, pkt_len, p->best_ip, p->best_port);
+    for (int i = 0; i < p->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
+        if (!p->endpoints[i].is_ipv6 && p->endpoints[i].ip == p->best_ip &&
+            p->endpoints[i].port == p->best_port) {
+            p->endpoints[i].last_ping_ms = now;
+        }
+    }
+    p->last_ping_sent_ms = now;
+    ESP_LOGD(TAG, "DISCO heartbeat -> %s via direct %d.%d.%d.%d:%d",
+             p->hostname,
+             (int)((p->best_ip >> 24) & 0xFF), (int)((p->best_ip >> 16) & 0xFF),
+             (int)((p->best_ip >> 8) & 0xFF), (int)(p->best_ip & 0xFF),
+             (int)p->best_port);
 }
 
 static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
@@ -2169,12 +2217,20 @@ static void disco_periodic_probes(microlink_t *ml) {
         }
 
         /* Heartbeat on active direct paths (every HEARTBEAT interval).
-         * MUST use force=true because HEARTBEAT_MS (3s) < PING_INTERVAL_MS (5s),
-         * so the rate limiter would always block heartbeat pings.
+         * Only the best path is pinged; a full round (force=true, because
+         * HEARTBEAT_MS (3s) < PING_INTERVAL_MS (5s) and the per-endpoint
+         * rate limiter would block it) runs every DISCO_FULL_PING_INTERVAL_MS
+         * to look for a better path, and as soon as the best path misses a
+         * heartbeat so another one can take over before trust expires.
          * Heartbeats are NEVER throttled — they're time-critical for trust_until_ms. */
         if (p->has_direct_path &&
             now - p->last_ping_sent_ms > ml->t_disco_heartbeat_ms) {
-            disco_ping_round(ml, i, true);
+            bool best_shaky = now - p->best_pong_ms > 2 * (uint64_t)ml->t_disco_heartbeat_ms;
+            if (best_shaky || now - p->last_full_ping_ms >= DISCO_FULL_PING_INTERVAL_MS) {
+                disco_ping_round(ml, i, true);
+            } else {
+                disco_ping_best(ml, i);
+            }
         }
     }
 
