@@ -29,6 +29,10 @@
 #include "mbedtls/error.h"
 #if CONFIG_ML_DERP_VERIFY_CERT
 #include "esp_crt_bundle.h"
+#elif !defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
+/* ML_DERP_VERIFY_CERT depends on the bundle, so turning the bundle off
+ * silently turns relay certificate checking off as well. Say so. */
+#warning "MBEDTLS_CERTIFICATE_BUNDLE is disabled: DERP relay TLS certificates will not be verified (ML_DERP_VERIFY_CERT unavailable)"
 #endif
 #include "nacl_box.h"
 #include <string.h>
@@ -855,6 +859,19 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         return ESP_FAIL;
     }
 #else
+    {
+        static bool s_warned;
+        if (!s_warned) {
+            s_warned = true;
+            ESP_LOGW(TAG, "DERP TLS certificates are not verified (%s)",
+#if defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
+                     "CONFIG_ML_DERP_VERIFY_CERT=n"
+#else
+                     "CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n"
+#endif
+                     );
+        }
+    }
     mbedtls_ssl_conf_authmode(&ml->derp.ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
 #endif
 #if ML_TLS_LEGACY_RNG
