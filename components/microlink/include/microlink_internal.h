@@ -613,6 +613,10 @@ struct microlink_s {
     char nvs_auth_key[96];
     char nvs_device_name[48];
 
+    /* Pending interactive login (empty = none). Written by the coord task
+     * under ml_coord's auth_url lock, read by microlink_get_auth_url(). */
+    char auth_url[MICROLINK_AUTH_URL_MAX];
+
     /* Control plane host override (empty = use ML_CTRL_HOST default).
      * Set from config struct or NVS at boot for Headscale/Ionscale/custom
      * coordinators. */

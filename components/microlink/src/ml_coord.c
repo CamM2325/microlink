@@ -972,6 +972,54 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
 
 /* do_register: the control plane rejected our auth (vs. -1 = I/O error) */
 #define ML_REG_AUTH_FAILED (-2)
+#define ML_REG_NEEDS_LOGIN (-3)   /* new AuthURL: the user has to log in */
+#define ML_REG_PENDING     (-4)   /* Followup came back before the login was done */
+
+/* How long one Followup request waits for the user to finish logging in
+ * before the connection is renewed and the Followup sent again. */
+#define ML_LOGIN_FOLLOWUP_WAIT_MS 60000
+
+/* ml->auth_url is written by the coord task and copied out by
+ * microlink_get_auth_url() from any task. */
+static portMUX_TYPE s_auth_url_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void set_auth_url(microlink_t *ml, const char *url) {
+    taskENTER_CRITICAL(&s_auth_url_lock);
+    if (url) {
+        strlcpy(ml->auth_url, url, sizeof(ml->auth_url));
+    } else {
+        ml->auth_url[0] = '\0';
+    }
+    taskEXIT_CRITICAL(&s_auth_url_lock);
+}
+
+esp_err_t microlink_get_auth_url(microlink_t *ml, char *buf, size_t buf_len) {
+    if (!ml || !buf || buf_len == 0) return ESP_ERR_INVALID_ARG;
+    esp_err_t ret = ESP_OK;
+    taskENTER_CRITICAL(&s_auth_url_lock);
+    size_t n = strnlen(ml->auth_url, sizeof(ml->auth_url));
+    if (n == 0) {
+        ret = ESP_ERR_NOT_FOUND;
+    } else if (n >= buf_len) {
+        ret = ESP_ERR_INVALID_SIZE;
+    } else {
+        memcpy(buf, ml->auth_url, n + 1);
+    }
+    taskEXIT_CRITICAL(&s_auth_url_lock);
+    return ret;
+}
+
+/* An AuthURL is shown to the user (and as a QR code), so accept only a
+ * plain http(s) URL of printable ASCII that fits. */
+static bool auth_url_ok(const char *url) {
+    if (strncmp(url, "https://", 8) != 0 && strncmp(url, "http://", 7) != 0) return false;
+    size_t n = strnlen(url, MICROLINK_AUTH_URL_MAX);
+    if (n >= MICROLINK_AUTH_URL_MAX) return false;
+    for (size_t i = 0; i < n; i++) {
+        if (url[i] <= 0x20 || url[i] >= 0x7F) return false;
+    }
+    return true;
+}
 
 /* Hostinfo, sent in RegisterRequest and every MapRequest. The control plane
  * reads NetInfo.PreferredDERP from inside it to set Node.HomeDERP for the
@@ -1033,8 +1081,14 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     snprintf(key_str, sizeof(key_str), "nodekey:%s", key_hex);
     cJSON_AddStringToObject(root, "NodeKey", key_str);
 
-    /* Auth - only include if auth_key is valid (matching v1 behavior) */
-    if (ml->config.auth_key && strlen(ml->config.auth_key) > 0) {
+    /* Interactive login in progress: ask the server to answer once the
+     * user has finished (it holds the request until then). Otherwise send
+     * the auth key, if there is one; without it the server replies with an
+     * AuthURL. */
+    bool followup = ml->auth_url[0] != '\0';
+    if (followup) {
+        cJSON_AddStringToObject(root, "Followup", ml->auth_url);
+    } else if (ml->config.auth_key && strlen(ml->config.auth_key) > 0) {
         cJSON *auth = cJSON_CreateObject();
         cJSON_AddStringToObject(auth, "AuthKey", ml->config.auth_key);
         cJSON_AddItemToObject(root, "Auth", auth);
@@ -1106,6 +1160,8 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_reg_sent = esp_timer_get_time();
     ESP_LOGI(TAG, "RegisterRequest sent (%d H2 bytes) [TIMING] send: %ld ms",
              h2_pos, (long)((t_reg_sent - t_reg_start) / 1000));
+
+    if (followup) coord_set_rcv_timeout(ml, ML_LOGIN_FOLLOWUP_WAIT_MS);
 
     /* Read RegisterResponse - accumulate all Noise frames into H2 buffer first,
      * then parse H2 frames (same pattern as MapResponse). */
@@ -1205,8 +1261,12 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     ESP_LOGI(TAG, "RegisterResponse: %d bytes total data", (int)resp_total);
 
     if (resp_total == 0) {
-        ESP_LOGW(TAG, "No DATA frame in RegisterResponse");
         free(resp_buf);
+        if (followup) {
+            ESP_LOGI(TAG, "Still waiting for the login");
+            return ML_REG_PENDING;
+        }
+        ESP_LOGW(TAG, "No DATA frame in RegisterResponse");
         /* Not fatal - server may just return headers-only 200 */
         return 0;
     }
@@ -1271,13 +1331,43 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     if (reg_err && cJSON_IsString(reg_err) && reg_err->valuestring[0]) {
         ESP_LOGE(TAG, "Registration rejected by control plane: %s", reg_err->valuestring);
         cJSON_Delete(resp_json);
+        set_auth_url(ml, NULL);   /* e.g. an expired login: start over */
         return ML_REG_AUTH_FAILED;
     }
     cJSON *authorized = cJSON_GetObjectItem(resp_json, "MachineAuthorized");
-    if (authorized && cJSON_IsFalse(authorized)) {
-        ESP_LOGE(TAG, "Registration not authorized by control plane");
+    bool is_authorized = authorized && cJSON_IsTrue(authorized);
+
+    /* Interactive login (no auth key): the server sends the URL the user
+     * must open, as Tailscale's direct.go handles resp.AuthURL. */
+    cJSON *auth_url = cJSON_GetObjectItem(resp_json, "AuthURL");
+    if (!is_authorized && cJSON_IsString(auth_url) && auth_url->valuestring[0]) {
+        int rc;
+        if (!auth_url_ok(auth_url->valuestring)) {
+            ESP_LOGE(TAG, "Control plane sent an unusable login URL (%u bytes)",
+                     (unsigned)strlen(auth_url->valuestring));
+            set_auth_url(ml, NULL);
+            rc = ML_REG_AUTH_FAILED;
+        } else if (strcmp(ml->auth_url, auth_url->valuestring) != 0) {
+            set_auth_url(ml, auth_url->valuestring);
+            rc = ML_REG_NEEDS_LOGIN;
+        } else {
+            rc = ML_REG_PENDING;
+        }
         cJSON_Delete(resp_json);
+        return rc;
+    }
+    if (authorized && cJSON_IsFalse(authorized)) {
+        cJSON_Delete(resp_json);
+        if (followup) {
+            ESP_LOGI(TAG, "Login not completed yet");
+            return ML_REG_PENDING;
+        }
+        ESP_LOGE(TAG, "Registration not authorized by control plane");
         return ML_REG_AUTH_FAILED;
+    }
+    if (followup) {
+        ESP_LOGI(TAG, "Interactive login complete");
+        set_auth_url(ml, NULL);
     }
 
     /* Extract our VPN IP from Node.Addresses */
@@ -2961,7 +3051,8 @@ void ml_coord_task(void *arg) {
             break;
 
         case COORD_NOISE_HANDSHAKE:
-            ml->state = ML_STATE_REGISTERING;
+            /* Keep NEEDS_LOGIN visible while the Followup is repeated */
+            if (ml->state != ML_STATE_NEEDS_LOGIN) ml->state = ML_STATE_REGISTERING;
             if (do_noise_handshake(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "Noise handshake failed");
                 coord_close_conn(ml);
@@ -2989,6 +3080,23 @@ void ml_coord_task(void *arg) {
             ESP_LOGI(TAG, "Registering...");
             {
                 int reg_rc = do_register(ml, &noise);
+                if (reg_rc == ML_REG_NEEDS_LOGIN || reg_rc == ML_REG_PENDING) {
+                    /* Reconnect at once and send the Followup (register uses
+                     * stream 1 of a fresh connection). */
+                    if (reg_rc == ML_REG_NEEDS_LOGIN) {
+                        ESP_LOGW(TAG, "Login required: open the URL from "
+                                      "microlink_get_auth_url() to add this device");
+                        ESP_LOGD(TAG, "Login URL: %s", ml->auth_url);
+                        ml->state = ML_STATE_NEEDS_LOGIN;
+                        if (ml->state_cb) {
+                            ml->state_cb(ml, ML_STATE_NEEDS_LOGIN, ml->state_cb_data);
+                        }
+                    }
+                    reconnect_attempts = 0;
+                    coord_close_conn(ml);
+                    state = COORD_RECONNECTING;
+                    break;
+                }
                 if (reg_rc < 0) {
                     ESP_LOGE(TAG, "Registration failed");
                     if (reg_rc == ML_REG_AUTH_FAILED) {
@@ -3358,7 +3466,8 @@ void ml_coord_task(void *arg) {
                  * with RECONNECTING on each retry would clear the host's
                  * re-login prompt. */
                 if (ml->state != ML_STATE_RECONNECTING &&
-                    ml->state != ML_STATE_AUTH_FAILED) {
+                    ml->state != ML_STATE_AUTH_FAILED &&
+                    ml->state != ML_STATE_NEEDS_LOGIN) {
                     ml->state = ML_STATE_RECONNECTING;
                     if (ml->state_cb) {
                         ml->state_cb(ml, ML_STATE_RECONNECTING, ml->state_cb_data);

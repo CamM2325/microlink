@@ -101,7 +101,15 @@ typedef enum {
      * should surface this to the user as their equivalent of a "re-login"
      * prompt (headless devices have no UI to notice it otherwise). */
     ML_STATE_AUTH_FAILED,
+    /* No auth key was given and the control plane wants an interactive
+     * login: get the URL with microlink_get_auth_url() and show it (or a QR
+     * code of it) to the user. The device keeps waiting for the login and
+     * moves on to CONNECTED by itself once it is done. */
+    ML_STATE_NEEDS_LOGIN,
 } microlink_state_t;
+
+/* Longest login URL microlink_get_auth_url() can return, with the NUL */
+#define MICROLINK_AUTH_URL_MAX 256
 
 /* Callback types */
 typedef void (*microlink_state_cb_t)(microlink_t *ml, microlink_state_t state, void *user_data);
@@ -204,6 +212,23 @@ bool microlink_is_connected(const microlink_t *ml);
  * @return VPN IP in host byte order, 0 if not yet assigned
  */
 uint32_t microlink_get_vpn_ip(const microlink_t *ml);
+
+/**
+ * @brief Get the login URL of a pending interactive login
+ *
+ * Without an auth key (auth_key NULL or ""), the control plane answers the
+ * registration with a URL; whoever opens it and logs in adds this device
+ * to their tailnet, so show it only to the device's owner (it is a
+ * credential until used). The device's keys are kept in NVS, so this is
+ * needed once, not on every boot.
+ *
+ * @param buf     Receives the NUL-terminated URL
+ * @param buf_len Size of buf; MICROLINK_AUTH_URL_MAX always fits
+ * @return ESP_OK, ESP_ERR_NOT_FOUND if no login is pending,
+ *         ESP_ERR_INVALID_SIZE if buf is too small (nothing is copied:
+ *         a truncated URL would be useless), ESP_ERR_INVALID_ARG
+ */
+esp_err_t microlink_get_auth_url(microlink_t *ml, char *buf, size_t buf_len);
 
 /**
  * @brief Get number of known peers

@@ -24,6 +24,7 @@
 #include "esp_netif.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "qrcode.h"
 
 #include "microlink.h"
 #include "microlink_internal.h"  /* For task handle access (diagnostic) */
@@ -100,7 +101,7 @@ static void on_udp_rx(microlink_udp_socket_t *sock, uint32_t src_ip, uint16_t sr
 static void on_state_change(microlink_t *ml_handle, microlink_state_t state, void *user_data) {
     const char *state_names[] = {
         "IDLE", "WIFI_WAIT", "CONNECTING", "REGISTERING",
-        "CONNECTED", "RECONNECTING", "ERROR"
+        "CONNECTED", "RECONNECTING", "ERROR", "AUTH_FAILED", "NEEDS_LOGIN"
     };
     const char *name = (state < sizeof(state_names)/sizeof(state_names[0]))
                        ? state_names[state] : "UNKNOWN";
@@ -111,6 +112,18 @@ static void on_state_change(microlink_t *ml_handle, microlink_state_t state, voi
         char ip_str[16];
         microlink_ip_to_str(ip, ip_str);
         ESP_LOGI(TAG, "Connected! VPN IP: %s", ip_str);
+    }
+
+    /* No auth key configured: show the login URL (and a QR code of it on
+     * the serial console). Opening it adds this device to your tailnet, so
+     * it is printed only here, for whoever has the serial port. */
+    if (state == ML_STATE_NEEDS_LOGIN) {
+        char url[MICROLINK_AUTH_URL_MAX];
+        if (microlink_get_auth_url(ml_handle, url, sizeof(url)) == ESP_OK) {
+            printf("\nTo add this device to your tailnet, open:\n\n    %s\n\n", url);
+            esp_qrcode_config_t qr = ESP_QRCODE_CONFIG_DEFAULT();
+            esp_qrcode_generate(&qr, url);
+        }
     }
 }
 

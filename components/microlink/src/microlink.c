@@ -400,8 +400,11 @@ static bool ml_called_from_worker(const microlink_t *ml) {
  * ========================================================================== */
 
 microlink_t *microlink_init(const microlink_config_t *config) {
-    if (!config || !config->auth_key) {
-        ESP_LOGE(TAG, "Invalid config: auth_key required");
+    /* auth_key may be NULL or "": the device then registers without one
+     * and the control plane asks for an interactive login
+     * (ML_STATE_NEEDS_LOGIN, microlink_get_auth_url()). */
+    if (!config) {
+        ESP_LOGE(TAG, "Invalid config");
         return NULL;
     }
 

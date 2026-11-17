@@ -499,6 +499,9 @@ menu "MicroLink V2 Configuration"
                 Tailscale authentication key from https://login.tailscale.com/admin/settings/keys
                 Generate a reusable + ephemeral key for development.
                 This is stored in sdkconfig which should be git-ignored.
+                Leave empty to join by interactive login instead: the device
+                gets a login URL from the control plane (ML_STATE_NEEDS_LOGIN,
+                microlink_get_auth_url(); basic_connect prints it as a QR code).
 
         config ML_DEVICE_NAME
             string "Device Name"

@@ -15,7 +15,8 @@ before you rely on it.
 
 ## What it does
 
-- **Tailscale control protocol**: ts2021 Noise handshake, registration with an auth key,
+- **Tailscale control protocol**: ts2021 Noise handshake, registration with an auth key or an
+  interactive login (URL / QR code),
   map updates over a long-poll stream (peers added, removed and patched by NodeID), key-expiry handling.
 - **WireGuard** data plane on lwIP (based on [wireguard-lwip](https://github.com/smartalock/wireguard-lwip)),
   with Tailscale's 1280-byte tunnel MTU.
@@ -53,7 +54,8 @@ control plane over TLS (PR #22).
 - Subnet routes work in one direction only: the device can *be* a subnet router or exit node,
   but it does not use other nodes' subnet routes or exit nodes (no `--accept-routes` /
   `--exit-node`).
-- No interactive / QR-code login; an auth key is required (issue #8).
+- A device that joined by interactive login cannot renew an expired node key by itself (it
+  reports `AUTH_FAILED`); disable key expiry for it in the admin console.
 - No Tailscale SSH, Taildrop, MagicDNS server or HTTPS certificates.
   (`microlink_resolve()` looks a peer name up in the local peer list.)
 - The DERP home region is set by hand (`CONFIG_ML_DERP_REGION`, default 9 = Dallas); there is
@@ -69,7 +71,8 @@ The device shows up as **Linux** in the admin console (`Hostinfo.OS`).
   `basic_connect`/`cellular_connect` with v6.1. On IDF 6, cJSON comes from the component registry.
 - An **ESP32-S3** is recommended (PSRAM strongly recommended). Classic ESP32 and ESP32-C3 build
   and have community reports, but are not part of the required CI checks.
-- A Tailscale **auth key** (reusable keys survive re-registration; ephemeral keys do not).
+- A Tailscale **auth key** (reusable keys survive re-registration; ephemeral keys do not), or a way
+  to show the user a login URL ([interactive login](#interactive-login-no-auth-key)).
 - Optional: SIM7600-series or SIM7670-series modem for cellular.
 
 ## Quick start (WiFi)
@@ -168,7 +171,7 @@ The header [`microlink.h`](components/microlink/include/microlink.h) is the refe
 | Area | Functions |
 |---|---|
 | Lifecycle | `microlink_init`, `microlink_start`, `microlink_stop`, `microlink_destroy`, `microlink_rebind`, `microlink_factory_reset` |
-| Status | `microlink_get_state`, `microlink_is_connected`, `microlink_get_vpn_ip`, `microlink_get_peer_count`, `microlink_get_peer_info` |
+| Status | `microlink_get_state`, `microlink_is_connected`, `microlink_get_vpn_ip`, `microlink_get_peer_count`, `microlink_get_peer_info`, `microlink_get_auth_url` |
 | Callbacks | `microlink_set_state_callback`, `microlink_set_peer_callback` |
 | Names / IPs | `microlink_resolve`, `microlink_ip_to_str`, `microlink_parse_ip`, `microlink_default_device_name`, `microlink_imei_device_name` |
 | UDP | `microlink_udp_create`, `microlink_udp_send`, `microlink_udp_recv`, `microlink_udp_set_rx_callback`, `microlink_udp_get_local_port`, `microlink_udp_close` |
@@ -190,7 +193,7 @@ Notes:
 
 | Field | Meaning |
 |---|---|
-| `auth_key` | Required. |
+| `auth_key` | Auth key; NULL or `""` = interactive login (see below). |
 | `device_name` | Hostname on the tailnet (default `esp32-<mac>`). |
 | `max_peers` | Peer table size, 0 = `CONFIG_ML_MAX_PEERS`, clamped to it. |
 | `priority_peer_ip` | Peer that may evict others when the table is full. |
@@ -299,6 +302,21 @@ to a streaming fetch automatically (or set `CONFIG_ML_CTRL_STREAMING_MAP_FETCH` 
 `parttool.py erase_partition --partition-name=nvs`) when moving a board between control servers. If your DERP or HTTPS
 endpoint uses a private CA, add it to the certificate bundle (`CONFIG_MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE`)
 or turn off `ML_DERP_VERIFY_CERT` / `ML_CTRL_TLS_VERIFY_CERT`.
+
+## Interactive login (no auth key)
+
+Leave the auth key empty (`auth_key = NULL` or `""`, or an empty `CONFIG_ML_TAILSCALE_AUTH_KEY`)
+and the device asks the control plane for a login instead, like `tailscale up` without
+`--auth-key`:
+
+1. The state changes to `ML_STATE_NEEDS_LOGIN`. `microlink_get_auth_url()` returns the login URL.
+2. Show it to the user. `basic_connect` prints it, and a QR code of it, on the serial console.
+3. The user opens it and logs in (on Headscale: `headscale auth register --auth-id <id> --user <user>`).
+   The device waits for this by itself and then continues to `CONNECTED`.
+
+The node keys are kept in NVS, so this happens once per device, not on every boot (erasing NVS makes
+it a new device). Whoever opens the URL first adds the device to *their* tailnet: show it only to
+the device's owner. Tested with Headscale.
 
 ## Subnet router and exit node
 

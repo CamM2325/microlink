@@ -1,0 +1,4 @@
+## IDF Component Manager manifest for the basic_connect example
+dependencies:
+  # Prints the interactive-login URL as a QR code on the console
+  espressif/qrcode: "^0.1.0"
