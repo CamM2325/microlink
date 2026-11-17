@@ -776,8 +776,12 @@ static esp_err_t ppp_setup_and_dial(void)
         /* Auth type: 0=none, 1=PAP, 2=CHAP */
         int auth_type = (ppp_user[0] || ppp_pass[0]) ? 2 : 1;  /* CHAP if creds, PAP if empty */
         char auth_cmd[192];   /* 2 x ML_AT_CRED_MAX + command: never truncated */
+        /* SIMCom order is password first: AT+CGAUTH=<cid>,<auth_type>,
+         * <passwd>,<user> (SIM7500/SIM7600 AT manual V3.00 and A7600
+         * series AT manual V1.01, which covers the A76xx/SIM767x family),
+         * unlike 3GPP TS 27.007's <username>,<password>. */
         snprintf(auth_cmd, sizeof(auth_cmd),
-                 "AT+CGAUTH=1,%d,\"%s\",\"%s\"", auth_type, ppp_user, ppp_pass);
+                 "AT+CGAUTH=1,%d,\"%s\",\"%s\"", auth_type, ppp_pass, ppp_user);
         at_cmd_ok(auth_cmd, AT_TIMEOUT_MS);
         ml_at_secure_zero(auth_cmd, sizeof(auth_cmd));
     }
