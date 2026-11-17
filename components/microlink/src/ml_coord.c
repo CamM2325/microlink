@@ -415,6 +415,52 @@ static int do_tcp_connect(microlink_t *ml) {
 static uint8_t *s_server_extra_data = NULL;
 static int s_server_extra_data_len = 0;
 
+/* Upper bound for the proactive frames kept from the handshake. EarlyNoise
+ * is a few small frames; Go servers never write a frame over 4 KB. */
+#define PROACTIVE_MAX_BYTES  16384
+
+/* The read that picked up the proactive frames can end in the middle of
+ * one (on slow links HTTP 101, msg2 and part of an EarlyNoise frame arrive
+ * in one segment). Read the missing bytes so the buffer ends on a frame
+ * boundary: process_proactive_frames() only sees this buffer, and a tail
+ * left on the socket would be taken for the next frame header.
+ * *buf is replaced when it grows. Returns 0, or -1 if the rest never came. */
+static int complete_proactive_frames(microlink_t *ml, uint8_t **buf, int *len) {
+    int off = 0;
+    for (;;) {
+        int need = 0;
+        while (off < *len) {
+            if (off + 3 > *len) {
+                need = off + 3 - *len;          /* frame header cut off */
+                break;
+            }
+            int fl = ((*buf)[off + 1] << 8) | (*buf)[off + 2];
+            if (off + 3 + fl > *len) {
+                need = off + 3 + fl - *len;     /* frame payload cut off */
+                break;
+            }
+            off += 3 + fl;
+        }
+        if (need == 0) return 0;
+
+        if (*len + need > PROACTIVE_MAX_BYTES) {
+            ESP_LOGE(TAG, "Proactive frame at offset %d too large (%d bytes missing)", off, need);
+            return -1;
+        }
+        ESP_LOGI(TAG, "Incomplete proactive frame at offset %d, reading %d more bytes", off, need);
+        uint8_t *nb = ml_psram_malloc(*len + need);
+        if (!nb) return -1;
+        memcpy(nb, *buf, *len);
+        free(*buf);
+        *buf = nb;
+        if (coord_recv_ex(ml, nb + *len, need, true) < 0) {
+            ESP_LOGE(TAG, "Rest of proactive frame did not arrive");
+            return -1;
+        }
+        *len += need;
+    }
+}
+
 static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_noise_start = esp_timer_get_time();
 
@@ -643,6 +689,13 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
         /* Restore normal recv timeout */
         struct timeval normal_tv = { .tv_sec = 60, .tv_usec = 0 };
         ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &normal_tv, sizeof(normal_tv));
+    }
+
+    if (extra_data && extra_len > 0 &&
+        complete_proactive_frames(ml, &extra_data, &extra_len) < 0) {
+        free(extra_data);
+        free(body_buf);
+        return -1;
     }
 
     if (extra_data && extra_len > 0) {
