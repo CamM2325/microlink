@@ -273,14 +273,15 @@ static esp_err_t cellular_start(void)
         .sim_pin = s_ctx.sim_pin[0] ? s_ctx.sim_pin : NULL,
     };
 
-    /* Apply APN: NVS (web UI) > config struct > Kconfig */
-    static char nvs_apn[32] = "";
+    /* Apply APN: NVS (web UI) > config struct > Kconfig.
+     * ml_cellular_init() copies the strings, so these can be locals. */
+    char nvs_apn[ML_AT_APN_MAX + 1] = "";
     if (ml_config_get_nvs_apn(nvs_apn, sizeof(nvs_apn))) {
         cell_config.apn = nvs_apn;
     }
 
     /* Apply PPP credentials: NVS (web UI) > Kconfig */
-    char nvs_ppp_user[32] = "", nvs_ppp_pass[32] = "";
+    char nvs_ppp_user[ML_AT_CRED_MAX + 1] = "", nvs_ppp_pass[ML_AT_CRED_MAX + 1] = "";
     if (ml_config_get_nvs_ppp(nvs_ppp_user, sizeof(nvs_ppp_user),
                                nvs_ppp_pass, sizeof(nvs_ppp_pass))) {
         cell_config.ppp_user = nvs_ppp_user;
@@ -293,6 +294,8 @@ static esp_err_t cellular_start(void)
     }
 
     esp_err_t err = ml_cellular_init(&cell_config);
+    ml_at_secure_zero(nvs_ppp_user, sizeof(nvs_ppp_user));
+    ml_at_secure_zero(nvs_ppp_pass, sizeof(nvs_ppp_pass));
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Cellular init failed: %s", esp_err_to_name(err));
         return err;

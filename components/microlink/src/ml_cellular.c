@@ -57,7 +57,11 @@ static const char *TAG = "ml_cell";
 #define PPP_GOT_IP6_BIT     BIT5
 
 static struct {
-    ml_cellular_config_t config;
+    ml_cellular_config_t config;   /* string fields point at the copies below */
+    char apn[ML_AT_APN_MAX + 1];
+    char sim_pin[ML_AT_PIN_MAX + 1];
+    char ppp_user[ML_AT_CRED_MAX + 1];
+    char ppp_pass[ML_AT_CRED_MAX + 1];
     volatile ml_cellular_state_t state;
     ml_cellular_info_t info;
     bool uart_installed;
@@ -901,6 +905,29 @@ static esp_err_t ppp_setup_and_dial(void)
  * Public API
  * ========================================================================== */
 
+/* Copy a validated config string into driver-owned storage (NULL stays NULL) */
+static const char *copy_config_str(char *dst, size_t dst_size, const char *src)
+{
+    if (!src) {
+        dst[0] = '\0';
+        return NULL;
+    }
+    strlcpy(dst, src, dst_size);
+    return dst;
+}
+
+static void clear_config_strs(void)
+{
+    ml_at_secure_zero(s_cell.sim_pin, sizeof(s_cell.sim_pin));
+    ml_at_secure_zero(s_cell.ppp_user, sizeof(s_cell.ppp_user));
+    ml_at_secure_zero(s_cell.ppp_pass, sizeof(s_cell.ppp_pass));
+    s_cell.apn[0] = '\0';
+    s_cell.config.apn = NULL;
+    s_cell.config.sim_pin = NULL;
+    s_cell.config.ppp_user = NULL;
+    s_cell.config.ppp_pass = NULL;
+}
+
 esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
 {
     if (s_cell.state != ML_CELL_STATE_OFF) {
@@ -935,6 +962,18 @@ esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
             return ESP_ERR_INVALID_ARG;
         }
     }
+
+    /* Keep our own copies: the PPP credentials are handed to lwIP
+     * (ppp_set_auth() stores the pointers) and used again on a CHAP
+     * re-challenge long after the caller's buffers are gone. The lengths
+     * were checked above, so nothing is truncated. */
+    s_cell.config.apn = copy_config_str(s_cell.apn, sizeof(s_cell.apn), s_cell.config.apn);
+    s_cell.config.sim_pin = copy_config_str(s_cell.sim_pin, sizeof(s_cell.sim_pin),
+                                            s_cell.config.sim_pin);
+    s_cell.config.ppp_user = copy_config_str(s_cell.ppp_user, sizeof(s_cell.ppp_user),
+                                             s_cell.config.ppp_user);
+    s_cell.config.ppp_pass = copy_config_str(s_cell.ppp_pass, sizeof(s_cell.ppp_pass),
+                                             s_cell.config.ppp_pass);
 
     if (!s_uart_lock) {
         s_uart_lock = xSemaphoreCreateMutex();
@@ -1078,6 +1117,7 @@ void ml_cellular_deinit(void)
     }
 
     memset(&s_cell.info, 0, sizeof(s_cell.info));
+    clear_config_strs();
     s_cell.state = ML_CELL_STATE_OFF;
     ESP_LOGI(TAG, "Cellular deinitialized");
 }

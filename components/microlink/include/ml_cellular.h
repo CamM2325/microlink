@@ -27,6 +27,8 @@ extern "C" {
  * Configuration
  * ========================================================================== */
 
+/* ml_cellular_init() copies the strings, so the caller's buffers need not
+ * outlive the call. */
 typedef struct {
     int tx_pin;                 /* ESP32 TX → SIM7600 RXD (default: GPIO43) */
     int rx_pin;                 /* ESP32 RX ← SIM7600 TXD (default: GPIO44) */
