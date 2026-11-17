@@ -1149,6 +1149,9 @@ err_t wireguardif_set_endpoint(struct netif *netif, u8_t peer_index, const ip_ad
 		result = ERR_ARG;
 	}
 	if (result == ERR_OK) {
+		// Address only: no handshake, no change to send_handshake/active
+		// (wg_mgr calls this on every heartbeat where the peer has roamed the
+		// endpoint away from the best path).
 		wg_state_lock();
 		peer->connect_ip = *ip;
 		peer->connect_port = port;

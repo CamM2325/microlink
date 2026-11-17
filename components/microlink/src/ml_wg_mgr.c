@@ -1524,9 +1524,10 @@ static bool disco_path_better(uint32_t a_ip, uint32_t a_rtt, uint32_t b_ip, uint
 
 /* Point the peer's WireGuard endpoint at its (new or re-confirmed) best
  * direct path. With a session up this only roams the endpoint, like
- * magicsock moving its bestAddr: a handshake per path change cost two
- * X25519 per heartbeat on a peer reachable at two addresses. Without a
- * session it kicks a (rate-limited) handshake. */
+ * magicsock moving its bestAddr (wireguardif_set_endpoint() never starts a
+ * handshake): a handshake per path change cost two X25519 per heartbeat on
+ * a peer reachable at two addresses. Without a session it kicks a
+ * (rate-limited) handshake. */
 static void disco_apply_direct_path(microlink_t *ml, ml_peer_t *p, bool switched, uint64_t now) {
     if (!ml->wg_netif || p->wg_peer_index < 0) return;
     struct netif *netif = (struct netif *)ml->wg_netif;
@@ -1544,18 +1545,30 @@ static void disco_apply_direct_path(microlink_t *ml, ml_peer_t *p, bool switched
                    cur_port == p->best_port;
 
     err_t err;
-    if (up && !on_path && (switched || ip_addr_isany(&cur_ip))) {
+    if (up && !on_path) {
+        /* Always transmit to the DISCO-verified best path, like magicsock
+         * sending to bestAddr whatever address the peer's packets arrive
+         * from. update_peer_addr() roams peer->ip to the source of each
+         * authenticated packet; if that address dies while the best path
+         * keeps answering DISCO, leaving the endpoint there black-holed TX
+         * (keepalives and rekeys included) for minutes. set_endpoint() only
+         * moves the address, no handshake, so a peer that sends from another
+         * address just flips it back here once per heartbeat. */
         err = wireguardif_set_endpoint(netif, wg_idx, &ep_ip, p->best_port);
-        if (err == ERR_OK) {
+        if (err == ERR_OK && switched) {
             ESP_LOGI(TAG, "WG endpoint SWITCHED to direct: %d.%d.%d.%d:%d for %s",
+                     (int)((p->best_ip >> 24) & 0xFF), (int)((p->best_ip >> 16) & 0xFF),
+                     (int)((p->best_ip >> 8) & 0xFF), (int)(p->best_ip & 0xFF),
+                     (int)p->best_port, p->hostname);
+        } else if (err == ERR_OK) {
+            ESP_LOGD(TAG, "WG endpoint moved back to best path %d.%d.%d.%d:%d for %s",
                      (int)((p->best_ip >> 24) & 0xFF), (int)((p->best_ip >> 16) & 0xFF),
                      (int)((p->best_ip >> 8) & 0xFF), (int)(p->best_ip & 0xFF),
                      (int)p->best_port, p->hostname);
         }
     } else {
-        /* Session up on this path, or the peer roamed our endpoint to the
-         * address it sends from (that path works too): just keep connect_ip
-         * on the best path. */
+        /* Session up on the best path already, or no session: keep
+         * connect_ip on the best path. */
         err = wireguardif_update_endpoint(netif, wg_idx, &ep_ip, p->best_port);
     }
     if (err != ERR_OK) {
