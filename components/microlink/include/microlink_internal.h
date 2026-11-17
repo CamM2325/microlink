@@ -206,6 +206,8 @@ typedef struct {
 /* Zero-copy state embedded in microlink_s */
 typedef struct {
     struct udp_pcb *pcb;            /* Raw UDP PCB (replaces disco_sock4) */
+    struct udp_pcb *stale_pcb;      /* PCB a failed deinit left registered: never
+                                     * used again, removal retried by the next deinit */
     uint16_t local_port;            /* Bound port */
 
     /* DISCO RX ring buffer (lock-free SPSC) */
@@ -719,8 +721,9 @@ void ml_peer_nvs_batch_end(void);
 /* ml_zerocopy.c */
 esp_err_t ml_zerocopy_init(microlink_t *ml);
 /* ESP_FAIL if tcpip_thread could not be reached: the PCB is then still
- * registered (its callback detached from ml), and the caller must not free
- * state reachable from it. A later call retries. */
+ * registered (its callback detached from ml, parked in zc.stale_pcb so
+ * nothing sends on it and the BSD socket fallback is used), and the caller
+ * must not free state reachable from it. A later call retries. */
 esp_err_t ml_zerocopy_deinit(microlink_t *ml);
 esp_err_t ml_zerocopy_send(microlink_t *ml, const uint8_t *data, size_t len,
                             uint32_t dest_ip, uint16_t dest_port);

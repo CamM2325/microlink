@@ -190,6 +190,10 @@ static void zc_pcb_remove_in_tcpip(void *arg) {
         udp_remove(ctx->ml->zc.pcb);
         ctx->ml->zc.pcb = NULL;
     }
+    if (ctx->ml->zc.stale_pcb) {
+        udp_remove(ctx->ml->zc.stale_pcb);
+        ctx->ml->zc.stale_pcb = NULL;
+    }
     xSemaphoreGive(ctx->done);
 }
 
@@ -200,7 +204,7 @@ static void zc_pcb_remove_in_tcpip(void *arg) {
 esp_err_t ml_zerocopy_init(microlink_t *ml) {
     ESP_LOGI(TAG, "Initializing zero-copy WG path");
 
-    if (ml->zc.pcb) {
+    if (ml->zc.pcb || ml->zc.stale_pcb) {
         /* A previous deinit could not remove its PCB; clearing ml->zc now
          * would lose it while it is still registered. */
         ESP_LOGE(TAG, "Previous zero-copy PCB still registered, not re-initializing");
@@ -243,7 +247,7 @@ esp_err_t ml_zerocopy_init(microlink_t *ml) {
 }
 
 esp_err_t ml_zerocopy_deinit(microlink_t *ml) {
-    if (!ml->zc.pcb) return ESP_OK;
+    if (!ml->zc.pcb && !ml->zc.stale_pcb) return ESP_OK;
 
     ESP_LOGI(TAG, "Shutting down zero-copy WG path");
 
@@ -267,8 +271,15 @@ esp_err_t ml_zerocopy_deinit(microlink_t *ml) {
     if (err != ERR_OK) {
         /* The PCB stays registered: detach its callback from ml and report
          * it, so the caller doesn't free what the PCB path can still reach.
-         * ml->zc.pcb is kept, so a later deinit retries the removal. */
+         * It is parked in stale_pcb: ml->zc.pcb = NULL makes every sender
+         * (disco_udp_sendto, ml_zerocopy_send) use the BSD socket instead
+         * of a PCB whose replies are now dropped, and the next deinit
+         * retries the removal. */
         __atomic_store_n(&s_zc_owner, NULL, __ATOMIC_RELEASE);
+        if (ml->zc.pcb) {
+            ml->zc.stale_pcb = ml->zc.pcb;
+            ml->zc.pcb = NULL;
+        }
         ESP_LOGE(TAG, "Could not reach tcpip_thread to remove the zero-copy PCB (%d)", err);
         vSemaphoreDelete(ctx.done);
         return ESP_FAIL;
