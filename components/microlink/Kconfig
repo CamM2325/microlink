@@ -511,7 +511,7 @@ menu "MicroLink V2 Configuration"
                 WiFi credentials, Tailscale auth key, peer allowlist, etc.
 
                 Every request requires HTTP Basic auth (user "admin") and is
-                only served on the tailnet address unless
+                only served on the device's tailnet (VPN) address unless
                 ML_CONFIG_HTTPD_ALLOW_LAN is set. Anyone with the password
                 can change the auth key and network settings.
 
@@ -534,11 +534,12 @@ menu "MicroLink V2 Configuration"
             depends on ML_ENABLE_CONFIG_HTTPD
             default n
             help
-                By default the config UI only answers on the tailnet address
-                (100.64.0.0/10), where traffic is WireGuard-encrypted. Enable
-                to also answer on private LAN addresses; Basic auth is then
-                sent in cleartext on that LAN. Never served on the cellular
-                carrier address.
+                By default the config UI only answers on the device's own
+                tailnet (VPN) address, where traffic is WireGuard-encrypted.
+                Enable to also answer on the WiFi station / Ethernet
+                interface's own address; Basic auth is then sent in cleartext
+                on that LAN. Never served on the cellular (PPP) carrier
+                address.
 
         config ML_CONFIG_MAX_ALLOWED_PEERS
             int "Maximum peers in allowlist"

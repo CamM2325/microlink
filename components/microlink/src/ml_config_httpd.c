@@ -23,6 +23,7 @@
 #include "esp_heap_caps.h"
 #include "esp_wifi.h"
 #include "esp_timer.h"
+#include "esp_netif.h"
 #include "driver/temperature_sensor.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -395,9 +396,10 @@ const char *ml_config_get_device_name_full(const ml_config_ctx_t *ctx) {
  *
  * The config server can change the auth key, WiFi list, APN credentials and
  * control host, so every endpoint requires:
- *   1. the request arrived on an allowed interface: tailnet (100.64.0.0/10)
- *      only, unless CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN. Never the cellular
- *      carrier-facing address.
+ *   1. the request arrived on an allowed address: the device's own tailnet
+ *      (VPN) IP, plus the WiFi station / Ethernet address with
+ *      CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN. Never the cellular carrier-facing
+ *      (PPP) address.
  *   2. HTTP Basic auth with the admin password (CONFIG_ML_CONFIG_HTTPD_PASSWORD,
  *      or a random one generated on first start, stored in NVS and printed
  *      once on the serial console).
@@ -492,17 +494,46 @@ static bool request_local_ipv4(httpd_req_t *req, uint32_t *ip_out) {
     return false;
 }
 
-static bool local_addr_allowed(httpd_req_t *req) {
+#if CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN
+/* esp_netif_find_if() predicate (runs in the lwIP context): a WiFi station
+ * or Ethernet interface whose own address is *arg (network byte order).
+ * The PPP (cellular carrier) interface never matches. */
+static bool lan_netif_has_ip(esp_netif_t *netif, void *arg) {
+    const uint32_t want = *(const uint32_t *)arg;
+    if (esp_netif_get_flags(netif) & ESP_NETIF_FLAG_IS_PPP) return false;
+    const char *key = esp_netif_get_ifkey(netif);
+    const char *desc = esp_netif_get_desc(netif);
+    bool lan = (key && (strncmp(key, "WIFI_STA", 8) == 0 || strncmp(key, "ETH", 3) == 0)) ||
+               (desc && (strcmp(desc, "sta") == 0 || strncmp(desc, "eth", 3) == 0));
+    if (!lan || !esp_netif_is_netif_up(netif)) return false;
+    esp_netif_ip_info_t info;
+    if (esp_netif_get_ip_info(netif, &info) != ESP_OK) return false;
+    return info.ip.addr != 0 && info.ip.addr == want;
+}
+#endif
+
+/* The request must have arrived on the device's own tailnet address (the
+ * VPN IP assigned by the control plane) or, with ALLOW_LAN, on the WiFi
+ * station / Ethernet interface's own address. Address ranges are not used:
+ * 100.64.0.0/10 is also carrier-grade NAT space and 10/8 is a common
+ * carrier PPP range, so a range check would serve the UI on the cellular
+ * carrier side. @p ml may be NULL (MicroLink stopped: no tailnet address).
+ * On success *ip_out is the local IPv4 address (host byte order). */
+static bool local_addr_allowed(httpd_req_t *req, const microlink_t *ml, uint32_t *ip_out) {
     uint32_t ip;
-    if (!request_local_ipv4(req, &ip)) {
+    if (!request_local_ipv4(req, &ip) || ip == 0) {
         return false;
     }
-    bool tailnet = (ip & 0xFFC00000u) == 0x64400000u;  /* 100.64.0.0/10 */
+    *ip_out = ip;
+    uint32_t vpn_ip = ml ? microlink_get_vpn_ip(ml) : 0;
+    if (vpn_ip != 0 && ip == vpn_ip) {
+        return true;
+    }
 #if CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN
-    bool lan = ((ip >> 24) == 10) || ((ip >> 16) == 0xC0A8) || (((ip >> 16) & 0xFFF0) == 0xAC10);
-    return tailnet || lan;
+    uint32_t ip_be = htonl(ip);
+    return esp_netif_find_if(lan_netif_has_ip, &ip_be) != NULL;
 #else
-    return tailnet;
+    return false;
 #endif
 }
 
@@ -542,7 +573,9 @@ static bool basic_auth_ok(httpd_req_t *req) {
 
 /* Returns true if the request may proceed; otherwise a response was sent. */
 static bool http_guard(httpd_req_t *req, bool mutating) {
-    if (!local_addr_allowed(req)) {
+    const ml_config_ctx_t *ctx = (const ml_config_ctx_t *)req->user_ctx;
+    uint32_t local_ip;
+    if (!local_addr_allowed(req, ctx->ml, &local_ip)) {
         httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Not available on this interface");
         return false;
     }
@@ -1405,6 +1438,14 @@ static esp_err_t handler_dispatch(httpd_req_t *req) {
     ml_config_ctx_t *ctx = s_attached;
     if (!ctx || !ctx->ml) {
         xSemaphoreGive(s_attach_lock);
+        /* Without MicroLink there is no tailnet address, so only a LAN
+         * address (ALLOW_LAN) can pass; everyone else gets the same 403
+         * as when MicroLink is running. */
+        uint32_t local_ip;
+        if (!local_addr_allowed(req, NULL, &local_ip)) {
+            httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Not available on this interface");
+            return ESP_OK;
+        }
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_type(req, "text/plain");
         httpd_resp_sendstr(req, "MicroLink is not running");
