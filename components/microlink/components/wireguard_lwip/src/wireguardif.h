@@ -126,6 +126,11 @@ err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip
 // a handshake (roaming an established session). ip_addr_any = via DERP.
 err_t wireguardif_set_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port);
 
+// Clear the DERP / UDP output callbacks and their contexts. Output then
+// fails with ERR_RTE/ERR_CONN instead of calling back into the owner. For a
+// netif that has to be leaked while lwIP may still route through it.
+void wireguardif_detach_outputs(struct netif *netif);
+
 // Try and connect to the given peer
 err_t wireguardif_connect(struct netif *netif, u8_t peer_index);
 

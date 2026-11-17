@@ -389,6 +389,22 @@ static void wg_netif_remove_in_tcpip(void *arg) {
     xSemaphoreGive(ctx->done);
 }
 
+/* A netif that can't be taken out of lwIP is leaked, but app traffic to
+ * 100.64/10 may still route through it on tcpip_thread. Detach the device's
+ * output callbacks (their ctx is ml, which microlink_destroy() frees later),
+ * so output fails instead of calling back into ml, and try (without
+ * blocking) to take the netif down so lwIP stops routing to it. */
+static void netif_set_down_in_tcpip(void *arg) {
+    netif_set_down((struct netif *)arg);
+}
+
+static void wg_abandon_netif(struct netif *netif) {
+    wireguardif_detach_outputs(netif);
+    if (tcpip_try_callback(netif_set_down_in_tcpip, netif) != ERR_OK) {
+        ESP_LOGE(TAG, "Could not post netif_set_down for the leaked WG netif");
+    }
+}
+
 static void wg_teardown_interface(microlink_t *ml) {
     struct netif *netif = (struct netif *)ml->wg_netif;
     if (!netif) return;
@@ -402,6 +418,7 @@ static void wg_teardown_interface(microlink_t *ml) {
          * the netif and device rather than free what lwIP may still use. */
         ml->wg_netif = NULL;
         ESP_LOGE(TAG, "Zero-copy PCB still live; leaking the WG netif and device");
+        wg_abandon_netif(netif);
         return;
     }
 #endif
@@ -425,6 +442,7 @@ static void wg_teardown_interface(microlink_t *ml) {
          * tcpip_thread; leaking it is the lesser evil. */
         ESP_LOGE(TAG, "Could not reach tcpip_thread to remove the WG netif (%d); leaking it", err);
         vSemaphoreDelete(ctx.done);
+        wg_abandon_netif(netif);
         return;
     }
     xSemaphoreTake(ctx.done, portMAX_DELAY);

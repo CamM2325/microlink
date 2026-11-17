@@ -229,6 +229,11 @@ static bool wireguardif_can_send_initiation(struct wireguard_peer *peer) {
 // called without either lock held.
 static err_t wireguardif_dest_output(struct netif *netif, struct pbuf *q, const struct wg_peer_dest *dest) {
 	struct wireguard_device *device = (struct wireguard_device *)netif->state;
+	// Each callback pointer is read once: wireguardif_detach_outputs() may
+	// clear them from another task (the callbacks tolerate a NULL ctx).
+	wireguard_derp_output_fn derp_fn = __atomic_load_n(&device->derp_output_fn, __ATOMIC_ACQUIRE);
+	wireguard_udp_output_pbuf_fn pbuf_fn = __atomic_load_n(&device->udp_output_pbuf_fn, __ATOMIC_ACQUIRE);
+	wireguard_udp_output_fn udp_fn = __atomic_load_n(&device->udp_output_fn, __ATOMIC_ACQUIRE);
 
 	WG_DEBUG("[WG_OUT] peer_output: endpoint=%s:%u, tot_len=%u",
 	       ip_addr_isany(&dest->ip) ? "0.0.0.0" : ipaddr_ntoa(&dest->ip), dest->port, (unsigned)q->tot_len);
@@ -240,12 +245,12 @@ static err_t wireguardif_dest_output(struct netif *netif, struct pbuf *q, const 
 	if (ip_addr_isany(&dest->ip) || dest->port == 0 || device->force_derp_output) {
 		WG_DEBUG("[WG_OUT] No direct endpoint or force_derp, checking DERP");
 
-		if (device->derp_output_fn) {
+		if (derp_fn) {
 			// Linearize pbuf chain into contiguous buffer for DERP callback
 			uint8_t *data = (uint8_t *)mem_malloc(q->tot_len);
 			if (data) {
 				pbuf_copy_partial(q, data, q->tot_len, 0);
-				err_t result = device->derp_output_fn(dest->public_key, data, q->tot_len, device->derp_output_ctx);
+				err_t result = derp_fn(dest->public_key, data, q->tot_len, __atomic_load_n(&device->derp_output_ctx, __ATOMIC_ACQUIRE));
 				mem_free(data);
 				return result;
 			}
@@ -260,13 +265,13 @@ static err_t wireguardif_dest_output(struct netif *netif, struct pbuf *q, const 
 	}
 
 	// Zero-copy magicsock output: hand the encrypted pbuf over untouched.
-	if (device->udp_output_pbuf_fn) {
+	if (pbuf_fn) {
 		uint32_t dest_ip = ip4_addr_get_u32(ip_2_ip4(&dest->ip));
-		return device->udp_output_pbuf_fn(dest_ip, dest->port, q, device->udp_output_pbuf_ctx);
+		return pbuf_fn(dest_ip, dest->port, q, __atomic_load_n(&device->udp_output_pbuf_ctx, __ATOMIC_ACQUIRE));
 	}
 
 	// In magicsock mode, use external UDP output callback
-	if (device->udp_output_fn) {
+	if (udp_fn) {
 		WG_DEBUG("[WG_OUT] Using magicsock callback");
 	
 		// Linearize pbuf chain and send via callback
@@ -280,7 +285,7 @@ static err_t wireguardif_dest_output(struct netif *netif, struct pbuf *q, const 
 			WG_DEBUG("[WG_OUT] Calling udp_output_fn, dest_ip=0x%08lx port=%u len=%u",
 			       (unsigned long)dest_ip, dest->port, (unsigned)q->tot_len);
 		
-			err_t result = device->udp_output_fn(dest_ip, dest->port, data, q->tot_len, device->udp_output_ctx);
+			err_t result = udp_fn(dest_ip, dest->port, data, q->tot_len, __atomic_load_n(&device->udp_output_ctx, __ATOMIC_ACQUIRE));
 			WG_DEBUG("[WG_OUT] udp_output_fn returned %d", result);
 		
 			mem_free(data);
@@ -295,26 +300,35 @@ static err_t wireguardif_dest_output(struct netif *netif, struct pbuf *q, const 
 
 	// Send to last known port, not the connect port
 	//TODO: Support DSCP and ECN - lwip requires this set on PCB globally, not per packet
+	if (!device->udp_pcb) {
+		// Magicsock mode with the output callbacks detached
+		return ERR_RTE;
+	}
 	return udp_sendto(device->udp_pcb, q, &dest->ip, dest->port);
 }
 
 static err_t wireguardif_device_output(struct wireguard_device *device, struct pbuf *q, const ip_addr_t *ipaddr, u16_t port) {
-	if (device->udp_output_pbuf_fn) {
+	wireguard_udp_output_pbuf_fn pbuf_fn = __atomic_load_n(&device->udp_output_pbuf_fn, __ATOMIC_ACQUIRE);
+	wireguard_udp_output_fn udp_fn = __atomic_load_n(&device->udp_output_fn, __ATOMIC_ACQUIRE);
+	if (pbuf_fn) {
 		uint32_t dest_ip = ip4_addr_get_u32(ip_2_ip4(ipaddr));
-		return device->udp_output_pbuf_fn(dest_ip, port, q, device->udp_output_pbuf_ctx);
+		return pbuf_fn(dest_ip, port, q, __atomic_load_n(&device->udp_output_pbuf_ctx, __ATOMIC_ACQUIRE));
 	}
 
 	// In magicsock mode, use external UDP output callback
-	if (device->udp_output_fn) {
+	if (udp_fn) {
 		uint8_t *data = (uint8_t *)mem_malloc(q->tot_len);
 		if (data) {
 			pbuf_copy_partial(q, data, q->tot_len, 0);
 			uint32_t dest_ip = ip4_addr_get_u32(ip_2_ip4(ipaddr));
-			err_t result = device->udp_output_fn(dest_ip, port, data, q->tot_len, device->udp_output_ctx);
+			err_t result = udp_fn(dest_ip, port, data, q->tot_len, __atomic_load_n(&device->udp_output_ctx, __ATOMIC_ACQUIRE));
 			mem_free(data);
 			return result;
 		}
 		return ERR_MEM;
+	}
+	if (!device->udp_pcb) {
+		return ERR_RTE;
 	}
 	return udp_sendto(device->udp_pcb, q, ipaddr, port);
 }
@@ -1558,6 +1572,21 @@ void wireguardif_set_udp_output_pbuf(struct netif *netif, wireguard_udp_output_p
 		device->udp_output_pbuf_ctx = ctx;
 		WG_DEBUG("[WG] zero-copy UDP output callback registered");
 	}
+}
+
+void wireguardif_detach_outputs(struct netif *netif) {
+	if (!netif || !netif->state) {
+		return;
+	}
+	struct wireguard_device *device = (struct wireguard_device *)netif->state;
+	// Pointers first, then contexts: a sender that already loaded a pointer
+	// sees either the old context (still alive when this is called) or NULL.
+	__atomic_store_n(&device->derp_output_fn, NULL, __ATOMIC_RELEASE);
+	__atomic_store_n(&device->udp_output_pbuf_fn, NULL, __ATOMIC_RELEASE);
+	__atomic_store_n(&device->udp_output_fn, NULL, __ATOMIC_RELEASE);
+	__atomic_store_n(&device->derp_output_ctx, NULL, __ATOMIC_RELEASE);
+	__atomic_store_n(&device->udp_output_pbuf_ctx, NULL, __ATOMIC_RELEASE);
+	__atomic_store_n(&device->udp_output_ctx, NULL, __ATOMIC_RELEASE);
 }
 
 void wireguardif_force_derp_output(struct netif *netif, bool force) {
