@@ -29,6 +29,10 @@
 #include "mbedtls/error.h"
 #if CONFIG_ML_DERP_VERIFY_CERT
 #include "esp_crt_bundle.h"
+#elif !defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
+/* ML_DERP_VERIFY_CERT depends on the bundle, so turning the bundle off
+ * silently turns relay certificate checking off as well. Say so. */
+#warning "MBEDTLS_CERTIFICATE_BUNDLE is disabled: DERP relay TLS certificates will not be verified (ML_DERP_VERIFY_CERT unavailable)"
 #endif
 #include "nacl_box.h"
 #include <string.h>
@@ -393,8 +397,14 @@ static int poll_derp_read(microlink_t *ml) {
         return n;
     }
     if (n < 5) {
-        ESP_LOGW(TAG, "DERP partial header: got %d of 5 bytes", n);
-        return -1;
+        /* ssl_read returns at most the rest of the current TLS record, and
+         * a relay may split a frame header across records. Finish it; the
+         * stream is only misaligned if the rest never arrives. Same 5 s
+         * as the payload: the next record can be slow on the AT bridge. */
+        if (derp_tls_read_all(ml, header + n, 5 - n, 5000) < 0) {
+            ESP_LOGW(TAG, "DERP partial header: got %d of 5 bytes", n);
+            return -1;
+        }
     }
 
     uint8_t frame_type = header[0];
@@ -558,8 +568,16 @@ void ml_derp_tx_task(void *arg) {
         /* ---- Handle DERP connect request from coord task ---- */
         {
             EventBits_t bits = xEventGroupGetBits(ml->events);
-            if ((bits & ML_EVT_DERP_CONNECT_REQ) && !ml->derp.connected) {
+            /* Always consume a connect request. One that arrives while we
+             * are connected (or reconnecting) is already satisfied; left
+             * set, it would fire after the next read/write error and run a
+             * connect over the failed, not yet freed session. A pending
+             * RECONNECT does the full disconnect + connect itself. */
+            if (bits & ML_EVT_DERP_CONNECT_REQ) {
                 xEventGroupClearBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
+            }
+            if ((bits & ML_EVT_DERP_CONNECT_REQ) && !ml->derp.connected &&
+                !(bits & ML_EVT_DERP_RECONNECT)) {
                 /* Retry up to 3 times with 2s backoff */
                 for (int attempt = 0; attempt < 3 && !ml->derp.connected; attempt++) {
                     if (attempt > 0) {
@@ -686,6 +704,15 @@ void ml_derp_tx_task(void *arg) {
  * ========================================================================== */
 
 esp_err_t ml_derp_connect(microlink_t *ml) {
+    /* A failed session is only marked (connected=false) by the read/write
+     * error paths. Free it before the TLS contexts and sockfd below are
+     * re-initialised, or its TLS buffers and lwIP socket leak. */
+    if (ml->derp.sockfd >= 0) {
+        ESP_LOGW(TAG, "DERP connect over an open session (fd=%d); closing it first",
+                 ml->derp.sockfd);
+        ml_derp_disconnect(ml);
+    }
+
     /* Determine DERP host/port from DERPMap with node failover.
      * Always start from node 0 (the first/preferred node in the DERPMap).
      * Only rotate to a different node after a SUCCESSFUL connection drops,
@@ -833,6 +860,19 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         return ESP_FAIL;
     }
 #else
+    {
+        static bool s_warned;
+        if (!s_warned) {
+            s_warned = true;
+            ESP_LOGW(TAG, "DERP TLS certificates are not verified (%s)",
+#if defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
+                     "CONFIG_ML_DERP_VERIFY_CERT=n"
+#else
+                     "CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n"
+#endif
+                     );
+        }
+    }
     mbedtls_ssl_conf_authmode(&ml->derp.ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
 #endif
 #if ML_TLS_LEGACY_RNG

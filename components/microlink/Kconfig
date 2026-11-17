@@ -45,6 +45,10 @@ menu "MicroLink V2 Configuration"
             Turn off only for a self-hosted DERP server with a private
             certificate.
 
+            This option needs CONFIG_MBEDTLS_CERTIFICATE_BUNDLE. Without the
+            bundle it is hidden and relay certificates are NOT checked; the
+            build and the first DERP connection both print a warning.
+
     config ML_DERP_REGION
         int "Preferred DERP region ID"
         default 9
@@ -484,6 +488,10 @@ menu "MicroLink V2 Configuration"
                 server; this additionally stops a network in the middle from
                 posing as the HTTPS endpoint. Turn off only for a self-hosted
                 server with a private/self-signed certificate.
+
+                This option needs CONFIG_MBEDTLS_CERTIFICATE_BUNDLE. Without
+                the bundle it is hidden and the certificate is NOT checked;
+                the build and each TLS handshake print a warning.
 
         config ML_CTRL_STREAMING_MAP_FETCH
             bool "Fetch the initial netmap over the streaming map request"

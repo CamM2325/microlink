@@ -23,6 +23,10 @@
 #include "esp_timer.h"
 #if CONFIG_ML_CTRL_TLS_VERIFY_CERT
 #include "esp_crt_bundle.h"
+#elif !defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
+/* ML_CTRL_TLS_VERIFY_CERT depends on the bundle, so turning the bundle off
+ * silently turns certificate checking off as well. Say so. */
+#warning "MBEDTLS_CERTIFICATE_BUNDLE is disabled: the control plane TLS certificate will not be verified (ML_CTRL_TLS_VERIFY_CERT unavailable)"
 #endif
 #include <errno.h>
 #include <string.h>
@@ -80,6 +84,13 @@ int ml_coord_tls_handshake(microlink_t *ml, const char *hostname) {
     ret = esp_crt_bundle_attach(&t->ssl_conf);
     if (ret != 0) goto fail;
 #else
+    ESP_LOGW(TAG, "TLS certificate of %s is not verified (%s)", hostname,
+#if defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
+             "CONFIG_ML_CTRL_TLS_VERIFY_CERT=n"
+#else
+             "CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n"
+#endif
+             );
     mbedtls_ssl_conf_authmode(&t->ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
 #endif
 #if ML_TLS_LEGACY_RNG
@@ -97,8 +108,8 @@ int ml_coord_tls_handshake(microlink_t *ml, const char *hostname) {
     const int64_t hs_deadline_us = esp_timer_get_time() + 20LL * 1000 * 1000;
     while ((ret = mbedtls_ssl_handshake(&t->ssl)) != 0) {
         if ((ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) &&
-            esp_timer_get_time() < hs_deadline_us) {
-            continue;  /* each socket timeout is 10s; the deadline bounds the total */
+            esp_timer_get_time() < hs_deadline_us && !ml_shutdown_requested(ml)) {
+            continue;  /* each socket timeout is a 1 s slice; the deadline bounds the total */
         }
         goto fail;
     }
