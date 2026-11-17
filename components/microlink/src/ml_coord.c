@@ -3257,10 +3257,13 @@ void ml_coord_task(void *arg) {
                                 state = COORD_RECONNECTING;
                                 break;
                             } else {
-                                ESP_LOGE(TAG, "Key expired but no auth_key — manual re-provisioning needed!");
-                                ml->state = ML_STATE_AUTH_FAILED;
-                                if (ml->state_cb) {
-                                    ml->state_cb(ml, ML_STATE_AUTH_FAILED, ml->state_cb_data);
+                                /* Checked every 60 s: notify the host once. */
+                                if (ml->state != ML_STATE_AUTH_FAILED) {
+                                    ESP_LOGE(TAG, "Key expired but no auth_key — manual re-provisioning needed!");
+                                    ml->state = ML_STATE_AUTH_FAILED;
+                                    if (ml->state_cb) {
+                                        ml->state_cb(ml, ML_STATE_AUTH_FAILED, ml->state_cb_data);
+                                    }
                                 }
                             }
                         }
