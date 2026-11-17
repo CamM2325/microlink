@@ -396,7 +396,14 @@ static void wg_teardown_interface(microlink_t *ml) {
 #ifdef CONFIG_ML_ZERO_COPY_WG
     /* The zero-copy receive callback (tcpip_thread) reads ml->wg_netif and
      * feeds its device; remove the PCB first. wg_mgr is its only sender. */
-    ml_zerocopy_deinit(ml);
+    if (ml_zerocopy_deinit(ml) != ESP_OK) {
+        /* The PCB is still registered and tcpip_thread unreachable: the
+         * netif can't be taken out of lwIP either. Unpublish it and leak
+         * the netif and device rather than free what lwIP may still use. */
+        ml->wg_netif = NULL;
+        ESP_LOGE(TAG, "Zero-copy PCB still live; leaking the WG netif and device");
+        return;
+    }
 #endif
     /* Unpublish before teardown, not after the free. */
     ml->wg_netif = NULL;

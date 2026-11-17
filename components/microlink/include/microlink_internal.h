@@ -718,7 +718,10 @@ void ml_peer_nvs_batch_end(void);
 #ifdef CONFIG_ML_ZERO_COPY_WG
 /* ml_zerocopy.c */
 esp_err_t ml_zerocopy_init(microlink_t *ml);
-void ml_zerocopy_deinit(microlink_t *ml);
+/* ESP_FAIL if tcpip_thread could not be reached: the PCB is then still
+ * registered (its callback detached from ml), and the caller must not free
+ * state reachable from it. A later call retries. */
+esp_err_t ml_zerocopy_deinit(microlink_t *ml);
 esp_err_t ml_zerocopy_send(microlink_t *ml, const uint8_t *data, size_t len,
                             uint32_t dest_ip, uint16_t dest_port);
 #endif
