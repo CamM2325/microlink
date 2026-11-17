@@ -1118,6 +1118,22 @@ err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip
 	return result;
 }
 
+err_t wireguardif_set_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port) {
+	struct wireguard_peer *peer;
+	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
+	if (result == ERR_OK && !ip_addr_isany(ip) && !wg_endpoint_is_valid_underlay(ip)) {
+		result = ERR_ARG;
+	}
+	if (result == ERR_OK) {
+		wg_state_lock();
+		peer->connect_ip = *ip;
+		peer->connect_port = port;
+		peer->ip = *ip;
+		peer->port = port;
+		wg_state_unlock();
+	}
+	return result;
+}
 
 err_t wireguardif_add_peer(struct netif *netif, struct wireguardif_peer *p, u8_t *peer_index) {
 	LWIP_ASSERT("netif != NULL", (netif != NULL));

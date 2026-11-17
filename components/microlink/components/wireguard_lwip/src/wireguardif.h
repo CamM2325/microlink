@@ -122,6 +122,10 @@ err_t wireguardif_remove_peer(struct netif *netif, u8_t peer_index);
 // Update the "connect" IP of the given peer
 err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port);
 
+// Update the "connect" IP and also move the live endpoint to it now, without
+// a handshake (roaming an established session). ip_addr_any = via DERP.
+err_t wireguardif_set_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port);
+
 // Try and connect to the given peer
 err_t wireguardif_connect(struct netif *netif, u8_t peer_index);
 

@@ -364,6 +364,8 @@ typedef struct {
     uint32_t best_ip;
     uint16_t best_port;
     bool has_direct_path;
+    uint32_t best_rtt_ms;           /* RTT of the last pong on best_ip:best_port */
+    uint64_t best_pong_ms;          /* when best_ip:best_port last answered */
 
     /* WireGuard peer index in wireguard-lwip */
     int wg_peer_index;
