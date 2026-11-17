@@ -1292,6 +1292,12 @@ static void disco_ping_round(microlink_t *ml, int peer_idx, bool force) {
     bool best_is_known_endpoint = false;
     for (int i = 0; i < p->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
         if (p->endpoints[i].is_ipv6 || p->endpoints[i].ip == 0) continue;
+        /* MapResponse and NVS endpoints get the same filter as CallMeMaybe
+         * ones: never probe tunnel-internal (100.64/10 would be routed into
+         * the WG netif), loopback, link-local, multicast or broadcast
+         * addresses. A pong from one would set a direct path that
+         * wireguardif refuses to use. */
+        if (!wg_endpoint_ip4_is_valid_underlay(p->endpoints[i].ip)) continue;
         if (p->endpoints[i].ip == p->best_ip && p->endpoints[i].port == p->best_port) {
             best_is_known_endpoint = true;
         }
@@ -1308,7 +1314,8 @@ static void disco_ping_round(microlink_t *ml, int peer_idx, bool force) {
      * peer-level last_ping_sent_ms instead, same as this function did before
      * per-endpoint tracking existed. */
     bool best_eligible = false;
-    if (!best_is_known_endpoint && p->has_direct_path && p->best_ip != 0 && p->best_port != 0) {
+    if (!best_is_known_endpoint && p->has_direct_path && p->best_ip != 0 && p->best_port != 0 &&
+        wg_endpoint_ip4_is_valid_underlay(p->best_ip)) {
         best_eligible = force || now - p->last_ping_sent_ms >= ML_DISCO_PING_INTERVAL_MS;
         if (best_eligible) any_eligible = true;
     }
@@ -1332,7 +1339,7 @@ static void disco_ping_round(microlink_t *ml, int peer_idx, bool force) {
         }
         p->last_full_ping_ms = now;
         for (int i = 0; i < p->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
-            if (p->endpoints[i].is_ipv6 || p->endpoints[i].ip == 0 || !eligible[i]) continue;
+            if (!eligible[i]) continue;  /* also skips IPv6, 0 and non-underlay */
             disco_build_ping(ml, peer_idx, round, p->endpoints[i].ip, p->endpoints[i].port, pkt, &pkt_len);
             int ret = disco_udp_sendto(ml, pkt, pkt_len, p->endpoints[i].ip, p->endpoints[i].port);
             p->endpoints[i].last_ping_ms = now;
@@ -1432,8 +1439,10 @@ static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
 
     bool direct_sent = false;
 
-    /* 1. Direct reply to PING source (if it was direct UDP) */
-    if (!pkt->via_derp && pkt->src_ip != 0 && pkt->src_port != 0) {
+    /* 1. Direct reply to PING source (if it was direct UDP). Every direct
+     * destination below passes the underlay filter (see disco_ping_round). */
+    if (!pkt->via_derp && pkt->src_ip != 0 && pkt->src_port != 0 &&
+        wg_endpoint_ip4_is_valid_underlay(pkt->src_ip)) {
         disco_udp_sendto(ml, pong, pong_len, pkt->src_ip, pkt->src_port);
         direct_sent = true;
     }
@@ -1442,7 +1451,7 @@ static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
     if (disco_has_udp_path(ml)) {
         for (int i = 0; i < p->endpoint_count; i++) {
             if (p->endpoints[i].is_ipv6 || p->endpoints[i].ip == 0) continue;
-            if (!is_lan_ip(p->endpoints[i].ip)) continue;
+            if (!is_lan_ip(p->endpoints[i].ip)) continue;   /* LAN ranges are valid underlay */
             /* Skip if this is the same as the ping source (already sent) */
             if (p->endpoints[i].ip == pkt->src_ip &&
                 p->endpoints[i].port == pkt->src_port) continue;
@@ -1456,6 +1465,7 @@ static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
             for (int i = 0; i < p->endpoint_count; i++) {
                 if (p->endpoints[i].is_ipv6 || p->endpoints[i].ip == 0) continue;
                 if (is_lan_ip(p->endpoints[i].ip)) continue;
+                if (!wg_endpoint_ip4_is_valid_underlay(p->endpoints[i].ip)) continue;
 
                 disco_udp_sendto(ml, pong, pong_len, p->endpoints[i].ip, p->endpoints[i].port);
                 direct_sent = true;
@@ -2089,8 +2099,13 @@ static esp_err_t wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip)
         ip_addr_t ep_ip;
         IP_SET_TYPE_VAL(ep_ip, IPADDR_TYPE_V4);
         ip4_addr_set_u32(ip_2_ip4(&ep_ip), htonl(p->best_ip));
-        wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
-                                     &ep_ip, p->best_port);
+        /* Only connect if wireguardif took the address: on ERR_ARG (not a
+         * valid underlay endpoint) connect would re-force the previous
+         * connect_ip instead. */
+        if (wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
+                                        &ep_ip, p->best_port) != ERR_OK) {
+            return ESP_OK;
+        }
         wireguardif_connect(netif, (u8_t)p->wg_peer_index);
         ESP_LOGI(TAG, "WG handshake triggered (direct) to %s at %d.%d.%d.%d:%d",
                  p->hostname,

@@ -14,6 +14,7 @@
  */
 
 #include "microlink_internal.h"
+#include "wireguard-filter.h"   /* wg_endpoint_ip4_is_valid_underlay() */
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -218,12 +219,18 @@ int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers) {
         memcpy(p->hostname, entry->hostname_short, sizeof(entry->hostname_short));
         p->hostname[sizeof(entry->hostname_short)] = '\0';
 
-        /* Restore endpoints */
-        p->endpoint_count = entry->endpoint_count;
+        /* Restore endpoints. Flash is not trusted: drop anything that is
+         * not a usable underlay address (the same filter CallMeMaybe uses). */
+        p->endpoint_count = 0;
         for (int j = 0; j < entry->endpoint_count && j < 2; j++) {
-            p->endpoints[j].ip = entry->endpoints[j].ip;
-            p->endpoints[j].port = entry->endpoints[j].port;
-            p->endpoints[j].is_ipv6 = false;
+            if (entry->endpoints[j].port == 0 ||
+                !wg_endpoint_ip4_is_valid_underlay(entry->endpoints[j].ip)) {
+                continue;
+            }
+            int k = p->endpoint_count++;
+            p->endpoints[k].ip = entry->endpoints[j].ip;
+            p->endpoints[k].port = entry->endpoints[j].port;
+            p->endpoints[k].is_ipv6 = false;
         }
 
         loaded++;
