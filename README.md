@@ -240,7 +240,10 @@ ESP's 3V3 pin is not enough and causes registration failures. Attach the main LT
   `ml_cellular_send_at_cmd()`. While the bridge runs, only an allowlist of query/information and GNSS
   commands is accepted (`AT+CSQ`, `AT+CPSI?`, `AT+CREG?`, `AT+CEREG?`, `AT+COPS?`, `AT+CCLK?`, `AT+CBC`,
   `AT+CPMUTEMP`, `AT+CGMR`, `AT+CGPS=1`, `AT+CGPSINFO`, `AT+CGNSSINFO`, …); anything else could break the
-  bridge. The list is `s_bridge_allowed[]` in `ml_at_validate.c`.
+  bridge. The list is `s_bridge_allowed[]` in `ml_at_validate.c`. Configuration commands (for example
+  GNSS port/NMEA routing such as `AT+CGNSSPORTSWITCH`) are accepted before `ml_cellular_connect()`:
+  configure the modem first, then poll positions with `AT+CGPSINFO` / `AT+CGNSSINFO` while connected.
+  Don't route NMEA output to the main UART; use the modem's separate GNSS/AUX UART if you need a stream.
 
 The UART runs at 115200 baud unless you set `ML_CELLULAR_FAST_BAUD` (e.g. 921600 with short wiring
 or flow control). If the modem was left at another rate, the driver detects it and resets it.

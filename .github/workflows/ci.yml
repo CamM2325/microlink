@@ -96,6 +96,10 @@ jobs:
         idf: [v5.3.6, v6.1.1]
         example: [basic_connect, cellular_connect]
         overlay: [sdkconfig.httpd.defaults, sdkconfig.size.defaults]
+        include:
+          # net_switch + cellular + config UI together
+          - { idf: v5.3.6, example: failover_connect, overlay: sdkconfig.httpd.defaults }
+          - { idf: v6.1.1, example: failover_connect, overlay: sdkconfig.httpd.defaults }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

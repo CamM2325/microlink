@@ -1034,6 +1034,9 @@ static esp_err_t ppp_setup_and_dial(void)
     }
 
     ESP_LOGE(TAG, "PPP connection timeout");
+    if (!s_cell.config.apn || s_cell.config.apn[0] == '\0') {
+        ESP_LOGE(TAG, "  No APN configured: set CONFIG_ML_CELLULAR_APN (e.g. soracom.io) for your SIM");
+    }
     s_cell.ppp_running = false;
     vTaskDelay(pdMS_TO_TICKS(200)); /* Let RX task exit */
     s_cell.state = ML_CELL_STATE_ERROR;
