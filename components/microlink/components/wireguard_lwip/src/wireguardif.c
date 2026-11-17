@@ -612,10 +612,41 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 				// another task), so it is re-validated by its index before the replay
 				// window or any other state is updated.
 				bool fresh = false;
+				u8_t ver = 0;
 				if (decrypt_ok) {
+					// 4a. Plaintext must be a well-formed IP packet, otherwise drop.
+					// Parsed here (pure) so that 4b can run under the lock below.
+					ip_addr_t src_ip;
+					bool have_src = false;
+					if (pbuf->tot_len > 0) {
+						const struct ip_hdr *iphdr = (const struct ip_hdr *)pbuf->payload;
+						ver = (pbuf->len >= 1) ? IPH_V(iphdr) : 0;
+#if LWIP_IPV4
+						if (ver == 4 && pbuf->len >= IP_HLEN) {
+							ip_addr_copy_from_ip4(src_ip, iphdr->src);
+							header_len = PP_NTOHS(IPH_LEN(iphdr));
+							have_src = (header_len >= IP_HLEN);
+						}
+#endif /* LWIP_IPV4 */
+#if LWIP_IPV6
+						if (ver == 6 && pbuf->len >= IP6_HLEN) {
+							const struct ip6_hdr *ip6hdr = (const struct ip6_hdr *)pbuf->payload;
+							ip_addr_copy_from_ip6_packed(src_ip, ip6hdr->src);
+							header_len = (uint16_t)(IP6_HLEN + IP6H_PLEN(ip6hdr));
+							have_src = true;
+						}
+#endif /* LWIP_IPV6 */
+					}
+
 					wg_state_lock();
 					if (keypair->valid && (keypair->local_index == idx) && wireguard_check_replay(keypair, nonce)) {
 						fresh = true;
+
+						// 4b. The inner SOURCE address must route back to this same peer in
+						// the cryptokey routing table (longest-prefix match over all peers).
+						// Under the lock, so a concurrent remove + re-add of this slot can't
+						// have the check run against the next occupant's allowed IPs.
+						dest_ok = have_src && wg_peer_allowed_source(device, peer, &src_ip);
 
 						// 3. Authentic and fresh: the outer source address may now update the
 						// peer endpoint (roaming). DERP-delivered packets (0.0.0.0) are ignored.
@@ -644,27 +675,6 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 					wireguardif_mark_link_up(device->netif);
 
 					if (pbuf->tot_len > 0) {
-						// 4a. Plaintext must be a well-formed IP packet, otherwise drop.
-						// 4b. Its inner SOURCE address must route back to this same peer in
-						//     the cryptokey routing table (longest-prefix match over all peers).
-						ip_addr_t src_ip;
-						const struct ip_hdr *iphdr = (const struct ip_hdr *)pbuf->payload;
-						const u8_t ver = (pbuf->len >= 1) ? IPH_V(iphdr) : 0;
-#if LWIP_IPV4
-						if (ver == 4 && pbuf->len >= IP_HLEN) {
-							ip_addr_copy_from_ip4(src_ip, iphdr->src);
-							header_len = PP_NTOHS(IPH_LEN(iphdr));
-							dest_ok = (header_len >= IP_HLEN) && wg_peer_allowed_source(device, peer, &src_ip);
-						}
-#endif /* LWIP_IPV4 */
-#if LWIP_IPV6
-						if (ver == 6 && pbuf->len >= IP6_HLEN) {
-							const struct ip6_hdr *ip6hdr = (const struct ip6_hdr *)pbuf->payload;
-							ip_addr_copy_from_ip6_packed(src_ip, ip6hdr->src);
-							header_len = (uint16_t)(IP6_HLEN + IP6H_PLEN(ip6hdr));
-							dest_ok = wg_peer_allowed_source(device, peer, &src_ip);
-						}
-#endif /* LWIP_IPV6 */
 						if (!dest_ok) {
 							WG_DEBUG("[WG_RX_IP] DROPPED: v%u inner source not routed to this peer (or malformed)", (unsigned)ver);
 						} else if (header_len > pbuf->tot_len) {
