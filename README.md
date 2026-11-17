@@ -519,8 +519,12 @@ reference), [WireGuard](https://www.wireguard.com/), [wireguard-lwip](https://gi
 - [@dj-oyu](https://github.com/dj-oyu): zero-copy WireGuard receive mode
 - [@GrieferPig](https://github.com/GrieferPig): early WireGuard peer-lookup fix (since replaced by longest-prefix routing)
 
-Fixes were also adapted from community forks (credited in the commit messages), including
-Csontikka, TailTiny (Asimmimx), antmanler, fugo101, MedAouadhi and TimelyToga.
+Fixes and designs were also adapted from community forks (credited in the commit messages):
+[Csontikka](https://github.com/Csontikka/microlink) (subnet routes and exit node, Headscale fixes),
+[antmanler](https://github.com/antmanler/microlink) (interactive login),
+[TailTiny / Asimmimx](https://github.com/Asimmimx/tailtiny) (event-driven idle, ESP-IDF 6, security fixes),
+[fugo101](https://github.com/fugo101/microlink) (wireguard-lwip fixes, CI),
+espkvm (ESP-IDF 6), MedAouadhi and TimelyToga.
 
 **Security reports:** Tomasz Fiedoruk and Adrian Nguyen ([fugo101](https://github.com/fugo101)).
 
