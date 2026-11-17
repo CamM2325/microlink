@@ -686,6 +686,19 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
         }
         e->wg_peer_index = -1;
     } else {
+        /* Same NodeID under a different node key: the node re-registered or
+         * renewed its key and the control plane sent the full record (Peers
+         * or PeersChanged) rather than a PeersChangedPatch. Drop the old
+         * key's entry and WireGuard peer first, as patch_peer() does for a
+         * patched rotation: otherwise the rotated-out key keeps being
+         * accepted, and both WireGuard peers own the same VPN IP. */
+        int old_idx = find_peer_by_node_id(ml, update->node_id);
+        if (old_idx >= 0) {
+            ESP_LOGI(TAG, "Peer %s rotated its node key, re-installing",
+                     ml->peers[old_idx].hostname);
+            remove_peer_idx(ml, old_idx);
+        }
+
         /* Find free slot */
         idx = -1;
         for (int i = 0; i < ML_MAX_PEERS; i++) {
