@@ -884,7 +884,12 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
             continue;
         }
         char err_buf[128];
+#if defined(MBEDTLS_ERROR_C)
         mbedtls_strerror(ret, err_buf, sizeof(err_buf));
+#else
+        /* CONFIG_MBEDTLS_ERROR_STRINGS=n: mbedTLS 4 has no strerror stub */
+        snprintf(err_buf, sizeof(err_buf), "-0x%04x", (unsigned)-ret);
+#endif
         ESP_LOGE(TAG, "TLS handshake failed: %s", err_buf);
 #if CONFIG_ML_DERP_VERIFY_CERT
         uint32_t vflags = mbedtls_ssl_get_verify_result(&ml->derp.ssl);

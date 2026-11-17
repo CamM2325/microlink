@@ -110,10 +110,16 @@ int ml_coord_tls_handshake(microlink_t *ml, const char *hostname) {
 
 fail:
     {
+#if defined(MBEDTLS_ERROR_C)
         char err_buf[128];
         mbedtls_strerror(ret, err_buf, sizeof(err_buf));
         ESP_LOGE(TAG, "TLS handshake with %s failed: -0x%04x (%s)",
                  hostname, (unsigned)-ret, err_buf);
+#else
+        /* CONFIG_MBEDTLS_ERROR_STRINGS=n: mbedTLS 4 has no strerror stub */
+        ESP_LOGE(TAG, "TLS handshake with %s failed: -0x%04x",
+                 hostname, (unsigned)-ret);
+#endif
     }
     ml_coord_tls_free(ml);
     return -1;
