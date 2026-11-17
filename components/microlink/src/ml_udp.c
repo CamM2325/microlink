@@ -471,7 +471,10 @@ void microlink_udp_close(microlink_udp_socket_t *sock) {
             ESP_LOGE(TAG, "UDP close: API call still in flight after %d ms; "
                      "closing the socket but leaking its memory", UDP_CLOSE_JOIN_MS);
             __atomic_store_n(&sock->owner, UDP_OWNER_LEAKED, __ATOMIC_RELEASE);
-            sock->rx_stop = true;   /* the RX loop checks it before every callback */
+            /* Don't stop/wake the RX task here: if it exited it could be
+             * freed before a later notify. Remove the PCB (no new packets),
+             * clear the callback, and leave the RX task parked with the
+             * leaked memory. */
             udp_tcpip_call(udp_remove_in_tcpip, sock);
             /* Wait out a callback already running (recursive: fine if we
              * are that callback), then make sure it can't be called again. */
@@ -481,9 +484,6 @@ void microlink_udp_close(microlink_udp_socket_t *sock) {
                 xSemaphoreGiveRecursive(sock->cb_lock);
             } else {
                 ESP_LOGE(TAG, "UDP close: RX callback still running after %d ms", UDP_CLOSE_JOIN_MS);
-            }
-            if (xTaskGetCurrentTaskHandle() != sock->rx_task) {
-                xTaskNotifyGive(sock->rx_task);
             }
             return;
         }
