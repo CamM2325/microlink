@@ -203,9 +203,14 @@ bool wg_endpoint_is_valid_underlay(const ip_addr_t *addr) {
 	if (IP_IS_V6(addr)) {
 		const uint32_t w0 = PP_NTOHL(ip_2_ip6(addr)->addr[0]);
 		const uint32_t w1 = PP_NTOHL(ip_2_ip6(addr)->addr[1]);
+		const uint32_t w2 = PP_NTOHL(ip_2_ip6(addr)->addr[2]);
 		if (w0 == 0xfd7a115cu && (w1 >> 16) == 0xa1e0u) return false;  /* fd7a:115c:a1e0::/48 tailnet */
 		if ((w0 >> 24) == 0xff) return false;                          /* multicast */
-		if (ip6_addr_isany(ip_2_ip6(addr)) || ip6_addr_isloopback(ip_2_ip6(addr))) return false;
+		if ((w0 & 0xffc00000u) == 0xfe800000u) return false;           /* fe80::/10 link-local */
+		/* ::/96 (unspecified, loopback, deprecated IPv4-compatible) and
+		 * ::ffff:0:0/96 (IPv4-mapped): an embedded IPv4 address would bypass
+		 * the IPv4 checks above (e.g. ::ffff:100.64.0.1 or ::ffff:127.0.0.1). */
+		if (w0 == 0 && w1 == 0 && (w2 == 0 || w2 == 0x0000ffffu)) return false;
 		return true;
 	}
 #endif

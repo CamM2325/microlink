@@ -177,6 +177,14 @@ static void wireguardif_mark_link_down(struct netif *netif) {
 }
 
 
+// The underlay is IPv4-only for now: every output path reads the destination
+// with ip4_addr_get_u32(ip_2_ip4(...)), so an IPv6 endpoint would become a
+// garbage IPv4 destination. Refuse IPv6 endpoints until that is implemented
+// (all current callers only ever pass IPv4).
+static bool wg_endpoint_usable(const ip_addr_t *addr) {
+	return IP_IS_V4(addr) && wg_endpoint_is_valid_underlay(addr);
+}
+
 // Caller holds the state lock.
 static void update_peer_addr(struct wireguard_peer *peer, const ip_addr_t *addr, u16_t port) {
 	// Don't overwrite a valid endpoint with 0.0.0.0 (DERP-injected packets have no real source)
@@ -185,7 +193,7 @@ static void update_peer_addr(struct wireguard_peer *peer, const ip_addr_t *addr,
 		WG_DEBUG("[WG] update_peer_addr: skipping DERP (0.0.0.0)");
 		return;  // Skip updating endpoint for DERP packets
 	}
-	if (!wg_endpoint_is_valid_underlay(addr)) {
+	if (!wg_endpoint_usable(addr)) {
 		WG_DEBUG("[WG] update_peer_addr: refusing non-underlay endpoint %s", ipaddr_ntoa(addr));
 		return;
 	}
@@ -1121,7 +1129,7 @@ void wireguardif_free(struct netif *netif) {
 err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port) {
 	struct wireguard_peer *peer;
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
-	if (result == ERR_OK && !ip_addr_isany(ip) && !wg_endpoint_is_valid_underlay(ip)) {
+	if (result == ERR_OK && !ip_addr_isany(ip) && !wg_endpoint_usable(ip)) {
 		result = ERR_ARG;
 	}
 	if (result == ERR_OK) {
@@ -1137,7 +1145,7 @@ err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip
 err_t wireguardif_set_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port) {
 	struct wireguard_peer *peer;
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
-	if (result == ERR_OK && !ip_addr_isany(ip) && !wg_endpoint_is_valid_underlay(ip)) {
+	if (result == ERR_OK && !ip_addr_isany(ip) && !wg_endpoint_usable(ip)) {
 		result = ERR_ARG;
 	}
 	if (result == ERR_OK) {

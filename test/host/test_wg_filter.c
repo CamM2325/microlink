@@ -213,6 +213,14 @@ static void test_underlay_endpoints(void) {
 	v6(&a, 0xfd7a115c, 0xa1e00000, 0, 1);  CHECK(!wg_endpoint_is_valid_underlay(&a));
 	v6(&a, 0x20010db8, 0, 0, 1);           CHECK(wg_endpoint_is_valid_underlay(&a));
 	v6(&a, 0, 0, 0, 1);                    CHECK(!wg_endpoint_is_valid_underlay(&a));   /* ::1 */
+	v6(&a, 0xfe800000, 0, 0, 1);           CHECK(!wg_endpoint_is_valid_underlay(&a));   /* fe80::1 link-local */
+	v6(&a, 0xfebfffff, 0, 0, 1);           CHECK(!wg_endpoint_is_valid_underlay(&a));   /* top of fe80::/10 */
+	v6(&a, 0xfec00000, 0, 0, 1);           CHECK(wg_endpoint_is_valid_underlay(&a));    /* just above it */
+	v6(&a, 0, 0, 0x0000ffff, 0x64400001);  CHECK(!wg_endpoint_is_valid_underlay(&a));   /* ::ffff:100.64.0.1 */
+	v6(&a, 0, 0, 0x0000ffff, 0x7f000001);  CHECK(!wg_endpoint_is_valid_underlay(&a));   /* ::ffff:127.0.0.1 */
+	v6(&a, 0, 0, 0x0000ffff, 0xcb007105);  CHECK(!wg_endpoint_is_valid_underlay(&a));   /* ::ffff:203.0.113.5 too */
+	v6(&a, 0, 0, 0, 0x64400001);           CHECK(!wg_endpoint_is_valid_underlay(&a));   /* ::100.64.0.1 (compat) */
+	v6(&a, 0x00640000, 0xff9b0000, 0, 0x08080808); CHECK(wg_endpoint_is_valid_underlay(&a)); /* NAT64 64:ff9b::/96 */
 }
 
 int main(void) {
