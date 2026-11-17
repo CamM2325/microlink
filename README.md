@@ -297,14 +297,40 @@ and lets you change the auth key, WiFi list, cellular settings, control host and
 
 ## Memory
 
-On ESP32-S3 with PSRAM, MicroLink's own code is roughly 115–140 KB of flash (measured Nov 2026,
-`idf.py size-components`, `basic_connect` / `cellular_connect`). The four internal tasks use 42 KB of
+On ESP32-S3 with PSRAM, MicroLink's own code and strings take roughly 105–130 KB of flash
+(`basic_connect` / `cellular_connect`, ESP-IDF 5.3, `-Os`, measured Nov 2026 from the linker map),
+or 85–105 KB with `CONFIG_ML_LOG_LEVEL_WARN`. The four internal tasks use 42 KB of
 stack (8 + 14 + 12 + 8 KB), plus 4 KB per UDP socket. Map-response buffers are allocated while
 fetching and use PSRAM when available.
 
 Without PSRAM, reduce `ML_H2_BUFFER_SIZE_KB`/`ML_JSON_BUFFER_SIZE_KB` and `ML_MAX_PEERS`. One
 measurement (ESP32-C3, PR #43) saw about 3 KB of map data per peer, so 64 KB buffers fit roughly
 20 peers. Exact limits depend on your tailnet.
+
+### Smaller images
+
+The examples build with `-Os`; the WireGuard/DISCO crypto is still compiled with `-O2`.
+`examples/sdkconfig.size.defaults` is an optional overlay that trims ESP-IDF further:
+
+```bash
+cd examples/basic_connect
+rm -f sdkconfig   # defaults only apply when sdkconfig is created
+idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;../sdkconfig.size.defaults" build
+```
+
+| Image size in bytes (esp32s3) | `basic_connect` | `cellular_connect` |
+|---|---:|---:|
+| ESP-IDF 5.3, example defaults | 995,996 | 782,904 |
+| ESP-IDF 5.3, + `sdkconfig.size.defaults` | 769,012 | 598,840 |
+| ESP-IDF 5.3, + `CONFIG_ML_LOG_LEVEL_WARN=y` as well | 753,320 | 577,920 |
+| ESP-IDF 6.1.1, example defaults | 991,915 | 721,771 |
+| ESP-IDF 6.1.1, + `sdkconfig.size.defaults` | 855,635 | 639,463 |
+
+The overlay uses the common CA bundle instead of the full one (Let's Encrypt, used by Tailscale, is
+included; a headscale or DERP server with a certificate from a less common CA needs the full
+bundle), newlib-nano printf (no 64-bit or float formats in your own logs), a client-only mbedTLS
+with fewer curves and ciphers, WiFi without Enterprise/SoftAP/OWE, and no `esp_err_to_name()`
+strings or log colours. The file lists each option; check them against your deployment.
 
 ## Troubleshooting
 
