@@ -80,7 +80,7 @@ typedef struct {
  * path use one slot per peer; discovery rounds use one per endpoint plus one
  * via DERP, and an unanswered probe holds its slot for
  * ML_DISCO_PING_TIMEOUT_MS. When the table is full the oldest probe is
- * evicted (see disco_probe_register). */
+ * evicted (see disco_build_ping). */
 #define MAX_PENDING_PROBES ((ML_MAX_PEERS * 4) > 64 ? (ML_MAX_PEERS * 4) : 64)
 static disco_probe_t pending_probes[MAX_PENDING_PROBES];
 static uint32_t s_disco_round;
