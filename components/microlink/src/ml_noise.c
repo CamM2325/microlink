@@ -262,8 +262,10 @@ esp_err_t ml_noise_write_msg1(ml_noise_state_t *state, uint8_t *out, size_t *out
  * Matches v1's noise_read_message_2() exactly.
  */
 esp_err_t ml_noise_read_msg2(ml_noise_state_t *state, const uint8_t *msg, size_t len) {
-    if (len < 32 + 16) {
-        ESP_LOGE(TAG, "Noise msg2 too short: %d (need >= 48)", (int)len);
+    /* IK msg2 carries an empty payload: anything but exactly 48 bytes would
+     * make the decrypt below write len-48 bytes through its NULL output. */
+    if (len != 32 + 16) {
+        ESP_LOGE(TAG, "Noise msg2 length %d (need exactly 48)", (int)len);
         return ESP_FAIL;
     }
 
