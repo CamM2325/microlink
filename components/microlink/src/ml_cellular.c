@@ -1105,20 +1105,30 @@ void ml_cellular_deinit(void)
 {
     if (s_cell.state == ML_CELL_STATE_OFF) return;
 
-    /* Stop PPP if running */
-    if (s_cell.ppp_running) {
+    /* The AT socket bridge sends commands on the UART: stop it before the
+     * driver goes away (no-op unless the bridge is active). */
+    ml_cellular_data_stop();
+
+    /* Stop PPP if running (or half set up after a failed dial) */
+    if (s_cell.ppp_running || s_cell.ppp_netif) {
         ml_cellular_ppp_stop();
     }
 
-    /* Uninstall UART */
+    /* An application task may be inside ml_cellular_send_at_cmd(), blocked
+     * in uart_read_bytes() with the UART lock held. Deleting the driver
+     * under it frees the ring buffer and semaphores it is waiting on, so
+     * wait for the lock. Commands that arrive later find uart_installed
+     * false and fail cleanly. */
+    bool locked = ml_cellular_uart_lock();
     if (s_cell.uart_installed) {
-        uart_driver_delete(UART_NUM);
         s_cell.uart_installed = false;
+        uart_driver_delete(UART_NUM);
     }
-
     memset(&s_cell.info, 0, sizeof(s_cell.info));
     clear_config_strs();
+    s_cell.data_mode = ML_DATA_MODE_NONE;
     s_cell.state = ML_CELL_STATE_OFF;
+    if (locked) ml_cellular_uart_unlock();
     ESP_LOGI(TAG, "Cellular deinitialized");
 }
 

@@ -104,7 +104,9 @@ typedef struct {
 esp_err_t ml_cellular_init(const ml_cellular_config_t *config);
 
 /**
- * Deinitialize cellular module. Closes PPP if active, releases UART.
+ * Deinitialize cellular module. Stops the AT socket bridge and PPP if
+ * active, waits for an in-flight ml_cellular_send_at_cmd() to finish,
+ * then releases the UART.
  */
 void ml_cellular_deinit(void);
 
