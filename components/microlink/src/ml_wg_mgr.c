@@ -44,6 +44,8 @@ static const char *TAG = "ml_wg_mgr";
 /* Forward declarations */
 static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx);
 static void disco_ping_round(microlink_t *ml, int peer_idx, bool force);
+static void wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip);
+static esp_err_t wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip);
 
 /* DISCO message types */
 #define DISCO_MSG_PING          0x01
@@ -1086,8 +1088,8 @@ static void process_peer_updates(microlink_t *ml) {
             sweep_stale_peers(ml, update->netmap_gen);
             break;
         case ML_PEER_REQ_HANDSHAKE:
-            ml_wg_mgr_trigger_handshake(ml, update->vpn_ip);
-            ml_wg_mgr_send_cmm(ml, update->vpn_ip);
+            wg_mgr_trigger_handshake(ml, update->vpn_ip);
+            wg_mgr_send_cmm(ml, update->vpn_ip);
             break;
         case ML_PEER_REQ_CMM_ALL:
             /* (Re)start from the first slot; cmm_sweep_step() paces it. */
@@ -1108,7 +1110,7 @@ static void process_peer_updates(microlink_t *ml) {
 
 static void cmm_sweep_step(microlink_t *ml) {
     if (!ml->cmm_sweep_active) return;
-    if (ml_at_socket_is_ready()) {  /* cellular: CMM useless (see ml_wg_mgr_send_cmm) */
+    if (ml_at_socket_is_ready()) {  /* cellular: CMM useless (see wg_mgr_send_cmm) */
         ml->cmm_sweep_active = false;
         return;
     }
@@ -1791,7 +1793,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
              * shouldn't exist at all. Bidirectional discovery is still
              * covered by this file's own independent, one-directional
              * triggers (the initial add_peer burst, the post-STUN one-shot
-             * broadcast, ml_wg_mgr_send_cmm() from microlink_tcp_connect()) -
+             * broadcast, ML_PEER_REQ_HANDSHAKE from microlink_tcp_connect()) -
              * none of them receive-triggered, so none can form this loop. */
 
             /* Merge each offered endpoint into p->endpoints[] - matching real
@@ -2034,9 +2036,9 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     }
 }
 
-/* Public wrapper for UDP API to trigger CallMeMaybe.
+/* CallMeMaybe to one peer, for ML_PEER_REQ_HANDSHAKE (wg_mgr task only).
  * Skip on cellular: our endpoints are behind CGNAT and unreachable. */
-void ml_wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip) {
+static void wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip) {
     if (ml_at_socket_is_ready()) return;  /* cellular: CMM useless */
     int idx = find_peer_by_ip(ml, peer_vpn_ip);
     if (idx >= 0) {
@@ -2044,7 +2046,9 @@ void ml_wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip) {
     }
 }
 
-/* On-demand WG handshake trigger (called from TCP/UDP API when session needed).
+/* On-demand WG handshake trigger, for ML_PEER_REQ_HANDSHAKE (posted by the
+ * TCP/UDP API when a session is needed). wg_mgr task only: it walks peers[]
+ * and drives WireGuard handshake state, both owned by this task.
  *
  * Dual-path strategy:
  * 1. DERP: Always send via DERP relay (reliable, works through all NATs)
@@ -2058,7 +2062,7 @@ void ml_wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip) {
  *
  * The direct handshake arrives at the peer's magicsock UDP socket, wakes
  * the lazy peer, and wireguard-go processes the init and responds. */
-esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
+static esp_err_t wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
     if (!ml || !ml->wg_netif) return ESP_ERR_INVALID_STATE;
 
     int idx = find_peer_by_ip(ml, dest_vpn_ip);
@@ -2098,40 +2102,31 @@ esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
     return ESP_OK;
 }
 
-bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip) {
-    if (!ml || !ml->wg_netif) return false;
-    int idx = find_peer_by_ip(ml, vpn_ip);
-    if (idx < 0) return false;
-    ml_peer_t *p = &ml->peers[idx];
-    if (p->wg_peer_index < 0) return false;
+/* Publish which peers have a usable session, for ml_wg_mgr_peer_is_up() on
+ * other tasks. wg_mgr only. */
+static void wg_publish_session_state(microlink_t *ml) {
     struct netif *netif = (struct netif *)ml->wg_netif;
-    ip_addr_t cur_ip;
-    u16_t cur_port;
-    bool up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index, &cur_ip, &cur_port) == ERR_OK;
-    if (up) {
-        /* Verify WG internal peer key matches our DISCO peer */
-        struct wireguard_device *dev = (struct wireguard_device *)netif->state;
-        if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
-            struct wireguard_peer *wp = &dev->peers[p->wg_peer_index];
-            bool key_match = (memcmp(wp->public_key, p->public_key, 32) == 0);
-            if (key_match) {
-                ESP_LOGD(TAG, "WG peer UP: %s wg_idx=%d ep=%s:%u key=%02x%02x%02x%02x",
-                         p->hostname, p->wg_peer_index,
-                         ip_addr_isany(&cur_ip) ? "DERP" : ipaddr_ntoa(&cur_ip),
-                         cur_port,
-                         wp->public_key[0], wp->public_key[1],
-                         wp->public_key[2], wp->public_key[3]);
-            } else {
-                ESP_LOGW(TAG, "WG peer UP but KEY_MISMATCH: %s wg_idx=%d ep=%s:%u key=%02x%02x%02x%02x",
-                         p->hostname, p->wg_peer_index,
-                         ip_addr_isany(&cur_ip) ? "DERP" : ipaddr_ntoa(&cur_ip),
-                         cur_port,
-                         wp->public_key[0], wp->public_key[1],
-                         wp->public_key[2], wp->public_key[3]);
-            }
+    for (int i = 0; i < ML_MAX_PEERS; i++) {
+        uint32_t up_ip = 0;
+        const ml_peer_t *p = &ml->peers[i];
+        if (netif && i < ml->peer_count && p->active && p->wg_peer_index >= 0 &&
+            wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index, NULL, NULL) == ERR_OK) {
+            up_ip = p->vpn_ip;
+        }
+        if (__atomic_load_n(&ml->wg_session_up_ip[i], __ATOMIC_RELAXED) != up_ip) {
+            __atomic_store_n(&ml->wg_session_up_ip[i], up_ip, __ATOMIC_RELEASE);
         }
     }
-    return up;
+}
+
+bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip) {
+    if (!ml || vpn_ip == 0) return false;
+    for (int i = 0; i < ML_MAX_PEERS; i++) {
+        if (__atomic_load_n(&ml->wg_session_up_ip[i], __ATOMIC_ACQUIRE) == vpn_ip) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void ml_wg_mgr_update_transport(microlink_t *ml) {
@@ -2296,6 +2291,7 @@ void ml_wg_mgr_task(void *arg) {
 
     uint64_t last_disco_probe_ms = 0;
     uint64_t last_wg_periodic_ms = 0;
+    uint64_t last_session_publish_ms = 0;
     bool derp_was_connected = false;
     bool stun_cmm_sent = false;  /* One-shot: send CMMs after first STUN result */
 
@@ -2372,7 +2368,9 @@ void ml_wg_mgr_task(void *arg) {
          * wakeups. When the queue is empty this blocks for the same 10 ms the
          * trailing vTaskDelay used to, so the idle cost is unchanged. */
         ml_rx_packet_t wg_pkt;
+        bool wg_rx = false;
         if (xQueueReceive(ml->wg_rx_queue, &wg_pkt, pdMS_TO_TICKS(10)) == pdTRUE) {
+            wg_rx = true;
             process_wg_packet(ml, &wg_pkt);
             while (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
                 process_wg_packet(ml, &wg_pkt);
@@ -2384,6 +2382,10 @@ void ml_wg_mgr_task(void *arg) {
          * preventing heavy crypto (X25519, ChaCha20-Poly1305) from monopolizing
          * the TCPIP thread and blocking all socket operations system-wide. */
         uint64_t now = ml_get_time_ms();
+        if (wg_rx || now - last_session_publish_ms >= 100) {
+            wg_publish_session_state(ml);
+            last_session_publish_ms = now;
+        }
         if (ml->wg_netif && now - last_wg_periodic_ms >= 400) {
             uint64_t t0 = now;
             wireguardif_periodic((struct netif *)ml->wg_netif);
@@ -2408,6 +2410,9 @@ void ml_wg_mgr_task(void *arg) {
 
     /* Shutdown WireGuard interface */
     wg_teardown_interface(ml);
+    for (int i = 0; i < ML_MAX_PEERS; i++) {
+        __atomic_store_n(&ml->wg_session_up_ip[i], 0, __ATOMIC_RELEASE);
+    }
 
     ESP_LOGI(TAG, "WG Manager task exiting");
     ml_task_exit(ml, ML_TASK_BIT_WG_MGR);
