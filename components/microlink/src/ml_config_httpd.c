@@ -1370,7 +1370,7 @@ bool ml_config_get_nvs_ppp(char *user, size_t user_len,
         pass[pass_len - 1] = '\0';
     }
 
-    ESP_LOGI(TAG, "PPP credentials from NVS: user=%s", settings->ppp_user);
+    ESP_LOGI(TAG, "PPP credentials from NVS");
     ml_at_secure_zero(settings, sizeof(*settings));
     free(settings);
     return true;

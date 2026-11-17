@@ -182,10 +182,15 @@ bool ml_at_cmd_allowed_with_bridge(const char *cmd)
  * Log redaction
  * ========================================================================== */
 
-/* Commands whose arguments contain a PIN, PUK, password or raw SIM APDU */
+/* Commands whose arguments contain a PIN, PUK, password, raw SIM APDU or
+ * (application pass-through) a service login or a URL that may carry one */
 static const char *const s_secret_cmds[] = {
     "+CPIN=", "+CPIN2=", "+CPWD=", "+CLCK=", "+CGAUTH=", "+CSIM=", "+CRSM=",
     "+CPINR=", "+SPIC=",
+    /* SIMCom FTP(S), MQTT(S), HTTP(S), SSL and e-mail services */
+    "+CFTPLOGIN=", "+CFTPSLOGIN=", "+CFTPUN=", "+CFTPPW=",
+    "+CMQTTCONNECT=", "+CMQTTACCQ=", "+SMCONF=",
+    "+HTTPPARA=", "+CSSLCFG=", "+SMTPAUTH=", "+POP3IN=",
 };
 
 const char *ml_at_redact_cmd(const char *cmd, char *out, size_t out_size)
@@ -213,6 +218,25 @@ const char *ml_at_redact_cmd(const char *cmd, char *out, size_t out_size)
     if (cut) {
         const char *mask = "****";
         for (size_t i = 0; mask[i] && o + 1 < out_size; i++) out[o++] = mask[i];
+    }
+    out[o] = '\0';
+    return out;
+}
+
+const char *ml_at_mask_id(const char *id, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return out;
+    out[0] = '\0';
+    if (!id) return out;
+
+    size_t len = bounded_len(id, 64);
+    if (len == 0) return out;
+    const char *tail = (len > 4 && len <= 64) ? id + len - 4 : NULL;
+    const char *mask = "****";
+    size_t o = 0;
+    for (size_t i = 0; mask[i] && o + 1 < out_size; i++) out[o++] = mask[i];
+    for (size_t i = 0; tail && tail[i] && o + 1 < out_size; i++) {
+        out[o++] = is_print(tail[i]) ? tail[i] : '.';
     }
     out[o] = '\0';
     return out;

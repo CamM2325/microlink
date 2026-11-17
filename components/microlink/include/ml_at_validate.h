@@ -86,11 +86,24 @@ bool ml_at_cmd_allowed_with_bridge(const char *cmd);
 
 /**
  * Copy @p cmd to @p out for logging, replacing the arguments of commands
- * that carry secrets (AT+CPIN, AT+CGAUTH, AT+CPWD, AT+CLCK, ...) with
- * "****". Non-printable bytes are shown as '.'. Always NUL-terminates when
+ * that carry secrets (AT+CPIN, AT+CGAUTH, AT+CPWD, AT+CLCK, ..., and the
+ * SIMCom FTP/MQTT/HTTP/SSL/e-mail login and URL commands such as
+ * AT+CFTPSLOGIN, AT+CMQTTCONNECT, AT+HTTPPARA) with "****". Non-printable bytes are shown as '.'. Always NUL-terminates when
  * @p out_size > 0. Returns @p out.
  */
 const char *ml_at_redact_cmd(const char *cmd, char *out, size_t out_size);
+
+/** Buffer size for ml_at_mask_id(): "****" + 4 characters + NUL */
+#define ML_AT_MASKED_ID_SIZE 9
+
+/**
+ * Copy a device/SIM identifier (IMEI, ICCID, ...) to @p out for logging
+ * with everything but the last 4 characters replaced by "****"
+ * ("490154203237518" -> "****7518"). Identifiers of 4 characters or fewer
+ * (or longer than 64) are fully masked, an empty one stays empty.
+ * Always NUL-terminates when @p out_size > 0. Returns @p out.
+ */
+const char *ml_at_mask_id(const char *id, char *out, size_t out_size);
 
 /** Zero a buffer that held a secret (not optimised away). */
 void ml_at_secure_zero(void *buf, size_t len);

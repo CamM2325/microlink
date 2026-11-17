@@ -293,7 +293,8 @@ Enable `CONFIG_ML_ENABLE_CONFIG_HTTPD` (off in all examples). The UI at `http://
 and lets you change the auth key, WiFi list, cellular settings, control host and a peer allowlist.
 
 - **Login**: HTTP Basic auth, user `admin`. Set `ML_CONFIG_HTTPD_PASSWORD`, or leave it empty and a
-  random password is generated on first boot, stored in NVS and printed once on the serial console.
+  random password is generated on first boot, stored in NVS and printed once on the serial console
+  (a `Config UI password generated` warning). Remove that line from logs you share.
 - **Reachable only on the device's own tailnet (VPN) address** unless `ML_CONFIG_HTTPD_ALLOW_LAN=y`
   (then also on the WiFi station / Ethernet interface's own address, and the password crosses the LAN
   unencrypted). Never on the cellular (PPP) carrier address, even if the carrier hands out a 100.64/10

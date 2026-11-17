@@ -162,10 +162,32 @@ static void test_redact(void) {
 	             "AT+CGDCONT=1,\"IP\",\"internet\"") == 0);
 	CHECK(strcmp(ml_at_redact_cmd("AT\r\n", out, sizeof(out)), "AT..") == 0);
 	CHECK(strcmp(ml_at_redact_cmd(NULL, out, sizeof(out)), "") == 0);
+	CHECK(strcmp(ml_at_redact_cmd("AT+CFTPSLOGIN=\"ftp.example.com\",21,\"u\",\"p\",0", out, sizeof(out)),
+	             "AT+CFTPSLOGIN=****") == 0);
+	CHECK(strcmp(ml_at_redact_cmd("AT+CMQTTCONNECT=0,\"tcp://h:1883\",60,1,\"u\",\"p\"", out, sizeof(out)),
+	             "AT+CMQTTCONNECT=****") == 0);
+	CHECK(strcmp(ml_at_redact_cmd("AT+HTTPPARA=\"URL\",\"https://u:p@h/\"", out, sizeof(out)),
+	             "AT+HTTPPARA=****") == 0);
+	CHECK(strcmp(ml_at_redact_cmd("AT+CMQTTCONNECT?", out, sizeof(out)), "AT+CMQTTCONNECT?") == 0);
 	char tiny[6];
 	CHECK(strcmp(ml_at_redact_cmd("AT+CPIN=1234", tiny, sizeof(tiny)), "AT+CP") == 0);
 	char one[1];
 	CHECK(ml_at_redact_cmd("AT", one, sizeof(one))[0] == '\0');
+}
+
+static void test_mask_id(void) {
+	char out[ML_AT_MASKED_ID_SIZE];
+	CHECK(strcmp(ml_at_mask_id("490154203237518", out, sizeof(out)), "****7518") == 0);
+	CHECK(strcmp(ml_at_mask_id("89000000000000005678", out, sizeof(out)), "****5678") == 0);
+	CHECK(strcmp(ml_at_mask_id("12345", out, sizeof(out)), "****2345") == 0);
+	CHECK(strcmp(ml_at_mask_id("1234", out, sizeof(out)), "****") == 0);
+	CHECK(strcmp(ml_at_mask_id("", out, sizeof(out)), "") == 0);
+	CHECK(strcmp(ml_at_mask_id(NULL, out, sizeof(out)), "") == 0);
+	CHECK(strcmp(ml_at_mask_id("12345\r", out, sizeof(out)), "****345.") == 0);
+	char small[6];
+	CHECK(strcmp(ml_at_mask_id("490154203237518", small, sizeof(small)), "****7") == 0);
+	char one[1];
+	CHECK(ml_at_mask_id("490154203237518", one, sizeof(one))[0] == '\0');
 }
 
 static void test_rxget(void) {
@@ -221,6 +243,7 @@ int main(void) {
 	test_credential();
 	test_cmd();
 	test_redact();
+	test_mask_id();
 	test_rxget();
 	if (failures) {
 		fprintf(stderr, "%d failure(s)\n", failures);

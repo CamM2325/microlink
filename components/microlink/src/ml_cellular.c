@@ -409,10 +409,14 @@ static esp_err_t modem_setup(void)
     for (size_t i = 0; i < strlen(s_cell.info.imei) && valid_imei; i++) {
         if (s_cell.info.imei[i] < '0' || s_cell.info.imei[i] > '9') valid_imei = false;
     }
+    /* Identifiers: last 4 digits at INFO (logs end up in bug reports),
+     * the full value only at DEBUG */
+    char masked[ML_AT_MASKED_ID_SIZE];
     if (valid_imei) {
-        ESP_LOGI(TAG, "IMEI: %s", s_cell.info.imei);
+        ESP_LOGI(TAG, "IMEI: %s", ml_at_mask_id(s_cell.info.imei, masked, sizeof(masked)));
+        ESP_LOGD(TAG, "IMEI (full): %s", s_cell.info.imei);
     } else {
-        ESP_LOGW(TAG, "IMEI invalid: '%s'", s_cell.info.imei);
+        ESP_LOGW(TAG, "IMEI invalid (%u chars)", (unsigned)strlen(s_cell.info.imei));
         s_cell.info.imei[0] = '\0';
     }
 
@@ -563,7 +567,9 @@ static esp_err_t sim_setup(void)
     at_send_cmd("AT+CICCID", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
     at_extract_value(resp, "+ICCID:", s_cell.info.iccid, sizeof(s_cell.info.iccid));
     if (s_cell.info.iccid[0]) {
-        ESP_LOGI(TAG, "ICCID: %s", s_cell.info.iccid);
+        char masked[ML_AT_MASKED_ID_SIZE];
+        ESP_LOGI(TAG, "ICCID: %s", ml_at_mask_id(s_cell.info.iccid, masked, sizeof(masked)));
+        ESP_LOGD(TAG, "ICCID (full): %s", s_cell.info.iccid);
     }
 
     return ESP_OK;
@@ -872,7 +878,7 @@ static esp_err_t ppp_setup_and_dial(void)
         ml_at_secure_zero(auth_cmd, sizeof(auth_cmd));
     }
     if (ppp_user[0] || ppp_pass[0]) {
-        ESP_LOGI(TAG, "PPP credentials: user=%s (CHAP)", ppp_user);
+        ESP_LOGI(TAG, "PPP credentials set (CHAP)");
     } else {
         ESP_LOGI(TAG, "PPP: empty credentials, PAP auth (IMSI-based)");
     }
@@ -934,7 +940,7 @@ static esp_err_t ppp_setup_and_dial(void)
         ppp_status_event_handler, NULL,
         &s_cell.ppp_status_handler);
 
-    ESP_LOGI(TAG, "PPP CHAP auth configured (user=%s)", ppp_user[0] ? ppp_user : "<empty>");
+    ESP_LOGI(TAG, "PPP %s auth configured", (ppp_user[0] || ppp_pass[0]) ? "CHAP" : "PAP");
 
     /* Do NOT call esp_netif_action_start() yet — it immediately sends LCP
      * Configure-Request frames via ppp_transmit(), which would go to the modem
@@ -1197,8 +1203,9 @@ static esp_err_t modem_bringup(void)
     err = network_register();
     if (err != ESP_OK) return err;
 
+    char masked_imei[ML_AT_MASKED_ID_SIZE];
     ESP_LOGI(TAG, "Cellular modem ready: %s IMEI=%s Operator=%s RSSI=%d",
-             s_cell.info.model, s_cell.info.imei,
+             s_cell.info.model, ml_at_mask_id(s_cell.info.imei, masked_imei, sizeof(masked_imei)),
              s_cell.info.operator_name, s_cell.info.rssi);
 
     return ESP_OK;
