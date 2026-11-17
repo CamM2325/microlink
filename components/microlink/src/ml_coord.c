@@ -3352,6 +3352,13 @@ void ml_coord_task(void *arg) {
     /* Cleanup */
     coord_close_conn(ml);
     memset(&noise, 0, sizeof(noise));
+    /* The long-poll reassembly buffers and handshake leftovers are file
+     * statics: free them here, or they stay allocated after stop/destroy
+     * until a later long-poll starts (if ever). */
+    lp_reset();
+    free(s_server_extra_data);
+    s_server_extra_data = NULL;
+    s_server_extra_data_len = 0;
 
     ESP_LOGI(TAG, "Coord task exiting");
     ml_task_exit(ml, ML_TASK_BIT_COORD);
