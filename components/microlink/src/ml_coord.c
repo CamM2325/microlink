@@ -168,22 +168,50 @@ static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
 #endif
 }
 
-static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
+/* Limits for finishing a read that has started. They are wall-clock times:
+ * each retry can block for a full SO_RCVTIMEO (2-60 s), so a retry count
+ * gave anything from seconds to hours. STALL bounds the time without any
+ * progress, TOTAL the whole read (a 4 KB Noise frame over the ~450 B/s AT
+ * socket bridge takes ~10 s). Both stay below the 120 s coord watchdog. */
+#define COORD_RECV_STALL_MS   30000
+#define COORD_RECV_TOTAL_MS   90000
+
+/* Read exactly len bytes from the coord transport. Returns 0 or -1.
+ *
+ * must_complete=false: if the socket times out before the first byte, this
+ * returns -1 with errno EAGAIN and nothing consumed, so the caller may try
+ * again later. Once a byte has been consumed the read has to finish, or the
+ * Noise frame stream is misaligned for good.
+ * must_complete=true: the caller already consumed something this read
+ * belongs to (a Noise frame header), so even "nothing yet" must finish.
+ *
+ * A read that has to finish waits at most COORD_RECV_STALL_MS without
+ * progress and COORD_RECV_TOTAL_MS in total, and stops on shutdown. Every
+ * such failure is a hard error: errno is never EAGAIN then. */
+static int coord_recv_ex(microlink_t *ml, uint8_t *buf, size_t len, bool must_complete) {
     size_t recvd = 0;
-    int retries = 0;
+    uint64_t start_ms = ml_get_time_ms();
+    uint64_t progress_ms = start_ms;
     while (recvd < len) {
         int n = coord_raw_recv(ml, buf + recvd, len - recvd);
         if (n <= 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (recvd == 0) {
+                if (recvd == 0 && !must_complete) {
                     /* No data consumed yet — timeout is fine, caller can retry */
                     return -1;
                 }
-                /* Partial data consumed — we MUST finish this read or the
-                 * Noise frame stream will be misaligned. Retry with backoff. */
-                if (++retries > 300) {  /* ~3 seconds */
-                    ESP_LOGE(TAG, "coord_recv partial timeout: %d/%d bytes",
+                uint64_t now = ml_get_time_ms();
+                if (ml_shutdown_requested(ml)) {
+                    ESP_LOGW(TAG, "coord_recv: shutdown at %d/%d bytes",
                              (int)recvd, (int)len);
+                    errno = ECANCELED;
+                    return -1;
+                }
+                if (now - progress_ms > COORD_RECV_STALL_MS ||
+                    now - start_ms > COORD_RECV_TOTAL_MS) {
+                    ESP_LOGE(TAG, "coord_recv partial timeout: %d/%d bytes after %lu ms",
+                             (int)recvd, (int)len, (unsigned long)(now - start_ms));
+                    errno = ETIMEDOUT;
                     return -1;
                 }
                 vTaskDelay(pdMS_TO_TICKS(10));
@@ -193,10 +221,18 @@ static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
                      n, errno, (int)recvd, (int)len);
             return -1;
         }
+        uint64_t now = ml_get_time_ms();
+        if (recvd == 0 && !must_complete) {
+            start_ms = now;  /* the clock starts with the first byte */
+        }
         recvd += n;
-        retries = 0;  /* Reset on successful read */
+        progress_ms = now;
     }
     return 0;
+}
+
+static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
+    return coord_recv_ex(ml, buf, len, false);
 }
 
 /* ============================================================================
@@ -251,17 +287,11 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
     uint8_t *ciphertext = ml_psram_malloc(ct_len);
     if (!ciphertext) return -1;
 
-    /* Header already consumed — payload read MUST complete or stream
-     * alignment is permanently lost. Retry EAGAIN (coord_recv returns -1
-     * with errno==EAGAIN if recvd==0 on first byte). */
-    int payload_retries = 0;
-    while (coord_recv(ml, ciphertext, ct_len) < 0) {
-        if ((errno == EAGAIN || errno == EWOULDBLOCK) && ++payload_retries <= 300) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-        ESP_LOGE(TAG, "noise_recv payload failed: ct_len=%d retries=%d errno=%d",
-                 ct_len, payload_retries, errno);
+    /* Header already consumed — the payload read must complete, in one
+     * bounded read. Restarting it from byte 0 after a partial read would
+     * lose stream alignment, so any failure here is a hard error. */
+    if (coord_recv_ex(ml, ciphertext, ct_len, true) < 0) {
+        ESP_LOGE(TAG, "noise_recv payload failed: ct_len=%d errno=%d", ct_len, errno);
         free(ciphertext);
         return -1;
     }
