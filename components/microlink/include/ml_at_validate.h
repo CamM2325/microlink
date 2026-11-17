@@ -76,11 +76,15 @@ bool ml_at_cmd_is_safe(const char *cmd, size_t maxlen);
 
 /**
  * Stricter check used while the AT socket bridge owns the modem.
- * In addition to ml_at_cmd_is_safe(): only "AT", "ATI" or a single
- * extended command "AT+..." with no ';' (so no command chaining), and
- * not one of the commands that would break the bridge or the UART link
- * (+CIP*, +NET*, +CDNS*, +IPR, +ICF, +IFC, +CFUN, +CMUX, +CGACT,
- * +CRESET, +CPOF, +CSCLK).
+ * In addition to ml_at_cmd_is_safe(): only "AT", "ATI" or one extended
+ * command from an allowlist of query/information commands (identification,
+ * signal and registration state, clock, battery, temperature, GNSS), e.g.
+ * AT+CSQ, AT+CPSI?, AT+CREG?, AT+CEREG?, AT+COPS?, AT+CCLK?, AT+CBC,
+ * AT+CPMUTEMP, AT+SIMCOMATI, AT+CGMR, AT+CGPS=1, AT+CGPSINFO,
+ * AT+CGNSSINFO. The name must match exactly, in an allowed form (exec,
+ * "?", "=?" or "=args"); set-command arguments may only contain letters,
+ * digits, ',', '.', '-' and '"'. No spaces, no ';' and no second '+'.
+ * The list is s_bridge_allowed[] in ml_at_validate.c.
  */
 bool ml_at_cmd_allowed_with_bridge(const char *cmd);
 

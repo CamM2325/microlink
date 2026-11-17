@@ -237,8 +237,10 @@ ESP's 3V3 pin is not enough and causes registration failures. Attach the main LT
 - **PPP only**: lwIP gets a real network interface; direct peer-to-peer UDP is possible.
 - **AT socket only**: uses the modem's own TCP/IP stack; all VPN traffic is relayed through DERP.
   The UART stays in command mode, so your application can send its own AT commands with
-  `ml_cellular_send_at_cmd()` (single `AT+…` commands; commands that would break the bridge, such as
-  `+CIP*`, `+NET*`, `+CFUN` and `+IPR`, are refused).
+  `ml_cellular_send_at_cmd()`. While the bridge runs, only an allowlist of query/information and GNSS
+  commands is accepted (`AT+CSQ`, `AT+CPSI?`, `AT+CREG?`, `AT+CEREG?`, `AT+COPS?`, `AT+CCLK?`, `AT+CBC`,
+  `AT+CPMUTEMP`, `AT+CGMR`, `AT+CGPS=1`, `AT+CGPSINFO`, `AT+CGNSSINFO`, …); anything else could break the
+  bridge. The list is `s_bridge_allowed[]` in `ml_at_validate.c`.
 
 The UART runs at 115200 baud unless you set `ML_CELLULAR_FAST_BAUD` (e.g. 921600 with short wiring
 or flow control). If the modem was left at another rate, the driver detects it and resets it.

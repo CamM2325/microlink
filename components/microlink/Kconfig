@@ -358,8 +358,9 @@ menu "MicroLink V2 Configuration"
                 in AT command mode, so the application can send its own AT
                 commands (e.g. GPS queries) alongside the data connection with
                 ml_cellular_send_at_cmd(). While the bridge is active only
-                single "AT+..." commands are accepted, and commands that would
-                break the bridge (+CIP*, +NET*, +CFUN, +IPR, ...) are refused.
+                allowlisted query/information and GNSS commands are accepted
+                (AT+CSQ, AT+CPSI?, AT+CREG?, AT+CCLK?, AT+CBC, AT+CGPS=1,
+                AT+CGPSINFO, AT+CGNSSINFO, ...; see ml_at_validate.c).
                 The bridge is much slower than PPP (seconds of latency); with
                 PPP, use the modem's second UART/USB port for GNSS instead.
 

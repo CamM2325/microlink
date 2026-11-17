@@ -148,6 +148,50 @@ static void test_cmd(void) {
 	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSQ;+NETCLOSE"));
 	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSQ;H"));
 	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSQ\r\nAT+NETCLOSE"));
+	/* allowlist: queries, info and GNSS */
+	CHECK(ml_at_cmd_allowed_with_bridge("at+csq"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CSQ=?"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CREG?"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CEREG?"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+COPS?"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CCLK?"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CBC"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CPMUTEMP"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+SIMCOMATI"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CGMR"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CGPS?"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CGPS=0"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CGNSSPWR=1"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CGPADDR=1"));
+	CHECK(ml_at_cmd_allowed_with_bridge("AT+CGACT?"));
+	/* not on the list, or not in an allowed form */
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGATT=0"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+COPS=2"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CNMP=38"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGDCONT=1,\"IP\",\"x\""));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSOCKSETPN=1"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CATR=1"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CPSMS=1"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CEDRXS=1"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CMGS=\"123\""));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+HTTPDATA=10,1000"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CLCK=\"SC\",1,\"1234\""));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGPSINFO=10"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGNSSTST=1"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSQ?"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSQX"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGP"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CREG=2"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGPS="));
+	/* spaces and '+' tricks */
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+ CFUN=0"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT +CSQ"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSQ "));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGPS= 1"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CSQ+CFUN=0"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+CGPS=1+CFUN=0"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT++CSQ"));
+	CHECK(!ml_at_cmd_allowed_with_bridge("AT+"));
 }
 
 static void test_redact(void) {

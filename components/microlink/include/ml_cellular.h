@@ -221,11 +221,12 @@ void ml_cellular_reset_sim_pin_guard(void);
  *
  * The command must be a single line starting with "AT", printable ASCII
  * only (no CR, LF, Ctrl-Z or ESC), at most ML_AT_CMD_MAX characters.
- * While the AT socket bridge is active, only "AT", "ATI" and one extended
- * "AT+..." command without ';' are accepted, and commands that would break
- * the bridge or the UART link (+CIP*, +NET*, +CDNS*, +IPR, +ICF, +IFC, +CFUN,
- * +CMUX, +CGACT, +CRESET, +CPOF, +CSCLK) are refused; see
- * ml_at_cmd_allowed_with_bridge() in ml_at_validate.h.
+ * While the AT socket bridge is active, only "AT", "ATI" and allowlisted
+ * query/information and GNSS commands (AT+CSQ, AT+CPSI?, AT+CREG?,
+ * AT+CEREG?, AT+COPS?, AT+CCLK?, AT+CBC, AT+CPMUTEMP, AT+CGPS=1,
+ * AT+CGPSINFO, AT+CGNSSINFO, ...) are accepted; anything else could break
+ * the bridge or the UART link. See ml_at_cmd_allowed_with_bridge() in
+ * ml_at_validate.h (the list is easy to extend).
  *
  * Not available while PPP owns the UART (state PPP_CONNECTING/CONNECTED):
  * returns -1. Use the modem's second UART/USB port for GNSS in PPP mode.
