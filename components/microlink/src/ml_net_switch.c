@@ -63,7 +63,8 @@ static const char *TAG = "ml_net_sw";
 
 /* microlink_stop() attempts (each up to CONFIG_ML_STOP_TIMEOUT_MS) before the
  * handle is destroyed (parked) anyway. The transport must not be torn down
- * under live MicroLink tasks: the AT socket bridge deletes its mutex. */
+ * under live MicroLink tasks: they would still be using its sockets (and,
+ * for PPP, the netif). */
 #define VPN_STOP_ATTEMPTS       6
 
 typedef struct {
