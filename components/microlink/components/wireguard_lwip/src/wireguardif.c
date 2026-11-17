@@ -459,6 +459,11 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 // The ipaddr here is the one inside the VPN which we use to lookup the correct peer/endpoint
 static err_t wireguardif_output(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr) {
 	struct wireguard_device *device = (struct wireguard_device *)netif->state;
+	if (device->tx_note_fn && q) {
+		uint8_t hdr[28];
+		u16_t n = pbuf_copy_partial(q, hdr, sizeof(hdr), 0);
+		device->tx_note_fn(device->filter_ctx, hdr, n);
+	}
 	// Send to peer that matches dest IP
 	// Convert ip4_addr_t to ip_addr_t for lookup
 	ip_addr_t addr;
@@ -681,6 +686,10 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 							// IP header is corrupt or lied about packet size
 							WG_DEBUG("[WG_RX_IP] DROPPED: header_len=%u > tot_len=%u",
 							       (unsigned)header_len, (unsigned)pbuf->tot_len);
+						} else if (device->rx_filter_fn &&
+						           !device->rx_filter_fn(device->filter_ctx, (const uint8_t *)pbuf->payload, pbuf->tot_len)) {
+							// Not allowed by the tailnet packet filter (ACLs)
+							WG_DEBUG("[WG_RX_IP] DROPPED by packet filter");
 						} else {
 							// 5. Deliver via netif->input (= tcpip_input), never ip_input():
 							// this runs on the wg_mgr task, and lwIP's IP/TCP input must run
@@ -1557,6 +1566,18 @@ void wireguardif_peer_init(struct wireguardif_peer *peer) {
 	ip_addr_set_any(0, &peer->allowed_mask);
 	memset(peer->greatest_timestamp, 0, sizeof(peer->greatest_timestamp));
 	peer->preshared_key = NULL;
+}
+
+void wireguardif_set_ip_filter(struct netif *netif, wireguard_ip_filter_fn rx_allow,
+                               wireguard_ip_note_fn tx_note, void *ctx) {
+	LWIP_ASSERT("netif != NULL", (netif != NULL));
+	LWIP_ASSERT("state != NULL", (netif->state != NULL));
+	struct wireguard_device *device = (struct wireguard_device *)netif->state;
+	if (device->valid) {
+		device->filter_ctx = ctx;
+		device->tx_note_fn = tx_note;
+		device->rx_filter_fn = rx_allow;
+	}
 }
 
 void wireguardif_set_derp_output(struct netif *netif, wireguard_derp_output_fn fn, void *ctx) {

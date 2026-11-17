@@ -143,6 +143,10 @@ err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *cu
 // fn: callback function, ctx: user context passed to callback
 void wireguardif_set_derp_output(struct netif *netif, wireguard_derp_output_fn fn, void *ctx);
 
+// Install an IP packet filter (call once, before traffic flows).
+void wireguardif_set_ip_filter(struct netif *netif, wireguard_ip_filter_fn rx_allow,
+                               wireguard_ip_note_fn tx_note, void *ctx);
+
 // Force initiation of handshake to a DERP-only peer
 // Use this for peers where connect() would fail due to no direct endpoint
 // The handshake will be routed through the DERP callback if set

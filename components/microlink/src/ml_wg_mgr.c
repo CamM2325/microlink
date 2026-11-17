@@ -13,6 +13,7 @@
  */
 
 #include "microlink_internal.h"
+#include "ml_filter.h"
 #include "ml_config_httpd.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -463,6 +464,17 @@ static void wg_free_unlinked_device(struct netif *netif) {
     mem_free(device);
 }
 
+/* Tailnet packet filter hooks (run on the RX task / tcpip_thread). */
+static bool wg_filter_rx_cb(void *ctx, const uint8_t *pkt, size_t len) {
+    (void)ctx;
+    return ml_filter_check_inbound(pkt, len, (uint32_t)ml_get_time_ms());
+}
+
+static void wg_filter_tx_cb(void *ctx, const uint8_t *pkt, size_t len) {
+    (void)ctx;
+    ml_filter_note_outbound(pkt, len, (uint32_t)ml_get_time_ms());
+}
+
 static esp_err_t wg_init_interface(microlink_t *ml) {
     /* Convert our WG private key to base64 */
     char privkey_b64[64];
@@ -557,6 +569,9 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
 
     /* Register output callbacks for magicsock mode */
     wireguardif_set_derp_output(netif, wg_derp_output_cb, ml);
+#if defined(CONFIG_ML_PACKET_FILTER_ENFORCE) || defined(CONFIG_ML_PACKET_FILTER_LOG)
+    wireguardif_set_ip_filter(netif, wg_filter_rx_cb, wg_filter_tx_cb, ml);
+#endif
     wireguardif_set_udp_output(netif, wg_udp_output_cb, ml);
     wireguardif_set_udp_output_pbuf(netif, wg_udp_output_pbuf_cb, ml);
 

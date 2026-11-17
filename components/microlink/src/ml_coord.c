@@ -22,6 +22,7 @@
  */
 
 #include "microlink_internal.h"
+#include "ml_filter.h"
 #include "x25519.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -2202,6 +2203,7 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
 
     /* Parse peers */
     parse_peers_from_map_response(ml, map_json);
+    ml_filter_update_from_map(map_json);
 
     /* Extract DERPMap if present — parse all regions and nodes */
     parse_derp_map_from_map(ml, map_json);
@@ -2401,6 +2403,7 @@ static void lp_handle_message(microlink_t *ml, const char *json, size_t len) {
     }
 
     parse_peers_from_map_response(ml, update_json);
+    ml_filter_update_from_map(update_json);
 
     /* With streaming_map_fetch, DERPMap updates also arrive on this stream. */
     if (ml->config.streaming_map_fetch) {
@@ -2719,6 +2722,7 @@ static int do_read_initial_netmap(microlink_t *ml, ml_noise_state_t *noise) {
     log_map_health(map_json);
     parse_self_node_from_map(ml, map_json);
     parse_peers_from_map_response(ml, map_json);
+    ml_filter_update_from_map(map_json);
     parse_derp_map_from_map(ml, map_json);
     cJSON_Delete(map_json);
 

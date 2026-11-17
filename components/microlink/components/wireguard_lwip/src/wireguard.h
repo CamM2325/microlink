@@ -207,6 +207,11 @@ struct wireguard_peer {
 	uint16_t handshake_attempts;
 };
 
+/* Inbound packet filter: return true to deliver. */
+typedef bool (*wireguard_ip_filter_fn)(void *ctx, const uint8_t *pkt, size_t len);
+/* Outbound packet observer (sees at most the first 28 bytes). */
+typedef void (*wireguard_ip_note_fn)(void *ctx, const uint8_t *pkt, size_t len);
+
 struct wireguard_device {
 	// Maybe have a "Device private" member to abstract these?
 	struct netif *netif;
@@ -237,6 +242,13 @@ struct wireguard_device {
 
 	// Force all peer output through DERP relay (cellular mode)
 	bool force_derp_output;
+
+	// Optional IP packet filter (e.g. tailnet ACLs): rx_filter_fn decides
+	// whether a decrypted inbound packet is delivered; tx_note_fn sees the
+	// start (up to 28 bytes) of every outbound packet. Set once at init.
+	wireguard_ip_filter_fn rx_filter_fn;
+	wireguard_ip_note_fn tx_note_fn;
+	void *filter_ctx;
 
 	bool valid;
 };

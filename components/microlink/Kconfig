@@ -135,6 +135,32 @@ menu "MicroLink V2 Configuration"
             Match this to ML_H2_BUFFER_SIZE_KB unless you have a reason
             to set them differently.
 
+    choice ML_PACKET_FILTER
+        prompt "Tailnet packet filter (ACLs)"
+        default ML_PACKET_FILTER_ENFORCE
+        help
+            Enforce the tailnet access policy on inbound traffic, like
+            Tailscale clients do (MapResponse PacketFilter/PacketFilters).
+            New TCP connections and UDP/ICMP packets from peers are delivered
+            only if a rule allows them; replies to traffic this device
+            started are always allowed.
+
+        config ML_PACKET_FILTER_ENFORCE
+            bool "Enforce (drop what the policy doesn't allow)"
+        config ML_PACKET_FILTER_LOG
+            bool "Log only (count would-be drops, deliver everything)"
+        config ML_PACKET_FILTER_OFF
+            bool "Off (accept all inbound traffic)"
+    endchoice
+
+    config ML_FILTER_MAX_ENTRIES
+        int "Maximum packet-filter entries per rule set"
+        default 4096
+        range 64 65536
+        help
+            Upper bound on source + destination entries in one rule set.
+            A larger policy is rejected and the previous one kept.
+
     config ML_UDP_RX_TASK_PRIO
         int "UDP socket receive task priority"
         default 7

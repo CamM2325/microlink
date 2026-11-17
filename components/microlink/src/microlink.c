@@ -7,6 +7,7 @@
  */
 
 #include "microlink_internal.h"
+#include "ml_filter.h"
 #include "ml_at_validate.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -406,6 +407,15 @@ microlink_t *microlink_init(const microlink_config_t *config) {
 
     /* Free any earlier context whose tasks have exited since its destroy */
     ml_reap_orphans();
+
+    /* Tailnet packet filter (ACLs), see ml_filter.h */
+#if defined(CONFIG_ML_PACKET_FILTER_ENFORCE)
+    ml_filter_init(ML_FILTER_MODE_ENFORCE);
+#elif defined(CONFIG_ML_PACKET_FILTER_LOG)
+    ml_filter_init(ML_FILTER_MODE_LOG);
+#else
+    ml_filter_init(ML_FILTER_MODE_OFF);
+#endif
 
     /* Route cJSON to PSRAM */
     cJSON_Hooks hooks = {
@@ -887,6 +897,7 @@ void microlink_destroy(microlink_t *ml) {
     }
 
     microlink_stop(ml);
+    ml_filter_reset();
 
     /* Free anything parked by an earlier teardown that has drained since. */
     ml_reap_orphans();

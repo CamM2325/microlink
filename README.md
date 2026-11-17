@@ -46,9 +46,6 @@ control plane over TLS (PR #22).
 
 **Not supported (yet):**
 
-- Tailscale **ACLs are not enforced on the device.** MicroLink does not parse the packet filter,
-  so any peer that can see the device can reach any port it listens on. Restrict access with
-  tailnet ACLs on the *other* devices, the config-UI allowlist, or your own checks.
 - IPv4 tunnel addresses only (no `fd7a:…` IPv6 inside the tunnel).
 - No subnet routes, exit nodes or `--advertise-routes` (issue #6).
 - No interactive / QR-code login; an auth key is required (issue #8).
@@ -319,7 +316,12 @@ and lets you change the auth key, WiFi list, cellular settings, control host and
   compiled into the image. For deployed devices enable ESP-IDF flash encryption + NVS encryption, and
   use tagged, pre-approved auth keys.
 - MicroLink falls back to Google's public STUN server if Tailscale's STUN servers are unreachable.
-- See [Status and limitations](#status-and-limitations) for the ACL caveat.
+- **Tailnet ACLs are enforced on the device** (`ML_PACKET_FILTER`, default *Enforce*), like Tailscale
+  clients: the policy from the control server (`PacketFilter` / `PacketFilters`) decides which peers
+  may open TCP connections or send UDP/ICMP to the device; replies to traffic the device started are
+  always allowed. Until the first policy arrives, inbound traffic is accepted. Set *Log only* to see
+  what a policy would block without dropping it. Tested with Tailscale's default policy and a
+  restrictive Headscale policy (only UDP 9000 allowed: ICMP and new TCP connections were dropped).
 
 ## Memory
 
