@@ -70,6 +70,15 @@ bool ml_filter_update_from_map(const struct cJSON *map_response);
 void ml_filter_set_local(uint32_t self_ip, const ml_route_t *routes, int n);
 
 /*
+ * IPv6: the device's tailnet IPv6 address (16 bytes, NULL = none: all IPv6
+ * from the tunnel is dropped) and whether it forwards IPv6 to the internet
+ * as an exit node (then any destination outside the tailnet range,
+ * link-local and multicast is local too). Policies' IPv6 entries are
+ * enforced like the IPv4 ones.
+ */
+void ml_filter_set_local6(const uint8_t self6[16], bool exit_node);
+
+/*
  * Inbound IPv4 packet from the tunnel (full IP packet, len bytes).
  * Returns true if it may be delivered.
  */

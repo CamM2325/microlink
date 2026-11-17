@@ -54,7 +54,8 @@ control plane over TLS (PR #22).
 
 **Not supported (yet):**
 
-- IPv4 tunnel addresses only (no `fd7a:…` IPv6 inside the tunnel).
+- IPv4 tunnel addresses only (no `fd7a:…` IPv6 inside the tunnel), except for an exit node, which
+  uses its IPv6 tailnet address to forward its clients' IPv6.
 - Subnet routes work in one direction only: the device can *be* a subnet router or exit node,
   but it does not use other nodes' subnet routes or exit nodes (no `--accept-routes` /
   `--exit-node`).
@@ -369,9 +370,14 @@ clients: `tailscale set --accept-routes`, or select the device as exit node.
   default `--snat-subnet-routes`, so LAN hosts need no route back to the tailnet.
 - From the tunnel, the device accepts only packets addressed to its tailnet IP or to an advertised
   route, whatever the ACL setting. ACLs (`ML_PACKET_FILTER`) apply to routed traffic too.
-- IPv4 only. An exit node also advertises `::/0`, because Tailscale requires both default routes,
-  but IPv6 traffic sent to it is dropped.
-- Measured on an ESP32-S3 over WiFi: about 4 Mbit/s of downloads through the device as exit node.
+- **IPv6 through an exit node** (`ML_EXIT_NODE_IPV6`, on with the overlay): the device takes its
+  tailnet IPv6 address, gets a global address on the LAN by SLAAC and masquerades its clients' IPv6
+  behind it (NAT66 for TCP, UDP and ping), as Linux exit nodes do. On a LAN without IPv6, clients
+  get an immediate "no route" and fall back to IPv4. It uses lwIP's IPv6 input hook
+  (`CONFIG_LWIP_HOOK_IP6_INPUT_CUSTOM=y`, set by the overlay), so the application must not define
+  `lwip_hook_ip6_input()` itself. Subnet routes are IPv4 only.
+- Measured on an ESP32-S3 over WiFi: about 4 Mbit/s of downloads through the device as exit node,
+  over IPv4 and IPv6 alike (Headscale, Tailscale client; the internet saw the device's SLAAC address).
 
 ## Config web UI
 

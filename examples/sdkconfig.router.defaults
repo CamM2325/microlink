@@ -6,6 +6,9 @@
 #
 # Edit the routes to match your LAN; approve them in the admin console
 # (Machines > the device > Edit route settings) or with autoApprovers.
-# Add 0.0.0.0/0 to offer the device as an exit node.
+# Add 0.0.0.0/0 to offer the device as an exit node; IPv6 is then forwarded
+# too (NAT66, CONFIG_ML_EXIT_NODE_IPV6), which needs the lwIP IPv6 input hook
+# below (MicroLink implements it).
 CONFIG_ML_SUBNET_ROUTER=y
 CONFIG_ML_ADVERTISE_ROUTES="192.168.1.0/24"
+CONFIG_LWIP_HOOK_IP6_INPUT_CUSTOM=y

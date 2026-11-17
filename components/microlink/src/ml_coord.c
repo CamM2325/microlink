@@ -31,6 +31,7 @@
 #include "cJSON.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "lwip/ip6_addr.h"
 #include "mbedtls/base64.h"
 #include <string.h>
 #include <errno.h>
@@ -1021,6 +1022,24 @@ static bool auth_url_ok(const char *url) {
     return true;
 }
 
+/* The IPv6 entry of a node's Addresses ("fd7a:.../128"), if any. */
+static bool addresses_ip6(const cJSON *addresses, uint8_t out[16]) {
+    const cJSON *a;
+    cJSON_ArrayForEach(a, addresses) {
+        if (!cJSON_IsString(a) || !strchr(a->valuestring, ':')) continue;
+        char buf[48];
+        size_t n = strcspn(a->valuestring, "/");
+        if (n == 0 || n >= sizeof(buf)) continue;
+        memcpy(buf, a->valuestring, n);
+        buf[n] = '\0';
+        ip6_addr_t ip6;
+        if (!ip6addr_aton(buf, &ip6)) continue;
+        memcpy(out, ip6.addr, 16);
+        return true;
+    }
+    return false;
+}
+
 /* Hostinfo, sent in RegisterRequest and every MapRequest. The control plane
  * reads NetInfo.PreferredDERP from inside it to set Node.HomeDERP for the
  * other peers, and RoutableIPs for subnet routes / exit node. */
@@ -1374,6 +1393,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     cJSON *node = cJSON_GetObjectItem(resp_json, "Node");
     if (node) {
         cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
+        if (addresses && addresses_ip6(addresses, ml->vpn_ip6)) ml->has_vpn_ip6 = true;
         if (addresses && cJSON_GetArraySize(addresses) > 0) {
             const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
             if (addr) {
@@ -1524,6 +1544,7 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
 
         /* VPN IP from Addresses */
         cJSON *addresses = cJSON_GetObjectItem(peer, "Addresses");
+        if (addresses) update->has_ip6 = addresses_ip6(addresses, update->vpn_ip6);
         if (addresses && cJSON_GetArraySize(addresses) > 0) {
             const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
             if (addr) {
@@ -1834,6 +1855,7 @@ static void parse_self_node_from_map(microlink_t *ml, cJSON *map_json) {
     /* Extract VPN IP if not already set */
     if (ml->vpn_ip == 0) {
         cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
+        if (addresses && addresses_ip6(addresses, ml->vpn_ip6)) ml->has_vpn_ip6 = true;
         if (addresses && cJSON_GetArraySize(addresses) > 0) {
             const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
             if (addr) {
@@ -2480,6 +2502,7 @@ static void lp_handle_message(microlink_t *ml, const char *json, size_t len) {
     cJSON *node = cJSON_GetObjectItem(update_json, "Node");
     if (node) {
         cJSON *addresses = cJSON_GetObjectItem(node, "Addresses");
+        if (addresses && addresses_ip6(addresses, ml->vpn_ip6)) ml->has_vpn_ip6 = true;
         if (addresses && cJSON_GetArraySize(addresses) > 0) {
             const char *addr = cJSON_GetArrayItem(addresses, 0)->valuestring;
             if (addr) {

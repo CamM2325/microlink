@@ -69,6 +69,11 @@ foreach(opt O2 Os)
   add_test(NAME crypto_kat_${opt} COMMAND test_crypto_kat_${opt})
 endforeach()
 
+# Exit-node IPv6 masquerading (no dependencies).
+add_executable(test_nat66 test_nat66.c ${ML_SRC}/src/ml_nat66.c)
+target_include_directories(test_nat66 PRIVATE ${ML_SRC}/include)
+add_test(NAME nat66 COMMAND test_nat66)
+
 # Packet filter (tailnet ACL enforcement). Needs cJSON: ESP-IDF's copy by
 # default, or pass -DCJSON_DIR=<dir containing cJSON.c/cJSON.h>.
 if(NOT CJSON_DIR AND DEFINED ENV{IDF_PATH})

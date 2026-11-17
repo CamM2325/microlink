@@ -11,6 +11,7 @@ set(SRCS
     "src/ml_udp.c"
     "src/ml_filter.c"
     "src/ml_routes.c"
+    "src/ml_nat66.c"
     "src/ml_ota.c"
     "src/ml_tcp.c"
     "src/ml_peer_nvs.c"

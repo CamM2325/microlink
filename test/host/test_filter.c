@@ -3,6 +3,7 @@
 #include <string.h>
 #include "cJSON.h"
 #include "ml_filter.h"
+#include <arpa/inet.h>
 
 static int failures = 0;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
@@ -26,6 +27,26 @@ static size_t pkt(uint8_t *b, uint8_t proto, const char *src, const char *dst,
     }
     b[2] = (uint8_t)(n >> 8); b[3] = (uint8_t)n;   /* IP total length */
     return n;
+}
+
+/* Minimal IPv6 packet: proto 6/17/58, TCP flags, ICMPv6 type. */
+static size_t pkt6(uint8_t *b, uint8_t proto, const char *src, const char *dst,
+                   uint16_t sport, uint16_t dport, uint8_t tcp_flags, uint8_t icmp_type) {
+    memset(b, 0, 96);
+    size_t tl = proto == 6 ? 20 : 8;
+    b[0] = 0x60; b[5] = (uint8_t)tl; b[6] = proto; b[7] = 64;
+    inet_pton(AF_INET6, src, b + 8);
+    inet_pton(AF_INET6, dst, b + 24);
+    if (proto == 58) { b[40] = icmp_type; }
+    else { b[40] = (uint8_t)(sport >> 8); b[41] = (uint8_t)sport; b[42] = (uint8_t)(dport >> 8); b[43] = (uint8_t)dport; }
+    if (proto == 6) b[53] = tcp_flags;
+    return 40 + tl;
+}
+#define ME6 "fd7a:115c:a1e0::1"
+static bool in6(uint8_t proto, const char *src, const char *dst, uint16_t dport, uint8_t flags, uint8_t icmp) {
+    uint8_t b[96];
+    size_t n = pkt6(b, proto, src, dst, 1234, dport, flags, icmp);
+    return ml_filter_check_inbound(b, n, 1000);
 }
 
 static void apply(const char *json) {
@@ -251,6 +272,52 @@ int main(void) {
         apply("{\"PacketFilter\":[{\"SrcIPs\":[\"*\"],\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":0,\"Last\":65535}}]}]}");
         n = pkt(b, 17, "100.64.0.6", "192.168.2.20", 1, 53, 0, 0);
         CHECK(ml_filter_check_inbound(b, n, 1000));
+    }
+
+    /* IPv6 */
+    {
+        uint8_t self6[16];
+        inet_pton(AF_INET6, ME6, self6);
+        ml_filter_reset();
+        ml_filter_init(ML_FILTER_MODE_ENFORCE);
+        apply("{\"PacketFilter\":" ALLOW_ALL "}");
+        /* no tailnet IPv6 address yet: nothing */
+        CHECK(!in6(6, "fd7a:115c:a1e0::5", ME6, 22, SYN, 0));
+        ml_filter_set_local6(self6, false);
+        CHECK(in6(6, "fd7a:115c:a1e0::5", ME6, 22, SYN, 0));            /* "*" covers IPv6 */
+        CHECK(!in6(6, "fd7a:115c:a1e0::5", "2606:4700::1111", 443, SYN, 0)); /* not an exit node */
+        ml_filter_set_local6(self6, true);
+        CHECK(in6(6, "fd7a:115c:a1e0::5", "2606:4700::1111", 443, SYN, 0));
+        CHECK(!in6(6, "fd7a:115c:a1e0::5", "fd7a:115c:a1e0::9", 22, SYN, 0)); /* other tailnet node */
+        CHECK(!in6(6, "fd7a:115c:a1e0::5", "fe80::1", 22, SYN, 0));
+        CHECK(!in6(6, "fd7a:115c:a1e0::5", "ff02::1", 22, SYN, 0));
+        {   /* extension headers are not handled: dropped */
+            uint8_t b[96];
+            size_t n = pkt6(b, 6, "fd7a:115c:a1e0::5", ME6, 1, 22, SYN, 0);
+            b[6] = 0;                                                      /* hop-by-hop */
+            CHECK(!ml_filter_check_inbound(b, n, 1000));
+            n = pkt6(b, 6, "fd7a:115c:a1e0::5", ME6, 1, 22, SYN, 0);
+            b[5] = 200;                                                    /* payload length beyond the data */
+            CHECK(!ml_filter_check_inbound(b, n, 1000));
+        }
+
+        /* An IPv4-only policy grants nothing over IPv6 ... */
+        apply("{\"PacketFilter\":[{\"SrcIPs\":[\"100.64.0.5\"],\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":0,\"Last\":65535}}]}]}");
+        CHECK(!in6(6, "fd7a:115c:a1e0::5", ME6, 22, SYN, 0));
+        CHECK(in6(6, "fd7a:115c:a1e0::5", ME6, 22, ACK, 0));             /* non-SYN TCP */
+        CHECK(in6(58, "fd7a:115c:a1e0::5", ME6, 0, 0, 129));              /* echo reply */
+        CHECK(!in6(58, "fd7a:115c:a1e0::5", ME6, 0, 0, 128));             /* echo request */
+        /* ... IPv6 entries do, with ports */
+        apply("{\"PacketFilter\":[{\"SrcIPs\":[\"fd7a:115c:a1e0::5/128\"],\"DstPorts\":["
+              "{\"IP\":\"2000::/3\",\"Ports\":{\"First\":443,\"Last\":443}},"
+              "{\"IP\":\"" ME6 "\",\"Ports\":{\"First\":0,\"Last\":65535}}]}]}");
+        CHECK(in6(6, "fd7a:115c:a1e0::5", "2606:4700::1111", 443, SYN, 0));
+        CHECK(!in6(6, "fd7a:115c:a1e0::5", "2606:4700::1111", 80, SYN, 0));
+        CHECK(!in6(6, "fd7a:115c:a1e0::6", "2606:4700::1111", 443, SYN, 0));
+        CHECK(in6(58, "fd7a:115c:a1e0::5", ME6, 0, 0, 128));              /* ICMPv6 in the default protocols */
+        CHECK(!in6(6, "fd7a:115c:a1e0::5", "fc00::1", 443, SYN, 0));      /* outside 2000::/3 */
+        ml_filter_set_local6(NULL, false);
+        CHECK(!in6(6, "fd7a:115c:a1e0::5", ME6, 22, SYN, 0));
     }
 
     if (failures) { fprintf(stderr, "%d check(s) failed\n", failures); return 1; }

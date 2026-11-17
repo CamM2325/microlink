@@ -14,6 +14,7 @@
 
 #include "microlink_internal.h"
 #include "ml_filter.h"
+#include "ml_nat66.h"
 #include "ml_config_httpd.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -336,6 +337,8 @@ typedef struct {
     SemaphoreHandle_t done;
     bool napt;          /* subnet router: masquerade forwarded traffic */
     bool napt_failed;
+    bool ip6;           /* exit node: tailnet IPv6 address + NAT66 */
+    uint8_t ip6addr[16];
 } wg_netif_up_ctx_t;
 
 static void wg_netif_bring_up_in_tcpip(void *arg) {
@@ -350,6 +353,21 @@ static void wg_netif_bring_up_in_tcpip(void *arg) {
      * with that interface's address as source, and replies arriving there
      * are mapped back and routed into the tunnel. Needs the netif up. */
     if (ctx->napt && !ip_napt_enable_netif(ctx->netif, 1)) ctx->napt_failed = true;
+#endif
+#ifdef CONFIG_ML_EXIT_NODE_IPV6
+    if (ctx->ip6) {
+        /* Our tailnet IPv6 address, usable at once (no DAD over a point-to-
+         * point tunnel): lwIP then routes the tailnet /64 into the tunnel,
+         * and NAT66 maps peers' IPv6 to the LAN address. */
+        ip6_addr_t a;
+        memset(&a, 0, sizeof(a));
+        memcpy(a.addr, ctx->ip6addr, 16);
+        s8_t i = -1;
+        if (netif_add_ip6_address(ctx->netif, &a, &i) == ERR_OK && i >= 0) {
+            netif_ip6_addr_set_state(ctx->netif, i, IP6_ADDR_PREFERRED);
+            ml_nat66_attach(ctx->netif);
+        }
+    }
 #endif
     xSemaphoreGive(ctx->done);
 }
@@ -390,6 +408,9 @@ typedef struct {
 static void wg_netif_remove_in_tcpip(void *arg) {
     wg_netif_down_ctx_t *ctx = (wg_netif_down_ctx_t *)arg;
     struct netif *netif = ctx->netif;
+#ifdef CONFIG_ML_EXIT_NODE_IPV6
+    ml_nat66_attach(NULL);
+#endif
 #if IP_NAPT
     /* Frees the NAPT table if no other netif uses it; needs the netif up */
     if (netif->napt) ip_napt_enable_netif(netif, 0);
@@ -484,6 +505,36 @@ static void wg_free_unlinked_device(struct netif *netif) {
     mem_free(device);
 }
 
+#ifdef CONFIG_ML_EXIT_NODE_IPV6
+/* Forwarding IPv6 as an exit node: built in, offering 0.0.0.0/0, and the
+ * control plane gave us a tailnet IPv6 address. */
+static bool exit6_active(const microlink_t *ml) {
+    return ml->has_vpn_ip6 && ml_routes_is_exit_node(ml->routes, ml->route_count);
+}
+#endif
+
+/* Add the peer's tailnet IPv6 /128 to its WireGuard peer (exit node only),
+ * so its IPv6 passes the inner-source check and replies find it. */
+static void wg_peer_sync_ip6(microlink_t *ml, ml_peer_t *p) {
+#ifdef CONFIG_ML_EXIT_NODE_IPV6
+    if (!exit6_active(ml) || !p->has_ip6 || p->ip6_installed || p->wg_peer_index < 0 || !ml->wg_netif) return;
+    ip_addr_t ip, mask;
+    memset(&ip, 0, sizeof(ip));
+    memset(&mask, 0, sizeof(mask));
+    IP_SET_TYPE_VAL(ip, IPADDR_TYPE_V6);
+    IP_SET_TYPE_VAL(mask, IPADDR_TYPE_V6);
+    memcpy(ip_2_ip6(&ip)->addr, p->vpn_ip6, 16);
+    memset(ip_2_ip6(&mask)->addr, 0xFF, 16);
+    if (wireguardif_add_allowed_ip((struct netif *)ml->wg_netif, (u8_t)p->wg_peer_index, &ip, &mask) == ERR_OK) {
+        p->ip6_installed = true;
+    } else {
+        ESP_LOGW(TAG, "Could not add the IPv6 address of %s to its WireGuard peer", p->hostname);
+    }
+#else
+    (void)ml; (void)p;
+#endif
+}
+
 /* Tailnet packet filter hooks (run on the RX task / tcpip_thread). */
 static bool wg_filter_rx_cb(void *ctx, const uint8_t *pkt, size_t len) {
     /* Keep the filter's local addresses (tailnet IP + advertised routes)
@@ -494,9 +545,15 @@ static bool wg_filter_rx_cb(void *ctx, const uint8_t *pkt, size_t len) {
      * race on it, both just push the same values. */
     microlink_t *ml = (microlink_t *)ctx;
     uint32_t self = ml->vpn_ip;
-    if (self != ml->filter_local_ip) {
+    bool v6 = ml->has_vpn_ip6;
+    if (self != ml->filter_local_ip || v6 != ml->filter_local_ip6) {
         ml_filter_set_local(self, ml->routes, ml->route_count);
+#ifdef CONFIG_ML_EXIT_NODE_IPV6
+        /* IPv6 is only set up on the WG netif for an exit node */
+        ml_filter_set_local6(exit6_active(ml) ? ml->vpn_ip6 : NULL, exit6_active(ml));
+#endif
         ml->filter_local_ip = self;
+        ml->filter_local_ip6 = v6;
     }
     return ml_filter_check_inbound(pkt, len, (uint32_t)ml_get_time_ms());
 }
@@ -560,6 +617,23 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
     {
         wg_netif_up_ctx_t ctx = { .netif = netif, .done = xSemaphoreCreateBinary(),
                                   .napt = ml->route_count > 0, .napt_failed = false };
+#ifdef CONFIG_ML_EXIT_NODE_IPV6
+        if (exit6_active(ml)) {
+            ctx.ip6 = true;
+            memcpy(ctx.ip6addr, ml->vpn_ip6, 16);
+            /* NAT66 needs a global address on the LAN side: make sure SLAAC
+             * runs there (it needs a link-local address first). */
+            static const char *const lan_keys[] = { "WIFI_STA_DEF", "ETH_DEF" };
+            for (size_t k = 0; k < sizeof(lan_keys) / sizeof(lan_keys[0]); k++) {
+                esp_netif_t *lan = esp_netif_get_handle_from_ifkey(lan_keys[k]);
+                esp_ip6_addr_t ll;
+                if (lan && esp_netif_get_ip6_linklocal(lan, &ll) != ESP_OK) {
+                    esp_netif_create_ip6_linklocal(lan);
+                }
+            }
+            ESP_LOGI(TAG, "Exit node: forwarding IPv6 too (NAT66)");
+        }
+#endif
         if (!ctx.done) {
             ESP_LOGE(TAG, "Failed to allocate netif-up semaphore");
             wg_free_unlinked_device(netif);
@@ -785,6 +859,12 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
                 persist = true;
             }
             if (update->online_valid) e->online = update->online;
+            if (update->has_ip6 && (!e->has_ip6 || memcmp(e->vpn_ip6, update->vpn_ip6, 16) != 0)) {
+                memcpy(e->vpn_ip6, update->vpn_ip6, 16);
+                e->has_ip6 = true;
+                e->ip6_installed = false;
+            }
+            wg_peer_sync_ip6(ml, e);
             if (merge_endpoints(e, update)) persist = true;
             if (persist) ml_peer_nvs_save(e);   /* only write flash when something changed */
             ESP_LOGD(TAG, "Refreshed peer %s (idx=%d)", e->hostname, idx);
@@ -888,6 +968,9 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     p->node_id = update->node_id;
     p->netmap_gen = update->netmap_gen;
     p->vpn_ip = update->vpn_ip;
+    p->has_ip6 = update->has_ip6;
+    if (update->has_ip6) memcpy(p->vpn_ip6, update->vpn_ip6, 16);
+    p->ip6_installed = false;
     memcpy(p->public_key, update->public_key, 32);
     memcpy(p->disco_key, update->disco_key, 32);
     strncpy(p->hostname, update->hostname, sizeof(p->hostname) - 1);
@@ -985,6 +1068,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
 
         if (wg_err == ERR_OK && wg_peer_idx != WIREGUARDIF_INVALID_INDEX) {
             p->wg_peer_index = wg_peer_idx;
+            wg_peer_sync_ip6(ml, p);
 
             /* Verify the WG internal peer key matches what we passed */
             struct wireguard_device *dev = (struct wireguard_device *)netif->state;

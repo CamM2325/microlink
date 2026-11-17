@@ -499,6 +499,21 @@ static err_t wireguardif_output(struct netif *netif, struct pbuf *q, const ip4_a
 	}
 }
 
+#if LWIP_IPV6
+// IPv6 into the tunnel: the peer is chosen by its allowed IPs, as for IPv4
+// (each peer's tailnet IPv6 /128 is added with wireguardif_add_allowed_ip).
+static err_t wireguardif_output_ip6(struct netif *netif, struct pbuf *q, const ip6_addr_t *ip6addr) {
+	struct wireguard_device *device = (struct wireguard_device *)netif->state;
+	ip_addr_t addr;
+	ip_addr_copy_from_ip6(addr, *ip6addr);
+	struct wireguard_peer *peer = wg_peer_lookup_by_allowed_ip(device, &addr);
+	if (!peer) {
+		return ERR_RTE;
+	}
+	return wireguardif_output_to_peer(netif, q, NULL, peer);
+}
+#endif /* LWIP_IPV6 */
+
 static void wireguardif_send_keepalive(struct wireguard_device *device, struct wireguard_peer *peer) {
 	// Send a NULL packet as a keep-alive
 	wireguardif_output_to_peer(device->netif, NULL, NULL, peer);
@@ -544,6 +559,22 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 	ESP_LOGD(WG_TAG, "Session established wg_idx=%u", wg_idx);
 }
 
+static bool peer_add_ip(struct wireguard_peer *peer, ip_addr_t ip, ip_addr_t mask);
+
+err_t wireguardif_add_allowed_ip(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, const ip_addr_t *mask) {
+	struct wireguard_device *device = netif ? (struct wireguard_device *)netif->state : NULL;
+	if (!device || peer_index >= WIREGUARD_MAX_PEERS || !ip || !mask) {
+		return ERR_ARG;
+	}
+	struct wireguard_peer *peer = &device->peers[peer_index];
+	// Lookups on tcpip_thread scan the slots without the lock; peer_add_ip
+	// writes address and mask before it marks the slot valid.
+	wg_state_lock();
+	bool ok = peer->valid && peer_add_ip(peer, *ip, *mask);
+	wg_state_unlock();
+	return ok ? ERR_OK : ERR_MEM;
+}
+
 static bool peer_add_ip(struct wireguard_peer *peer, ip_addr_t ip, ip_addr_t mask) {
 	bool result = false;
 	struct wireguard_allowed_ip *allowed;
@@ -561,9 +592,10 @@ static bool peer_add_ip(struct wireguard_peer *peer, ip_addr_t ip, ip_addr_t mas
 		for (x=0; x < WIREGUARD_MAX_SRC_IPS; x++) {
 			allowed = &peer->allowed_source_ips[x];
 			if (!allowed->valid) {
-				allowed->valid = true;
 				allowed->ip = ip;
 				allowed->mask = mask;
+				__atomic_thread_fence(__ATOMIC_RELEASE);
+				allowed->valid = true;
 				result = true;
 				break;
 			}
@@ -1470,6 +1502,9 @@ err_t wireguardif_init(struct netif *netif) {
 						netif->name[0] = 'w';
 						netif->name[1] = 'g';
 						netif->output = wireguardif_output;
+#if LWIP_IPV6
+						netif->output_ip6 = wireguardif_output_ip6;
+#endif
 						netif->linkoutput = NULL;
 						netif->hwaddr_len = 0;
 						netif->mtu = WIREGUARDIF_MTU;
@@ -1514,6 +1549,9 @@ err_t wireguardif_init(struct netif *netif) {
 								netif->name[0] = 'w';
 								netif->name[1] = 'g';
 								netif->output = wireguardif_output;
+#if LWIP_IPV6
+								netif->output_ip6 = wireguardif_output_ip6;
+#endif
 								netif->linkoutput = NULL;
 								netif->hwaddr_len = 0;
 								netif->mtu = WIREGUARDIF_MTU;

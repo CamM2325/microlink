@@ -187,6 +187,24 @@ menu "MicroLink V2 Configuration"
             IPv4 CIDRs separated by commas, e.g. "192.168.1.0/24". Add
             "0.0.0.0/0" to offer the device as an exit node. Up to 8.
 
+    config ML_EXIT_NODE_IPV6
+        bool "Exit node: forward IPv6 too (NAT66)"
+        depends on ML_SUBNET_ROUTER && LWIP_IPV6 && LWIP_HOOK_IP6_INPUT_CUSTOM
+        default y
+        select LWIP_IPV6_FORWARD
+        select LWIP_IPV6_AUTOCONFIG
+        help
+            An exit node advertises ::/0 next to 0.0.0.0/0 (Tailscale needs
+            both). With this, it also forwards its clients' IPv6: the device
+            takes its tailnet IPv6 address, gets a global address on the LAN
+            by SLAAC, and masquerades peers' traffic behind it (NAT66), as
+            Linux exit nodes do. Without a global IPv6 address on the LAN,
+            clients get "no route" (ICMPv6) and fall back to IPv4 at once.
+
+            Needs lwIP's IPv6 input hook set to "Custom implementation"
+            (LWIP_HOOK_IP6_INPUT_CUSTOM): MicroLink provides
+            lwip_hook_ip6_input(), so the application must not.
+
     config ML_OTA_ROLLBACK
         bool "Keep an OTA-updated firmware only once it connects"
         depends on BOOTLOADER_APP_ROLLBACK_ENABLE

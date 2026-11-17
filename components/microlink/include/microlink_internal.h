@@ -306,6 +306,8 @@ typedef struct {
     bool key_valid;             /* public_key present (patches may omit it) */
     bool disco_valid;           /* disco_key present (patches may omit it) */
     uint32_t vpn_ip;
+    uint8_t vpn_ip6[16];        /* tailnet IPv6 address, if has_ip6 */
+    bool has_ip6;
     uint8_t public_key[32];
     uint8_t disco_key[32];
     char hostname[64];
@@ -330,6 +332,9 @@ typedef struct {
     int64_t node_id;            /* tailcfg NodeID (0 = not yet known, e.g. NVS cache) */
     uint32_t netmap_gen;        /* last full-netmap generation that listed this peer */
     uint32_t vpn_ip;
+    uint8_t vpn_ip6[16];        /* tailnet IPv6 address, if has_ip6 */
+    bool has_ip6;
+    bool ip6_installed;         /* its /128 is an allowed IP of the WG peer */
     uint8_t public_key[32];
     uint8_t disco_key[32];
     char hostname[64];
@@ -490,6 +495,8 @@ struct microlink_s {
     /* State (atomic reads from any task, writes only from coord) */
     volatile microlink_state_t state;
     volatile uint32_t vpn_ip;
+    uint8_t vpn_ip6[16];                /* our tailnet IPv6 address, if has_vpn_ip6 */
+    volatile bool has_vpn_ip6;
 
     /* Event group (cross-task synchronization) */
     EventGroupHandle_t events;
@@ -642,6 +649,7 @@ struct microlink_s {
      * context, so a re-created instance always pushes it again (ml_filter
      * is reset in microlink_destroy). */
     uint32_t filter_local_ip;
+    bool filter_local_ip6;              /* has_vpn_ip6 when last pushed */
 
     /* Debug flags (bitmask from NVS, checked at runtime for verbose logging) */
     uint8_t debug_flags;  /* bit 0: DISCO, bit 1: WG, bit 2: DERP, bit 3: coord */

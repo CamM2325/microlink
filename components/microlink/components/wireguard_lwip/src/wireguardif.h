@@ -119,6 +119,11 @@ err_t wireguardif_add_peer(struct netif *netif, struct wireguardif_peer *peer, u
 // Remove the given peer from the network interface
 err_t wireguardif_remove_peer(struct netif *netif, u8_t peer_index);
 
+// Add an allowed IP (e.g. the peer's IPv6 /128 next to its IPv4 /32) to a
+// peer that is already installed. No-op if it is already there; ERR_MEM if
+// the peer has no free slot (WIREGUARD_MAX_SRC_IPS).
+err_t wireguardif_add_allowed_ip(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, const ip_addr_t *mask);
+
 // Update the "connect" IP of the given peer
 err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port);
 
