@@ -61,7 +61,9 @@
  * with CONFIG_ML_ZERO_COPY_WG), and peers are added and removed on wg_mgr.
  *
  * s_wg_tx_lock (state lock) covers a peer's keypairs (next/curr/prev), its
- * endpoint (ip/port, connect_ip/connect_port) and its valid flag. Every
+ * endpoint (ip/port, connect_ip/connect_port), its valid flag and the
+ * handshake-control fields (send_handshake, last_initiation_tx,
+ * handshake_attempts, active). Every
  * keypair mutation (add_new_keypair via wireguard_start_session,
  * keypair_update, keypair_destroy, peer init and the wipe on remove) takes it,
  * and so does the TX path from keypair selection to reserving the nonce.
@@ -987,9 +989,14 @@ static err_t wireguard_start_handshake(struct netif *netif, struct wireguard_pee
 	wg_hs_lock();
 	bool created = wireguard_create_handshake_initiation(device, peer, &msg);
 	if (created) {
+		// Handshake-control fields (send_handshake, last_initiation_tx,
+		// handshake_attempts, active) are written under the state lock
+		// everywhere else; tcpip_thread sets send_handshake from the TX path.
+		wg_state_lock();
 		peer->send_handshake = false;
 		peer->last_initiation_tx = wireguard_sys_now();
 		peer->handshake_attempts++;
+		wg_state_unlock();
 		memcpy(peer->handshake_mac1, msg.mac1, WIREGUARD_COOKIE_LEN);
 		peer->handshake_mac1_valid = true;
 	}
