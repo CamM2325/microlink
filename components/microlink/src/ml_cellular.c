@@ -928,68 +928,25 @@ static void clear_config_strs(void)
     s_cell.config.ppp_pass = NULL;
 }
 
-esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
+/* Undo a failed ml_cellular_init() after the UART was installed. s_cell.info
+ * is kept for diagnostics (it is reset by the next init). */
+static void init_failed_cleanup(void)
 {
-    if (s_cell.state != ML_CELL_STATE_OFF) {
-        ESP_LOGW(TAG, "Already initialized");
-        return ESP_ERR_INVALID_STATE;
+    bool locked = ml_cellular_uart_lock();
+    if (s_cell.uart_installed) {
+        s_cell.uart_installed = false;
+        uart_driver_delete(UART_NUM);
     }
+    clear_config_strs();
+    s_cell.data_mode = ML_DATA_MODE_NONE;
+    s_cell.state = ML_CELL_STATE_OFF;
+    if (locked) ml_cellular_uart_unlock();
+}
 
-    /* Apply config or defaults */
-    if (config) {
-        s_cell.config = *config;
-    } else {
-        ml_cellular_config_t def = ML_CELLULAR_DEFAULT_CONFIG();
-        s_cell.config = def;
-    }
-
-    /* Reject values that cannot be passed safely inside an AT command
-     * (Kconfig, NVS and application config all arrive here). */
-    {
-        const char *bad = NULL;
-        if (s_cell.config.apn && !ml_at_valid_apn(s_cell.config.apn)) {
-            bad = "APN (letters, digits, '-' and '.', max 100)";
-        } else if (s_cell.config.sim_pin && s_cell.config.sim_pin[0] &&
-                   !ml_at_valid_pin(s_cell.config.sim_pin)) {
-            bad = "SIM PIN (4-8 digits)";
-        } else if (s_cell.config.ppp_user && !ml_at_valid_credential(s_cell.config.ppp_user)) {
-            bad = "PPP user (printable ASCII without '\"' or '\\', max 64)";
-        } else if (s_cell.config.ppp_pass && !ml_at_valid_credential(s_cell.config.ppp_pass)) {
-            bad = "PPP password (printable ASCII without '\"' or '\\', max 64)";
-        }
-        if (bad) {
-            ESP_LOGE(TAG, "Invalid cellular config: %s", bad);
-            return ESP_ERR_INVALID_ARG;
-        }
-    }
-
-    /* Keep our own copies: the PPP credentials are handed to lwIP
-     * (ppp_set_auth() stores the pointers) and used again on a CHAP
-     * re-challenge long after the caller's buffers are gone. The lengths
-     * were checked above, so nothing is truncated. */
-    s_cell.config.apn = copy_config_str(s_cell.apn, sizeof(s_cell.apn), s_cell.config.apn);
-    s_cell.config.sim_pin = copy_config_str(s_cell.sim_pin, sizeof(s_cell.sim_pin),
-                                            s_cell.config.sim_pin);
-    s_cell.config.ppp_user = copy_config_str(s_cell.ppp_user, sizeof(s_cell.ppp_user),
-                                             s_cell.config.ppp_user);
-    s_cell.config.ppp_pass = copy_config_str(s_cell.ppp_pass, sizeof(s_cell.ppp_pass),
-                                             s_cell.config.ppp_pass);
-
-    if (!s_uart_lock) {
-        s_uart_lock = xSemaphoreCreateMutex();
-        if (!s_uart_lock) return ESP_ERR_NO_MEM;
-    }
-
-    if (s_cell.config.tx_pin == 0) s_cell.config.tx_pin = 43;
-    if (s_cell.config.rx_pin == 0) s_cell.config.rx_pin = 44;
-    if (s_cell.config.baud_rate == 0) s_cell.config.baud_rate = 115200;
-
-    memset(&s_cell.info, 0, sizeof(s_cell.info));
-    s_cell.state = ML_CELL_STATE_INIT;
-
-    /* Initialize UART */
-    esp_err_t err = uart_init();
-    if (err != ESP_OK) return err;
+/* Power up the modem and bring it to REGISTERED (UART already installed) */
+static esp_err_t modem_bringup(void)
+{
+    esp_err_t err;
 
     /* Board-specific modem power-on sequence.
      * Use gpio_config() instead of gpio_set_direction() for reliable GPIO init
@@ -1078,8 +1035,8 @@ esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
                 vTaskDelay(pdMS_TO_TICKS(200));
                 uart_flush_input(UART_NUM);
                 if (!at_cmd_ok("AT", AT_SHORT_TIMEOUT_MS)) {
-                    ESP_LOGE(TAG, "Modem not responding after baud revert; it will be "
-                                  "re-detected (and normalised) on the next init");
+                    ESP_LOGE(TAG, "Modem not responding after baud revert; its baud "
+                                  "rate is re-detected (and normalised) on the next init");
                     return ESP_ERR_TIMEOUT;
                 }
             }
@@ -1099,6 +1056,85 @@ esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
              s_cell.info.operator_name, s_cell.info.rssi);
 
     return ESP_OK;
+}
+
+esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
+{
+    if (s_cell.state != ML_CELL_STATE_OFF) {
+        ESP_LOGW(TAG, "Already initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Apply config or defaults */
+    if (config) {
+        s_cell.config = *config;
+    } else {
+        ml_cellular_config_t def = ML_CELLULAR_DEFAULT_CONFIG();
+        s_cell.config = def;
+    }
+
+    /* Reject values that cannot be passed safely inside an AT command
+     * (Kconfig, NVS and application config all arrive here). */
+    {
+        const char *bad = NULL;
+        if (s_cell.config.apn && !ml_at_valid_apn(s_cell.config.apn)) {
+            bad = "APN (letters, digits, '-' and '.', max 100)";
+        } else if (s_cell.config.sim_pin && s_cell.config.sim_pin[0] &&
+                   !ml_at_valid_pin(s_cell.config.sim_pin)) {
+            bad = "SIM PIN (4-8 digits)";
+        } else if (s_cell.config.ppp_user && !ml_at_valid_credential(s_cell.config.ppp_user)) {
+            bad = "PPP user (printable ASCII without '\"' or '\\', max 64)";
+        } else if (s_cell.config.ppp_pass && !ml_at_valid_credential(s_cell.config.ppp_pass)) {
+            bad = "PPP password (printable ASCII without '\"' or '\\', max 64)";
+        }
+        if (bad) {
+            ESP_LOGE(TAG, "Invalid cellular config: %s", bad);
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    /* Keep our own copies: the PPP credentials are handed to lwIP
+     * (ppp_set_auth() stores the pointers) and used again on a CHAP
+     * re-challenge long after the caller's buffers are gone. The lengths
+     * were checked above, so nothing is truncated. */
+    s_cell.config.apn = copy_config_str(s_cell.apn, sizeof(s_cell.apn), s_cell.config.apn);
+    s_cell.config.sim_pin = copy_config_str(s_cell.sim_pin, sizeof(s_cell.sim_pin),
+                                            s_cell.config.sim_pin);
+    s_cell.config.ppp_user = copy_config_str(s_cell.ppp_user, sizeof(s_cell.ppp_user),
+                                             s_cell.config.ppp_user);
+    s_cell.config.ppp_pass = copy_config_str(s_cell.ppp_pass, sizeof(s_cell.ppp_pass),
+                                             s_cell.config.ppp_pass);
+
+    if (!s_uart_lock) {
+        s_uart_lock = xSemaphoreCreateMutex();
+        if (!s_uart_lock) {
+            clear_config_strs();
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (s_cell.config.tx_pin == 0) s_cell.config.tx_pin = 43;
+    if (s_cell.config.rx_pin == 0) s_cell.config.rx_pin = 44;
+    if (s_cell.config.baud_rate == 0) s_cell.config.baud_rate = 115200;
+
+    memset(&s_cell.info, 0, sizeof(s_cell.info));
+    s_cell.state = ML_CELL_STATE_INIT;
+
+    /* Initialize UART */
+    esp_err_t err = uart_init();
+    if (err != ESP_OK) {
+        clear_config_strs();
+        s_cell.state = ML_CELL_STATE_OFF;
+        return err;
+    }
+
+    err = modem_bringup();
+    if (err != ESP_OK) {
+        /* Leave nothing behind, so the next ml_cellular_init() starts from
+         * scratch instead of failing with "Already initialized". */
+        init_failed_cleanup();
+    }
+    return err;
 }
 
 void ml_cellular_deinit(void)

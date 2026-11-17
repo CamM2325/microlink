@@ -98,6 +98,9 @@ typedef struct {
  * Sets up UART, sends initial AT commands, checks SIM status.
  * Does NOT start PPP data connection.
  *
+ * On failure the UART is released and the driver is back in state OFF, so
+ * the call can simply be retried (no ml_cellular_deinit() needed).
+ *
  * @param config  Cellular configuration (NULL for defaults)
  * @return ESP_OK on success
  */
