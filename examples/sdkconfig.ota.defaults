@@ -1,0 +1,16 @@
+# MicroLink overlay: firmware updates over the tailnet. Used by the
+# firmware-variants CI job, and usable as-is:
+#
+#   cd examples/basic_connect
+#   idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;../sdkconfig.ota.defaults" build
+#
+# Turns on the config web UI with its firmware upload endpoint, a partition
+# table with two OTA slots (4 MB flash), and the bootloader rollback that
+# MicroLink uses to drop an update which cannot reconnect. The first flash
+# must be done over USB (new partition table); then use tools/ml_ota.py.
+CONFIG_ML_ENABLE_CONFIG_HTTPD=y
+CONFIG_ML_CONFIG_HTTPD_OTA=y
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../partitions_ota.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y

@@ -28,6 +28,8 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <string.h>
@@ -642,7 +644,9 @@ static bool basic_auth_ok(httpd_req_t *req) {
 }
 
 /* Returns true if the request may proceed; otherwise a response was sent. */
-static bool http_guard(httpd_req_t *req, bool mutating) {
+/* required_ct: Content-Type a state-changing request must carry (one that
+ * a cross-site page cannot send without a CORS preflight), NULL for reads. */
+static bool http_guard_ct(httpd_req_t *req, const char *required_ct) {
     const ml_config_ctx_t *ctx = (const ml_config_ctx_t *)req->user_ctx;
     uint32_t local_ip;
     if (!local_addr_allowed(req, ctx->ml, &local_ip)) {
@@ -659,17 +663,23 @@ static bool http_guard(httpd_req_t *req, bool mutating) {
         httpd_resp_sendstr(req, "Authentication required");
         return false;
     }
-    if (mutating) {
+    if (required_ct) {
         char ct[48];
         if (httpd_req_get_hdr_value_str(req, "Content-Type", ct, sizeof(ct)) != ESP_OK ||
-            strncmp(ct, "application/json", 16) != 0) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Content-Type must be application/json");
+            strncmp(ct, required_ct, strlen(required_ct)) != 0) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Content-Type must be %s", required_ct);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
             return false;
         }
     }
     httpd_resp_set_hdr(req, "X-Frame-Options", "DENY");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return true;
+}
+
+static bool http_guard(httpd_req_t *req, bool mutating) {
+    return http_guard_ct(req, mutating ? "application/json" : NULL);
 }
 
 /* ============================================================================
@@ -741,15 +751,25 @@ static esp_err_t handler_status(httpd_req_t *req) {
     cJSON *json = cJSON_CreateObject();
     if (!json) return ESP_FAIL;
 
+    /* Firmware identity, so an update can be checked from outside
+     * (tools/ml_ota.py) */
+    const esp_app_desc_t *app = esp_app_get_description();
+    cJSON_AddStringToObject(json, "fw_version", app->version);
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running) cJSON_AddStringToObject(json, "fw_partition", running->label);
+
     char ip_buf[16] = "0.0.0.0";
     if (ml) {
         uint32_t vpn_ip = microlink_get_vpn_ip(ml);
         if (vpn_ip) microlink_ip_to_str(vpn_ip, ip_buf);
         cJSON_AddStringToObject(json, "vpn_ip", ip_buf);
 
-        const char *states[] = {"IDLE","WIFI_WAIT","CONNECTING","REGISTERING","CONNECTED","RECONNECTING","ERROR"};
+        static const char *const states[] = {"IDLE", "WIFI_WAIT", "CONNECTING", "REGISTERING",
+                                             "CONNECTED", "RECONNECTING", "ERROR",
+                                             "AUTH_FAILED", "NEEDS_LOGIN"};
         int s = microlink_get_state(ml);
-        cJSON_AddStringToObject(json, "state", (s >= 0 && s <= 6) ? states[s] : "UNKNOWN");
+        int nstates = (int)(sizeof(states) / sizeof(states[0]));
+        cJSON_AddStringToObject(json, "state", (s >= 0 && s < nstates) ? states[s] : "UNKNOWN");
         cJSON_AddNumberToObject(json, "peer_count", microlink_get_peer_count(ml));
         cJSON_AddStringToObject(json, "hostname", ml->config.device_name ? ml->config.device_name : "");
     }
@@ -1140,6 +1160,85 @@ static esp_err_t handler_restart(httpd_req_t *req) {
     esp_restart();
     return ESP_OK;  /* unreachable */
 }
+
+#ifdef CONFIG_ML_CONFIG_HTTPD_OTA
+/* POST /api/ota: body = an app image (the .bin from the build), sent as
+ * application/octet-stream. Written to the next OTA slot, checked by
+ * esp_ota_end() (chip, SHA-256 digest, signature with secure boot), made
+ * the boot image, then the device restarts into it. With ML_OTA_ROLLBACK
+ * the new image is kept only once it reconnects to the tailnet. */
+static esp_err_t handler_ota(httpd_req_t *req) {
+    if (!http_guard_ct(req, "application/octet-stream")) return ESP_OK;
+
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (!part) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "No OTA slot: flash a partition table with two OTA app partitions");
+        return ESP_OK;
+    }
+    size_t total = req->content_len;
+    if (total == 0 || total > part->size) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Image is empty or larger than the OTA slot");
+        return ESP_OK;
+    }
+
+    esp_ota_handle_t ota = 0;
+    esp_err_t err = esp_ota_begin(part, OTA_WITH_SEQUENTIAL_WRITES, &ota);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA begin failed: %s", esp_err_to_name(err));
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+    ESP_LOGW(TAG, "Firmware upload started: %u bytes to %s", (unsigned)total, part->label);
+
+    char *buf = malloc(4096);
+    size_t got = 0;
+    int timeouts = 0;
+    err = buf ? ESP_OK : ESP_ERR_NO_MEM;
+    while (err == ESP_OK && got < total) {
+        size_t want = total - got < 4096 ? total - got : 4096;
+        int n = httpd_req_recv(req, buf, want);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts <= 6) continue;
+        if (n <= 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        timeouts = 0;
+        err = esp_ota_write(ota, buf, (size_t)n);
+        got += (size_t)n;
+    }
+    free(buf);
+    if (err != ESP_OK) {
+        esp_ota_abort(ota);
+        ESP_LOGE(TAG, "Firmware upload failed after %u/%u bytes: %s",
+                 (unsigned)got, (unsigned)total, esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Upload failed or not an app image");
+        return ESP_OK;
+    }
+    err = esp_ota_end(ota);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Uploaded image rejected: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Image rejected (corrupt, wrong chip or bad signature)");
+        return ESP_OK;
+    }
+    err = esp_ota_set_boot_partition(part);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not select the new image: %s", esp_err_to_name(err));
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "Firmware update written to %s; restarting", part->label);
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"partition\":\"%s\",\"bytes\":%u,\"restarting\":true}",
+             part->label, (unsigned)total);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;  /* unreachable */
+}
+#endif
 
 /* ============================================================================
  * WiFi List HTTP Handlers
@@ -1555,6 +1654,9 @@ static esp_err_t config_server_start_once(void) {
         { "/api/restart",       HTTP_POST,   handler_restart },
         { "/api/wifi",          HTTP_GET,    handler_get_wifi },
         { "/api/wifi",          HTTP_POST,   handler_post_wifi },
+#ifdef CONFIG_ML_CONFIG_HTTPD_OTA
+        { "/api/ota",           HTTP_POST,   handler_ota },
+#endif
     };
 
     for (int i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {

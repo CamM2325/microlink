@@ -3204,6 +3204,7 @@ void ml_coord_task(void *arg) {
             state = COORD_LONG_POLL;
             ml->state = ML_STATE_CONNECTED;
             reconnect_attempts = 0;
+            ml_ota_confirm();
             last_activity_ms = ml_get_time_ms();
 
             /* Notify app */

@@ -105,6 +105,9 @@ jobs:
           # subnet router / exit node (lwIP forwarding + NAPT)
           - { idf: v5.3.6, example: basic_connect, overlay: sdkconfig.router.defaults }
           - { idf: v6.1.1, example: basic_connect, overlay: sdkconfig.router.defaults }
+          # firmware upload over the tailnet + rollback (two OTA slots)
+          - { idf: v5.3.6, example: basic_connect, overlay: sdkconfig.ota.defaults }
+          - { idf: v6.1.1, example: basic_connect, overlay: sdkconfig.ota.defaults }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

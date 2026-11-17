@@ -668,6 +668,10 @@ bool ml_shutdown_requested(const microlink_t *ml);
  *  this call; clearing the bit is what allows microlink_destroy() to free it. */
 void ml_task_exit(microlink_t *ml, uint32_t task_bit) __attribute__((noreturn));
 
+/* ml_ota.c: firmware rollback guard (no-ops without CONFIG_ML_OTA_ROLLBACK) */
+void ml_ota_check_pending(void);   /* at start: arm the rollback timer */
+void ml_ota_confirm(void);         /* on CONNECTED: keep the new firmware */
+
 /* ml_net_io.c */
 void ml_net_io_task(void *arg);
 

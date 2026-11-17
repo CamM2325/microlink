@@ -638,6 +638,9 @@ esp_err_t microlink_start(microlink_t *ml) {
      * COORD_REGISTERED/WG_READY/DERP_* bits would skip startup steps. */
     xEventGroupClearBits(ml->events, ML_EVT_ALL_BITS);
     ml->started = true;
+
+    /* First boot of an OTA-updated firmware: arm its rollback timer */
+    ml_ota_check_pending();
     ml->state = ML_STATE_WIFI_WAIT;
 
     /* Set WiFi TX power if configured */

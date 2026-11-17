@@ -187,6 +187,25 @@ menu "MicroLink V2 Configuration"
             IPv4 CIDRs separated by commas, e.g. "192.168.1.0/24". Add
             "0.0.0.0/0" to offer the device as an exit node. Up to 8.
 
+    config ML_OTA_ROLLBACK
+        bool "Keep an OTA-updated firmware only once it connects"
+        depends on BOOTLOADER_APP_ROLLBACK_ENABLE
+        default y
+        help
+            With the bootloader's app rollback enabled, a firmware written by
+            OTA is marked valid when MicroLink first reaches CONNECTED. If it
+            does not within ML_OTA_CONFIRM_TIMEOUT_S, the device restarts and
+            the bootloader returns to the previous firmware, so an update that
+            cannot reach the tailnet does not leave the device unreachable.
+            Turn off to confirm updates in your own code
+            (esp_ota_mark_app_valid_cancel_rollback()).
+
+    config ML_OTA_CONFIRM_TIMEOUT_S
+        int "Seconds an updated firmware has to connect"
+        depends on ML_OTA_ROLLBACK
+        default 300
+        range 30 3600
+
     config ML_UDP_RX_TASK_PRIO
         int "UDP socket receive task priority"
         default 7
@@ -587,6 +606,21 @@ menu "MicroLink V2 Configuration"
                 Settings persist in NVS across reboots. The peer allowlist
                 controls which peers receive outbound DISCO probes — on large
                 tailnets this prevents wg_mgr flooding and reduces latency.
+
+        config ML_CONFIG_HTTPD_OTA
+            bool "Firmware upload (POST /api/ota)"
+            depends on ML_ENABLE_CONFIG_HTTPD
+            default n
+            help
+                Accept a new app image (the .bin from the build) with
+                POST /api/ota, under the same access rules as the rest of the
+                config server, write it to the next OTA slot and restart into
+                it. The image is checked before it is used (chip, SHA-256
+                digest, and its signature with secure boot). Needs a partition
+                table with two OTA slots. tools/ml_ota.py updates a list of
+                devices this way. Enable BOOTLOADER_APP_ROLLBACK_ENABLE too, so
+                that an update that cannot reconnect is rolled back
+                (ML_OTA_ROLLBACK).
 
         config ML_CONFIG_HTTPD_PASSWORD
             string "Admin password (empty = generate on first boot)"

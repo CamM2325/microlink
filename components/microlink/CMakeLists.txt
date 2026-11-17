@@ -11,6 +11,7 @@ set(SRCS
     "src/ml_udp.c"
     "src/ml_filter.c"
     "src/ml_routes.c"
+    "src/ml_ota.c"
     "src/ml_tcp.c"
     "src/ml_peer_nvs.c"
     "src/nacl_box.c"
@@ -35,6 +36,8 @@ set(REQUIRES
     esp_driver_gpio
     esp_driver_tsens
     esp_http_server
+    app_update
+    esp_app_format
 )
 
 # ESP-IDF 6 no longer ships cJSON as the built-in `json` component; it comes

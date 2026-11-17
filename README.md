@@ -28,7 +28,8 @@ before you rely on it.
 - **Subnet router / exit node** (opt-in): advertise LAN routes or `0.0.0.0/0` and forward
   tailnet traffic to them, masqueraded with lwIP NAPT.
 - **Peer cache in NVS**, so known peers are usable right after a reboot.
-- **Optional on-device web UI** for settings (password-protected, tailnet-only by default).
+- **Optional on-device web UI** for settings (password-protected, tailnet-only by default), with
+  optional firmware updates over the tailnet and automatic rollback.
 
 ## Status and limitations
 
@@ -218,13 +219,14 @@ override the Kconfig defaults at runtime.
 | `ML_ZERO_COPY_WG` | n | High-throughput receive path on a raw lwIP PCB (contributed by dj-oyu). |
 | `ML_UDP_RX_TASK_PRIO` | 7 | UDP callback task priority. |
 | `ML_SUBNET_ROUTER` / `ML_ADVERTISE_ROUTES` | n / "" | Subnet router and exit node; turns on lwIP IP forwarding and NAPT. |
+| `ML_OTA_ROLLBACK` / `ML_OTA_CONFIRM_TIMEOUT_S` | y / 300 | With bootloader rollback: keep an OTA update only once it connects. |
 | `ML_STOP_TIMEOUT_MS` | 30000 | How long `microlink_stop()` waits. |
 | MicroLink log verbosity | Same as ESP-IDF | Compile-time level for MicroLink's own logs (`ML_LOG_LEVEL_WARN` / `_INFO` / `_DEBUG` / `_VERBOSE`). Warning saves about 17–23 KB of flash. Debug/Verbose messages also need `esp_log_level_set("<tag>", ...)` at run time. |
 | **Credentials** | | `ML_WIFI_SSID`, `ML_WIFI_PASSWORD`, `ML_TAILSCALE_AUTH_KEY`, `ML_DEVICE_NAME` (compiled into the image). |
 | **Control Plane** | | `ML_CTRL_HOST`, `ML_CTRL_TLS`, `ML_CTRL_TLS_VERIFY_CERT` (y), `ML_CTRL_NOISE_PUBKEY_HEX`. |
 | **Cellular Modem** | | `ML_ENABLE_CELLULAR`, board preset, pins, `ML_CELLULAR_APN`, `ML_CELLULAR_SIM_PIN`, `ML_CELLULAR_PPP_USER/PASS`, data mode, `ML_CELLULAR_FAST_BAUD` (0). |
 | **Network Switching** | | `ML_ENABLE_NET_SWITCH`, `ML_NET_SWITCH_WIFI_TIMEOUT_MS` (30000), `ML_NET_SWITCH_HEALTH_INTERVAL_MS` (30000), `ML_NET_SWITCH_FAILBACK_MS` (120000, 0 = no failback): defaults for the `ml_net_switch_config_t` timing fields left at 0. |
-| **HTTP Config Server** | | `ML_ENABLE_CONFIG_HTTPD` (n), `ML_CONFIG_HTTPD_PASSWORD`, `ML_CONFIG_HTTPD_ALLOW_LAN` (n), `ML_CONFIG_MAX_ALLOWED_PEERS`. |
+| **HTTP Config Server** | | `ML_ENABLE_CONFIG_HTTPD` (n), `ML_CONFIG_HTTPD_OTA` (n), `ML_CONFIG_HTTPD_PASSWORD`, `ML_CONFIG_HTTPD_ALLOW_LAN` (n), `ML_CONFIG_MAX_ALLOWED_PEERS`. |
 
 APN, SIM PIN, PPP credentials and the control host are validated; invalid values are rejected at
 startup (or with HTTP 400 in the config UI) instead of being passed to the modem.
@@ -317,6 +319,31 @@ and the device asks the control plane for a login instead, like `tailscale up` w
 The node keys are kept in NVS, so this happens once per device, not on every boot (erasing NVS makes
 it a new device). Whoever opens the URL first adds the device to *their* tailnet: show it only to
 the device's owner. Tested with Headscale.
+
+## Firmware updates over the tailnet
+
+The config web UI can take a new firmware image (`CONFIG_ML_CONFIG_HTTPD_OTA`), and
+`tools/ml_ota.py` uses it to update any number of devices from a machine in the tailnet:
+
+```bash
+cd examples/basic_connect
+idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;../sdkconfig.ota.defaults" build
+# first time: flash over USB (the overlay changes the partition table), then:
+ML_HTTP_PASSWORD=... ../../tools/ml_ota.py build/microlink_v2_basic_connect.bin 100.64.0.5 sensor-2
+```
+
+- The overlay turns on the config UI with `POST /api/ota`, a 4 MB partition table with two OTA slots
+  (`examples/partitions_ota.csv`) and the bootloader's app rollback.
+- Uploads get the same checks as the rest of the config UI (tailnet address, password, Host
+  header) and must be `application/octet-stream`. The image is verified before it is used: chip,
+  SHA-256 digest, and the signature when secure boot is on.
+- **Rollback:** an updated firmware is kept only once MicroLink reaches `CONNECTED`. If it does not
+  within `CONFIG_ML_OTA_CONFIRM_TIMEOUT_S` (300 s), the device restarts into the previous firmware.
+  So an update that breaks networking does not leave the device unreachable.
+- `ml_ota.py` checks each device's version before and after (`fw_version` / `fw_partition` in
+  `/api/status`) and reports a rolled-back update as a failure.
+- Measured on an ESP32-S3 over WiFi: a 1.1 MB image uploads in about 11 s (direct path), and a
+  deliberately broken image is rolled back without help 30 s after it boots.
 
 ## Subnet router and exit node
 
