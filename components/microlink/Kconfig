@@ -320,6 +320,11 @@ menu "MicroLink V2 Configuration"
                 PIN code for the SIM card. Leave empty if no PIN required.
                 Must be 4-8 digits.
 
+                The PIN is only sent when AT+SPIC reports at least 2 attempts
+                left (or, if the modem cannot report them, once per boot),
+                and never again after a rejection until reboot, so a wrong
+                PIN cannot PUK-lock the SIM through retries.
+
         config ML_CELLULAR_PPP_USER
             string "PPP CHAP username"
             depends on ML_ENABLE_CELLULAR

@@ -263,6 +263,18 @@ static void wifi_stop(void)
 
 static esp_err_t cellular_start(void)
 {
+    /* A rejected SIM PIN is never retried (it would PUK-lock the SIM), so
+     * powering the modem up again is pointless until reboot. */
+    if (ml_cellular_sim_pin_blocked()) {
+        static bool logged;
+        if (!logged) {
+            ESP_LOGE(TAG, "Cellular disabled until reboot: SIM PIN rejected or attempts "
+                     "nearly used up (fix CONFIG_ML_CELLULAR_SIM_PIN)");
+            logged = true;
+        }
+        return ESP_ERR_NOT_ALLOWED;
+    }
+
     ESP_LOGI(TAG, "Starting cellular modem...");
 
     ml_cellular_config_t cell_config = {

@@ -34,7 +34,9 @@ typedef struct {
     int rx_pin;                 /* ESP32 RX ← SIM7600 TXD (default: GPIO44) */
     int baud_rate;              /* UART baud rate (default: 115200) */
     const char *apn;            /* APN for data connection (NULL = auto) */
-    const char *sim_pin;        /* SIM PIN code (NULL = no PIN required) */
+    const char *sim_pin;        /* SIM PIN code (NULL = no PIN required). Sent
+                                 * at most once until accepted: see
+                                 * ml_cellular_sim_pin_blocked() */
     const char *ppp_user;       /* PPP CHAP username (NULL = empty) */
     const char *ppp_pass;       /* PPP CHAP password (NULL = empty) */
 } ml_cellular_config_t;
@@ -188,6 +190,23 @@ esp_err_t ml_cellular_get_info(ml_cellular_info_t *info);
  * The returned pointer is valid until ml_cellular_deinit().
  */
 const char *ml_cellular_get_imei(void);
+
+/**
+ * True when the SIM PIN guard has stopped sending the PIN: it was rejected
+ * (or got no answer), too few attempts were left (AT+SPIC < 2), the SIM is
+ * PUK-locked, or the modem cannot report the attempts left and the PIN was
+ * already tried once this boot. ml_cellular_init() then fails with
+ * ESP_ERR_NOT_ALLOWED (or ESP_ERR_INVALID_ARG for the rejection itself)
+ * instead of risking a PUK lock. RAM only: cleared by a reboot or by
+ * ml_cellular_reset_sim_pin_guard().
+ */
+bool ml_cellular_sim_pin_blocked(void);
+
+/**
+ * Clear the SIM PIN guard, e.g. after the application installed a corrected
+ * PIN. The attempts-left check (AT+SPIC) still applies on the next init.
+ */
+void ml_cellular_reset_sim_pin_guard(void);
 
 /** Upper bound for the timeout of an application AT command (the modem
  *  UART, and with it the AT socket bridge, is blocked for that long). */

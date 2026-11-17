@@ -419,6 +419,102 @@ static esp_err_t modem_setup(void)
     return ESP_OK;
 }
 
+/* SIM PIN guard. A wrong PIN must never be retried automatically: three
+ * rejections PUK-lock the SIM, and net_switch / boot loops call
+ * ml_cellular_init() again and again. Kept across deinit/init (RAM only),
+ * so it lasts until reboot or ml_cellular_reset_sim_pin_guard(). */
+static struct {
+    bool blocked;       /* a PIN was rejected or attempts are nearly used up */
+    bool sent_blind;    /* PIN sent once without a known attempt counter */
+    bool known_good;    /* the configured PIN was accepted this boot */
+} s_pin_guard;
+
+bool ml_cellular_sim_pin_blocked(void)
+{
+    return s_pin_guard.blocked;
+}
+
+void ml_cellular_reset_sim_pin_guard(void)
+{
+    memset(&s_pin_guard, 0, sizeof(s_pin_guard));
+}
+
+/* "+CPIN: <code>" with <code> exactly @p code (so "SIM PIN" does not also
+ * match "SIM PIN2" or "PH-SIM PIN") */
+static bool cpin_is(const char *resp, const char *code)
+{
+    const char *p = strstr(resp, "+CPIN:");
+    if (!p) return false;
+    p += 6;
+    while (*p == ' ') p++;
+    size_t n = strlen(code);
+    return strncmp(p, code, n) == 0 && (p[n] == '\r' || p[n] == '\n' || p[n] == '\0');
+}
+
+/* Remaining SIM PIN1 attempts via AT+SPIC ("+SPIC: <pin1>,<puk1>,<pin2>,
+ * <puk2>", SIM7500/SIM7600 and A76xx/SIM767x manuals), or -1 if unknown. */
+static int sim_pin_attempts_left(void)
+{
+    char resp[128];
+    if (at_send_cmd("AT+SPIC", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS) <= 0) return -1;
+    const char *p = strstr(resp, "+SPIC:");
+    int pin1, puk1;
+    if (!p || sscanf(p, "+SPIC: %d,%d", &pin1, &puk1) != 2 || pin1 < 0 || pin1 > 10) return -1;
+    return pin1;
+}
+
+static esp_err_t sim_enter_pin(void)
+{
+    if (!s_cell.config.sim_pin || !s_cell.config.sim_pin[0]) {
+        ESP_LOGE(TAG, "SIM requires PIN but none configured");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!ml_at_valid_pin(s_cell.config.sim_pin)) {
+        /* Never interpolate an unchecked value into an AT command */
+        ESP_LOGE(TAG, "SIM PIN is not 4-8 digits; not sending it");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_pin_guard.blocked) {
+        ESP_LOGE(TAG, "SIM PIN not sent: it was rejected (or too few attempts were left) "
+                 "earlier; fix the PIN and reboot");
+        return ESP_ERR_NOT_ALLOWED;
+    }
+
+    int left = sim_pin_attempts_left();
+    if (left >= 0) {
+        ESP_LOGI(TAG, "SIM PIN attempts left: %d", left);
+        if (left < 2) {
+            /* One wrong PIN now would need the PUK */
+            ESP_LOGE(TAG, "SIM PIN not sent: only %d attempt(s) left. Unlock the SIM "
+                     "in a phone, or check the PIN and reboot", left);
+            s_pin_guard.blocked = true;
+            return ESP_ERR_NOT_ALLOWED;
+        }
+    } else if (s_pin_guard.sent_blind && !s_pin_guard.known_good) {
+        /* No attempt counter: send at most once per boot */
+        ESP_LOGE(TAG, "SIM PIN not sent again: the modem does not report the attempts "
+                 "left and the PIN was already tried this boot");
+        s_pin_guard.blocked = true;
+        return ESP_ERR_NOT_ALLOWED;
+    } else {
+        s_pin_guard.sent_blind = true;
+    }
+
+    char pin_cmd[32];
+    snprintf(pin_cmd, sizeof(pin_cmd), "AT+CPIN=\"%s\"", s_cell.config.sim_pin);
+    bool pin_ok = at_cmd_ok(pin_cmd, AT_TIMEOUT_MS);
+    ml_at_secure_zero(pin_cmd, sizeof(pin_cmd));
+    if (!pin_ok) {
+        /* Rejected, or no answer (outcome unknown): never retry by itself */
+        s_pin_guard.blocked = true;
+        ESP_LOGE(TAG, "SIM PIN rejected; it will not be sent again until reboot");
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_pin_guard.known_good = true;
+    ESP_LOGI(TAG, "SIM PIN accepted");
+    return ESP_OK;
+}
+
 static esp_err_t sim_setup(void)
 {
     char resp[512];
@@ -426,47 +522,37 @@ static esp_err_t sim_setup(void)
     /* Check SIM status */
     at_send_cmd("AT+CPIN?", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
 
-    if (strstr(resp, "READY")) {
+    if (cpin_is(resp, "READY")) {
         s_cell.info.sim_ready = true;
         s_cell.state = ML_CELL_STATE_SIM_READY;
         ESP_LOGI(TAG, "SIM ready");
-    } else if (strstr(resp, "SIM PIN")) {
-        /* Try to unlock with PIN */
-        if (s_cell.config.sim_pin && s_cell.config.sim_pin[0]) {
-            if (!ml_at_valid_pin(s_cell.config.sim_pin)) {
-                /* Never interpolate an unchecked value into an AT command */
-                ESP_LOGE(TAG, "SIM PIN is not 4-8 digits; not sending it");
-                s_cell.state = ML_CELL_STATE_ERROR;
-                return ESP_ERR_INVALID_ARG;
-            }
-            char pin_cmd[32];
-            snprintf(pin_cmd, sizeof(pin_cmd), "AT+CPIN=\"%s\"", s_cell.config.sim_pin);
-            bool pin_ok = at_cmd_ok(pin_cmd, AT_TIMEOUT_MS);
-            ml_at_secure_zero(pin_cmd, sizeof(pin_cmd));
-            if (pin_ok) {
-                ESP_LOGI(TAG, "SIM PIN accepted");
-                vTaskDelay(pdMS_TO_TICKS(2000)); /* Wait for SIM to initialize */
+    } else if (cpin_is(resp, "SIM PIN")) {
+        esp_err_t err = sim_enter_pin();
+        if (err != ESP_OK) {
+            s_cell.state = ML_CELL_STATE_ERROR;
+            return err;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000)); /* Wait for SIM to initialize */
 
-                /* Verify SIM is now ready */
-                at_send_cmd("AT+CPIN?", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
-                if (strstr(resp, "READY")) {
-                    s_cell.info.sim_ready = true;
-                    s_cell.state = ML_CELL_STATE_SIM_READY;
-                } else {
-                    ESP_LOGE(TAG, "SIM still not ready after PIN");
-                    s_cell.state = ML_CELL_STATE_ERROR;
-                    return ESP_ERR_INVALID_STATE;
-                }
-            } else {
-                ESP_LOGE(TAG, "SIM PIN rejected");
-                s_cell.state = ML_CELL_STATE_ERROR;
-                return ESP_ERR_INVALID_ARG;
-            }
+        /* Verify SIM is now ready */
+        at_send_cmd("AT+CPIN?", resp, sizeof(resp), AT_SHORT_TIMEOUT_MS);
+        if (cpin_is(resp, "READY")) {
+            s_cell.info.sim_ready = true;
+            s_cell.state = ML_CELL_STATE_SIM_READY;
         } else {
-            ESP_LOGE(TAG, "SIM requires PIN but none configured");
+            ESP_LOGE(TAG, "SIM still not ready after PIN");
             s_cell.state = ML_CELL_STATE_ERROR;
             return ESP_ERR_INVALID_STATE;
         }
+    } else if (cpin_is(resp, "SIM PUK")) {
+        ESP_LOGE(TAG, "SIM is PUK-locked (too many wrong PINs); unlock it in a phone");
+        s_pin_guard.blocked = true;
+        s_cell.state = ML_CELL_STATE_ERROR;
+        return ESP_ERR_NOT_ALLOWED;
+    } else if (strstr(resp, "+CPIN:")) {
+        ESP_LOGE(TAG, "SIM needs an unsupported code (%.40s)", strstr(resp, "+CPIN:"));
+        s_cell.state = ML_CELL_STATE_ERROR;
+        return ESP_ERR_NOT_SUPPORTED;
     } else {
         ESP_LOGE(TAG, "SIM not detected — check SIM card insertion");
         s_cell.state = ML_CELL_STATE_ERROR;
