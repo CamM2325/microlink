@@ -358,6 +358,21 @@ bundle), newlib-nano printf (no 64-bit or float formats in your own logs), a cli
 with fewer curves and ciphers, WiFi without Enterprise/SoftAP/OWE, and no `esp_err_to_name()`
 strings or log colours. The file lists each option; check them against your deployment.
 
+## Low power
+
+MicroLink's tasks are event-driven: they sleep until a packet arrives, something is queued, or a
+periodic timer is due (DERP task about 6 wakeups/s while idle, down from about 1000). That lets the
+chip use automatic light sleep between packets. To enable it in your app:
+
+- `CONFIG_PM_ENABLE=y` and `CONFIG_FREERTOS_USE_TICKLESS_IDLE=y`, then call `esp_pm_configure()` with
+  `light_sleep_enable = true` (see ESP-IDF's power-management docs).
+- WiFi: use modem sleep (`esp_wifi_set_ps(WIFI_PS_MIN_MODEM)`); the tunnel keeps working, with some
+  extra latency for incoming packets.
+- Cellular modems have their own sleep modes (e.g. SIM7600 `AT+CSCLK`), which MicroLink does not manage.
+
+Keepalives still run (WireGuard every 25 s per active peer, DISCO heartbeats every 3 s on direct
+paths, control-plane PINGs every 5 s), so the device is never fully idle while connected.
+
 ## Troubleshooting
 
 | Symptom | Check |
