@@ -107,6 +107,15 @@ static int hex_to_bytes(const char *hex, uint8_t *bytes, size_t max_len) {
     return hex_len / 2;
 }
 
+/* Decode a 32-byte key. Only an exact 64-digit hex string counts: on any
+ * other input the key is zeroed and false is returned, so a malformed key
+ * is never mistaken for a (rotated) key. */
+static bool parse_key32(const char *hex, uint8_t key[32]) {
+    if (hex_to_bytes(hex, key, 32) == 32) return true;
+    memset(key, 0, 32);
+    return false;
+}
+
 /* ============================================================================
  * TCP I/O helpers for coord socket (owned exclusively by this task)
  * ========================================================================== */
@@ -706,10 +715,11 @@ static void process_proactive_frames(microlink_t *ml, ml_noise_state_t *noise) {
                     /* Parse "chalpub:hex..." format (v1 lines 1402-1424) */
                     if (strncmp(chal_str, "chalpub:", 8) == 0) {
                         const char *hex = chal_str + 8;
-                        if (strlen(hex) >= 64) {
-                            hex_to_bytes(hex, s_node_key_challenge, 32);
+                        if (parse_key32(hex, s_node_key_challenge)) {
                             s_has_node_key_challenge = true;
                             ESP_LOGI(TAG, "NodeKeyChallenge decoded (32 bytes)");
+                        } else {
+                            ESP_LOGW(TAG, "NodeKeyChallenge malformed, ignored");
                         }
                     }
                 }
@@ -1201,8 +1211,16 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
         if (key && key->valuestring) {
             const char *hex = key->valuestring;
             if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-            hex_to_bytes(hex, update->public_key, 32);
-            update->key_valid = true;
+            update->key_valid = parse_key32(hex, update->public_key);
+            if (!update->key_valid) {
+                /* Installing it would give the peer an all-zero key. Drop
+                 * the record and keep whatever entry we already have
+                 * (dropped_any also stops the full-list sweep evicting it). */
+                ESP_LOGW(TAG, "  Peer with malformed Key ignored");
+                free(update);
+                dropped_any = true;
+                continue;
+            }
         }
 
         /* DiscoKey: "discokey:HEX..." */
@@ -1210,8 +1228,7 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
         if (disco && disco->valuestring) {
             const char *hex = disco->valuestring;
             if (strncmp(hex, "discokey:", 9) == 0) hex += 9;
-            hex_to_bytes(hex, update->disco_key, 32);
-            update->disco_valid = true;
+            update->disco_valid = parse_key32(hex, update->disco_key);
         }
 
         /* VPN IP from Addresses */
@@ -1328,8 +1345,12 @@ check_removed:
             } else {
                 const char *hex = key_item->valuestring;
                 if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-                hex_to_bytes(hex, update->public_key, 32);
-                update->key_valid = true;
+                update->key_valid = parse_key32(hex, update->public_key);
+                if (!update->key_valid) {
+                    ESP_LOGW(TAG, "  PeersRemoved entry with malformed key ignored");
+                    free(update);
+                    continue;
+                }
                 ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
                          update->public_key[0], update->public_key[1],
                          update->public_key[2], update->public_key[3]);
@@ -1362,15 +1383,16 @@ check_removed:
                     if (pkey && cJSON_IsString(pkey) && pkey->valuestring) {
                         const char *hex = pkey->valuestring;
                         if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-                        hex_to_bytes(hex, update->public_key, 32);
-                        update->key_valid = true;
+                        update->key_valid = parse_key32(hex, update->public_key);
+                        if (!update->key_valid) {
+                            ESP_LOGW(TAG, "  Patch with malformed Key: key change ignored");
+                        }
                     }
                     cJSON *pdisco = cJSON_GetObjectItem(patch, "DiscoKey");
                     if (pdisco && cJSON_IsString(pdisco) && pdisco->valuestring) {
                         const char *hex = pdisco->valuestring;
                         if (strncmp(hex, "discokey:", 9) == 0) hex += 9;
-                        hex_to_bytes(hex, update->disco_key, 32);
-                        update->disco_valid = true;
+                        update->disco_valid = parse_key32(hex, update->disco_key);
                     }
 
                     /* Liveness transitions arrive here on the long-poll stream,
