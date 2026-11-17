@@ -172,7 +172,10 @@ static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
  * each retry can block for a full SO_RCVTIMEO (2-60 s), so a retry count
  * gave anything from seconds to hours. STALL bounds the time without any
  * progress, TOTAL the whole read (a 4 KB Noise frame over the ~450 B/s AT
- * socket bridge takes ~10 s). Both stay below the 120 s coord watchdog. */
+ * socket bridge takes ~10 s). A check runs after each recv returns, so a
+ * read can overrun either limit by one SO_RCVTIMEO, and a frame's header
+ * and payload reads have separate budgets. The coord watchdog runs on the
+ * same task and only sees the result once the read returns. */
 #define COORD_RECV_STALL_MS   30000
 #define COORD_RECV_TOTAL_MS   90000
 
