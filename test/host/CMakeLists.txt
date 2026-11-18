@@ -32,6 +32,25 @@ target_include_directories(test_at_validate PRIVATE ${ML_SRC}/include)
 enable_testing()
 add_test(NAME wg_filter COMMAND test_wg_filter)
 
+# Endpoint roaming on the receive path: two real wireguardif instances wired
+# back to back (replayed packets and cookie replies must not move the endpoint).
+add_executable(test_wg_roaming test_wg_roaming.c
+  ${WG_SRC}/wireguardif.c
+  ${WG_SRC}/wireguard.c
+  ${WG_SRC}/wireguard-filter.c
+  ${WG_SRC}/crypto.c
+  ${WG_SRC}/crypto/refc/x25519.c
+  ${WG_SRC}/crypto/refc/chacha20.c
+  ${WG_SRC}/crypto/refc/chacha20poly1305.c
+  ${WG_SRC}/crypto/refc/poly1305-donna.c
+  ${WG_SRC}/crypto/refc/blake2s.c)
+target_include_directories(test_wg_roaming PRIVATE
+  ${CMAKE_CURRENT_LIST_DIR}/include ${WG_SRC} ${LWIP_INCLUDE_DIR})
+# wireguard.c compares int with size_t in its base64 helpers
+set_source_files_properties(${WG_SRC}/wireguard.c
+  PROPERTIES COMPILE_OPTIONS -Wno-sign-compare)
+add_test(NAME wg_roaming COMMAND test_wg_roaming)
+
 # Noise control-channel AEAD (wireguard-lwip ChaCha20-Poly1305 + Tailscale nonce)
 add_executable(test_noise_aead test_noise_aead.c
   ${WG_SRC}/crypto/refc/chacha20.c
