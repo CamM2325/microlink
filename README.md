@@ -537,6 +537,8 @@ espkvm (ESP-IDF 6), MedAouadhi and TimelyToga.
 
 **Security reports:** Tomasz Fiedoruk and Adrian Nguyen ([fugo101](https://github.com/fugo101)).
 
+**Testing:** Ivo (cellular testing, and the logs that found the reconnect-after-reboot bug).
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Bundled third-party code keeps its own license:
