@@ -525,6 +525,7 @@ reference), [WireGuard](https://www.wireguard.com/), [wireguard-lwip](https://gi
 - [@letalvoj](https://github.com/letalvoj) (Vojtěch Létal): peer online status (#24)
 - [@ViniciusDev26](https://github.com/ViniciusDev26) (Carlos Vinicius): small-buffer underflow and corruption fixes (#35)
 - [@Asimmimx](https://github.com/Asimmimx) (Asım Mirza Çiftler): ESP32-C3 / no-PSRAM support (#43)
+- [@fiedoruk](https://github.com/fiedoruk) (Tomasz Fiedoruk): replay and endpoint-roaming regression test (#46)
 - [@dj-oyu](https://github.com/dj-oyu): zero-copy WireGuard receive mode
 - [@GrieferPig](https://github.com/GrieferPig): early WireGuard peer-lookup fix (since replaced by longest-prefix routing)
 
